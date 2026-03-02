@@ -11,15 +11,7 @@ env:
 
 jobs:
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-14
-          - target: x86_64-apple-darwin
-            os: macos-13
-    runs-on: ${{ matrix.os }}
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -32,21 +24,30 @@ jobs:
       - name: Install Rust toolchain
         run: rustup toolchain install stable --profile minimal
 
+      - name: Cache cargo registry and build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: release-aarch64-apple-darwin-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-aarch64-apple-darwin-
+
       - name: Build release binary
-        run: cargo build --release --target ${{ matrix.target }} -p nanograph-cli
+        run: cargo build --release --target aarch64-apple-darwin -p nanograph-cli
 
       - name: Package
         run: |
-          BINARY=target/${{ matrix.target }}/release/nanograph
-          ARCHIVE=nanograph-${GITHUB_REF_NAME}-${{ matrix.target }}.tar.gz
+          BINARY=target/aarch64-apple-darwin/release/nanograph
+          ARCHIVE=nanograph-${GITHUB_REF_NAME}-aarch64-apple-darwin.tar.gz
           tar czf "$ARCHIVE" -C "$(dirname "$BINARY")" "$(basename "$BINARY")"
           shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
-          echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: binary-${{ matrix.target }}
+          name: binary-aarch64-apple-darwin
           path: |
             nanograph-*.tar.gz
             nanograph-*.tar.gz.sha256
