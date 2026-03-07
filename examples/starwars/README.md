@@ -21,31 +21,34 @@ Typed property graph of the Star Wars universe with a rich relationship model an
 
 ## Quick Start
 
+This example ships with a checked-in `nanograph.toml`, so you can work directly from the example directory without repeating `--db` or query paths:
+
 ```bash
-nanograph init sw.nano --schema examples/starwars/starwars.pg
-nanograph load sw.nano --data examples/starwars/starwars.jsonl --mode overwrite
-nanograph check --db sw.nano --query examples/starwars/starwars.gq
-nanograph run --db sw.nano --query examples/starwars/starwars.gq --name jedi
-nanograph run --db sw.nano --query examples/starwars/starwars.gq --name film_timeline
+cd examples/starwars
+
+nanograph init
+nanograph load --data starwars.jsonl --mode overwrite
+nanograph check --query starwars.gq
+nanograph run search "father and son conflict"
+nanograph run debut anakin-skywalker
 ```
+
+The config also enables deterministic mock embeddings and exposes aliases like `search`, `hybrid`, `family`, and `debut`.
 
 ## Mutation + CDC Walkthrough
 
 ```bash
-# mutations
-nanograph run --db sw.nano --query examples/starwars/starwars.gq --name add_character
-nanograph run --db sw.nano --query examples/starwars/starwars.gq --name update_character --param slug=ezra-bridger
-nanograph run --db sw.nano --query examples/starwars/starwars.gq --name delete_character --param slug=ezra-bridger
+nanograph run --query starwars.gq --name add_character
+nanograph run --query starwars.gq --name delete_character --param slug=ezra-bridger
 
-# inspect changes
-nanograph changes sw.nano --from 2 --to 4 --format json
-nanograph changes sw.nano --since 3 --format jsonl
+nanograph changes --from 2 --to 3 --format json
+nanograph changes --since 2 --format jsonl
 ```
 
 ## Introspection
 
 ```bash
-nanograph version --db sw.nano
-nanograph describe --db sw.nano --format table
-nanograph export --db sw.nano --format jsonl
+nanograph version
+nanograph describe --type Character --format json
+nanograph export --format jsonl
 ```

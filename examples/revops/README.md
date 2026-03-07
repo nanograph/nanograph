@@ -15,27 +15,24 @@ Personal CRM and decision trace system. Demonstrates the complete physics of exe
 ## Quick Start
 
 ```bash
-# Build
-cargo build -p nanograph-cli
+cd examples/revops
 
-# Create database
-nanograph init omni.nano --schema examples/revops/revops.pg
-
-# Load seed data
-nanograph load omni.nano --data examples/revops/revops.jsonl --mode overwrite
-
-# Typecheck queries
-nanograph check --db omni.nano --query examples/revops/revops.gq
-
-# Run a query
-nanograph run --db omni.nano --query examples/revops/revops.gq --name pipeline_summary
-
-# Run with parameters
-nanograph run --db omni.nano --query examples/revops/revops.gq --name decision_trace \
-  --param opp=opp-stripe-migration
+nanograph init
+nanograph load --data revops.jsonl --mode overwrite
+nanograph check --query revops.gq
+nanograph run why opp-stripe-migration
+nanograph run pipeline
+nanograph run signals cli-priya-shah "procurement approval timing"
 ```
 
-Output formats: `table` (default), `csv`, `jsonl`, `json`.
+The checked-in `nanograph.toml` provides:
+
+- `db.default_path = "omni.nano"`
+- `query.roots = ["."]`
+- aliases like `why`, `trace`, `value`, `pipeline`, and `signals`
+- deterministic mock embeddings for `Signal.summaryEmbedding`
+
+Output formats remain `table` (default), `csv`, `jsonl`, and `json`.
 
 ## Schema Overview
 
@@ -155,7 +152,7 @@ The seed data implements the complete three-phase trace from the [context graph 
 Load additional data with merge mode (upserts by `@key`):
 
 ```bash
-nanograph load omni.nano --data your-data.jsonl --mode merge
+nanograph load --data your-data.jsonl --mode merge
 ```
 
-To evolve the schema, edit `<db>/schema.pg` then run `nanograph migrate omni.nano`.
+To evolve the schema, edit `omni.nano/schema.pg` then run `nanograph migrate`.

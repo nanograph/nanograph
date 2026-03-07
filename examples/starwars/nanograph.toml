@@ -1,0 +1,45 @@
+[project]
+name = "Star Wars"
+description = "Full Star Wars example graph with search, lineage, affiliation, and debut traversal."
+instruction = "Run commands from this directory to use the default database path, query roots, and aliases."
+
+[db]
+default_path = "starwars.nano"
+
+[schema]
+default_path = "starwars.pg"
+
+[query]
+roots = ["."]
+
+[embedding]
+provider = "mock"
+chunk_size = 1500
+chunk_overlap_chars = 200
+
+[cli]
+output_format = "table"
+
+[query_aliases.search]
+query = "starwars.gq"
+name = "semantic_search"
+args = ["q"]
+format = "table"
+
+[query_aliases.hybrid]
+query = "starwars.gq"
+name = "hybrid_search"
+args = ["q"]
+format = "table"
+
+[query_aliases.family]
+query = "starwars.gq"
+name = "family_semantic"
+args = ["slug", "q"]
+format = "table"
+
+[query_aliases.debut]
+query = "starwars.gq"
+name = "debut_film"
+args = ["slug"]
+format = "table"

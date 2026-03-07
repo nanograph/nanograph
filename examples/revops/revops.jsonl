@@ -28,6 +28,9 @@
 
 // ── Signals (1) ───────────────────────────────────────────────
 {"type": "Signal", "data": {"slug": "sig-hates-vendor", "observedAt": "2026-02-08T15:30:00Z", "summary": "Priya hates her current data vendor — actively looking for alternatives", "sentiment": "negative", "urgency": "high", "sourceType": "meeting", "assertion": "fact", "createdAt": "2026-02-08T16:00:00Z"}}
+{"type": "Signal", "data": {"slug": "sig-billing-delay", "observedAt": "2026-02-11T09:00:00Z", "summary": "Billing reconciliation delay due to missing invoice data is slowing the migration decision", "urgency": "medium", "sourceType": "email", "assertion": "fact", "createdAt": "2026-02-11T09:00:00Z"}}
+{"type": "Signal", "data": {"slug": "sig-referral-analytics", "observedAt": "2026-02-11T10:00:00Z", "summary": "Warm referral suggests an analytics migration project for the Stripe team", "urgency": "low", "sourceType": "meeting", "assertion": "fact", "createdAt": "2026-02-11T10:00:00Z"}}
+{"type": "Signal", "data": {"slug": "sig-enterprise-procurement", "observedAt": "2026-02-11T11:00:00Z", "summary": "Enterprise procurement questionnaire is blocking launch timing and vendor approval", "urgency": "high", "sourceType": "observation", "assertion": "fact", "createdAt": "2026-02-11T11:00:00Z"}}
 
 // ── Decisions (1) ─────────────────────────────────────────────
 {"type": "Decision", "data": {"slug": "dec-make-proposal", "decidedAt": "2026-02-10T09:00:00Z", "intent": "Make proposal for Stripe migration", "status": "approved", "domain": "sales", "assertion": "fact", "createdAt": "2026-02-10T09:00:00Z"}}
@@ -48,7 +51,13 @@
 {"edge": "ClientOwnsRecord", "from": "cli-jamie-lee", "to": "rec-coffee-chat"}
 {"edge": "SourcedFrom", "from": "sig-hates-vendor", "to": "rec-coffee-chat", "data": {"extractionMethod": "manual"}}
 {"edge": "SignalAffects", "from": "sig-hates-vendor", "to": "cli-priya-shah"}
+{"edge": "SignalAffects", "from": "sig-billing-delay", "to": "cli-priya-shah"}
+{"edge": "SignalAffects", "from": "sig-referral-analytics", "to": "cli-jamie-lee"}
+{"edge": "SignalAffects", "from": "sig-enterprise-procurement", "to": "cli-priya-shah"}
 {"edge": "Surfaced", "from": "sig-hates-vendor", "to": "opp-stripe-migration", "data": {"confidence": "high"}}
+{"edge": "Surfaced", "from": "sig-billing-delay", "to": "opp-stripe-migration", "data": {"confidence": "high"}}
+{"edge": "Surfaced", "from": "sig-referral-analytics", "to": "opp-stripe-migration", "data": {"confidence": "low"}}
+{"edge": "Surfaced", "from": "sig-enterprise-procurement", "to": "opp-stripe-migration", "data": {"confidence": "high"}}
 {"edge": "ClientOwnsOpportunity", "from": "cli-priya-shah", "to": "opp-stripe-migration"}
 {"edge": "ClientOwnsProject", "from": "cli-priya-shah", "to": "prj-data-pipeline"}
 

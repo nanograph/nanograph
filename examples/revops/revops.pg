@@ -10,7 +10,7 @@
 // Updated in place. All carry: slug @key, createdAt, updatedAt, notes
 // ═══════════════════════════════════════════════════════════════
 
-node Client {
+node Client @description("Mutable account records that capture current customer state and ownership context.") {
     slug: String @key
     name: String @unique
     status: enum(cold, dormant, focus, healthy, nurture)
@@ -96,7 +96,7 @@ node ActionItem {
 // All carry: slug @key, createdAt (no updatedAt, no notes)
 // ═══════════════════════════════════════════════════════════════
 
-node Decision {
+node Decision @description("Append-only decision records that explain why work happened.") @instruction("Treat decisions as immutable history; corrections should create new decision records rather than overwrite old ones.") {
     slug: String @key
     decidedAt: DateTime
     intent: String
@@ -107,10 +107,11 @@ node Decision {
     createdAt: DateTime
 }
 
-node Signal {
-    slug: String @key
+node Signal @description("Observed customer, product, or market signals that can surface opportunities.") @instruction("Use Signal.slug for trace queries. summary and summaryEmbedding are the retrieval fields for search-oriented workflows.") {
+    slug: String @key @description("Stable signal identifier for trace and search queries.")
     observedAt: DateTime
-    summary: String
+    summary: String @description("Primary textual signal content used for lexical and semantic retrieval.")
+    summaryEmbedding: Vector(8) @embed(summary) @index @description("Semantic embedding derived from summary for nearest-neighbor search.")
     sentiment: enum(mixed, negative, neutral, positive)?
     urgency: enum(critical, high, low, medium)?
     sourceType: enum(call, email, meeting, message, observation, slack)
@@ -149,7 +150,7 @@ edge MadeBy: Decision -> Actor
 edge DecisionAffects: Decision -> Client
 edge SignalAffects: Signal -> Client
 
-edge InformedBy: Decision -> Signal {
+edge InformedBy: Decision -> Signal @description("Connects a decision to the signals that informed it.") {
     influence: enum(minor, primary, supporting)
 }
 
@@ -182,7 +183,7 @@ edge Surfaced: Signal -> Opportunity {
     confidence: enum(high, low, medium)
 }
 
-edge Targets: Decision -> Opportunity
+edge Targets: Decision -> Opportunity @description("Connects a decision to the opportunity it is intended to move.")
 edge DecisionGenerates: Decision -> ActionItem
 edge AssignedTo: ActionItem -> Actor
 edge Resolves: Action -> ActionItem

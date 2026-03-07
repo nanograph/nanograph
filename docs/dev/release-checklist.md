@@ -15,7 +15,7 @@
 
 - [ ] CI workflow green on `main` / PRs (`cargo check`, TS SDK tests, TS consumer smoke test, Swift SDK tests)
 - [ ] All tests pass: `cargo test`
-- [ ] CLI e2e pass: `bash tests/cli/run-cli-e2e.sh`
+- [ ] CLI e2e pass: `cargo test -p nanograph-cli`
 - [ ] Clippy clean: `cargo clippy --workspace --all-targets`
 - [ ] Bump version in all Cargo.toml files (currently lockstep: `nanograph`, `nanograph-cli`, `nanograph-ffi`, `nanograph-ts`)
 - [ ] Bump version in `crates/nanograph-ts/package.json`

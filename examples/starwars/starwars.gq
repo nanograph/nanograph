@@ -1,5 +1,128 @@
 // Star Wars Knowledge Graph — Merged Query Suite
 
+// ── Search queries ──────────────────────────────────────────────────────────
+
+query keyword_search($q: String)
+  @description("Find characters whose notes contain the query tokens.")
+  @instruction("Use for exact term lookup across character notes.")
+{
+    match {
+        $c: Character
+        search($c.note, $q)
+    }
+    return { $c.slug, $c.name }
+    order { $c.slug asc }
+}
+
+query fuzzy_search($q: String)
+  @description("Find characters by name with typo tolerance.")
+  @instruction("Use when the user is likely to misspell a name.")
+{
+    match {
+        $c: Character
+        fuzzy($c.name, $q)
+    }
+    return { $c.slug, $c.name }
+    order { $c.slug asc }
+}
+
+query match_text_search($q: String)
+  @description("Match contiguous text spans inside character notes.")
+  @instruction("Prefer for phrase-style note matching instead of bag-of-words search.")
+{
+    match {
+        $c: Character
+        match_text($c.note, $q)
+    }
+    return { $c.slug, $c.name }
+    order { $c.slug asc }
+}
+
+query bm25_search($q: String)
+  @description("Rank characters by lexical relevance against their notes.")
+  @instruction("Use for keyword-heavy queries where exact term hits should dominate.")
+{
+    match { $c: Character }
+    return { $c.slug, $c.name, bm25($c.note, $q) as score }
+    order { bm25($c.note, $q) desc }
+    limit 5
+}
+
+query semantic_search($q: String)
+  @description("Rank characters by semantic similarity against their embedded notes.")
+  @instruction("Use for broad conceptual search, not exact spelling.")
+{
+    match { $c: Character }
+    return {
+        $c.slug as slug,
+        $c.name as name,
+        nearest($c.embedding, $q) as score
+    }
+    order { nearest($c.embedding, $q) }
+    limit 5
+}
+
+query hybrid_search($q: String)
+  @description("Blend semantic and lexical ranking across character notes.")
+  @instruction("Use when both exact wording and broader meaning matter.")
+{
+    match { $c: Character }
+    return {
+        $c.slug as slug,
+        $c.name as name,
+        nearest($c.embedding, $q) as semantic_distance,
+        bm25($c.note, $q) as lexical_score,
+        rrf(nearest($c.embedding, $q), bm25($c.note, $q)) as hybrid_score
+    }
+    order { rrf(nearest($c.embedding, $q), bm25($c.note, $q)) desc }
+    limit 5
+}
+
+query family_semantic($slug: String, $q: String)
+  @description("Search only within a character's parents, ranked semantically.")
+  @instruction("Use after traversal when you want ranking inside the family subgraph.")
+{
+    match {
+        $c: Character { slug: $slug }
+        $c hasParent $p
+    }
+    return { $p.slug, $p.name }
+    order { nearest($p.embedding, $q) }
+    limit 3
+}
+
+query students_search($mentor: String, $q: String)
+  @description("Rank a mentor's students by lexical relevance against their notes.")
+  @instruction("Use when a traversal should define scope before ranking.")
+{
+    match {
+        $m: Character { slug: $mentor }
+        $s hasMentor $m
+    }
+    return { $s.slug, $s.name, bm25($s.note, $q) as score }
+    order { bm25($s.note, $q) desc }
+    limit 5
+}
+
+query character_profile($slug: String) {
+    match { $c: Character { slug: $slug } }
+    return { $c.slug, $c.name, $c.note, $c.alignment, $c.tags }
+    limit 1
+}
+
+query same_debut($film: String) {
+    match {
+        $f: Film { slug: $film }
+        $c debutsIn $f
+    }
+    return { $c.slug, $c.name }
+    order { $c.slug asc }
+}
+
+query add_edge_parent($from: String, $to: String) {
+    insert HasParent { from: $from, to: $to }
+}
+
 // ── Faction queries ─────────────────────────────────────────────────────────
 
 query jedi() {
@@ -235,7 +358,10 @@ query film_timeline() {
     order { $f.release_date asc }
 }
 
-query debut_film($slug: String) {
+query debut_film($slug: String)
+  @description("Show the debut film for a character identified by slug.")
+  @instruction("Use for keyed cross-type traversal from a character to a film.")
+{
     match {
         $c: Character { slug: $slug }
         $c debutsIn $f

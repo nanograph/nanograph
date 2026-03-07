@@ -1,0 +1,50 @@
+[project]
+name = "Omni Context Graph"
+description = "RevOps context graph covering signals, decisions, actions, and delivery."
+instruction = "Run commands from this directory to use the default database path, query roots, and aliases."
+
+[db]
+default_path = "omni.nano"
+
+[schema]
+default_path = "revops.pg"
+
+[query]
+roots = ["."]
+
+[embedding]
+provider = "mock"
+chunk_size = 1500
+chunk_overlap_chars = 200
+
+[cli]
+output_format = "table"
+
+[query_aliases.why]
+query = "revops.gq"
+name = "decision_trace"
+args = ["opp"]
+format = "table"
+
+[query_aliases.trace]
+query = "revops.gq"
+name = "full_trace"
+args = ["sig"]
+format = "table"
+
+[query_aliases.value]
+query = "revops.gq"
+name = "signal_value"
+args = ["sig"]
+format = "table"
+
+[query_aliases.pipeline]
+query = "revops.gq"
+name = "pipeline_summary"
+format = "table"
+
+[query_aliases.signals]
+query = "revops.gq"
+name = "semantic_signals_for_client"
+args = ["client", "q"]
+format = "table"

@@ -63,29 +63,31 @@ edge AffiliatedWith: Character -> Faction { role: String? }
 ## Init and load
 
 ```bash
-nanograph init sw.nano --schema examples/starwars/starwars.pg
-nanograph load sw.nano --data examples/starwars/starwars.jsonl --mode overwrite
+cd examples/starwars
+
+nanograph init
+nanograph load --data starwars.jsonl --mode overwrite
 ```
 
-`init` creates the database directory from the schema. `load` ingests JSONL data — nodes and edges are validated against the schema.
+The checked-in [examples/starwars/nanograph.toml](/Users/andrew/code/nanograph/examples/starwars/nanograph.toml) supplies the default DB path, query root, mock embedding mode, and search aliases. `init` creates the database directory from the schema, and `load` ingests JSONL data with schema validation.
 
 ## Query
 
 ```bash
-# all Jedi
-nanograph run --db sw.nano --query examples/starwars/starwars.gq --name jedi
+# semantic search
+nanograph run search "father and son conflict"
 
 # who did Yoda train?
-nanograph run --db sw.nano --query examples/starwars/starwars.gq --name students_of --param name="Yoda"
+nanograph run --query starwars.gq --name students_of --param name="Yoda"
 
-# faction member counts
-nanograph run --db sw.nano --query examples/starwars/starwars.gq --name faction_sizes
+# cross-type traversal
+nanograph run debut anakin-skywalker
 ```
 
 Queries are typechecked against the schema — wrong property names, type mismatches, and invalid traversals are caught before execution:
 
 ```bash
-nanograph check --db sw.nano --query examples/starwars/starwars.gq
+nanograph check --query starwars.gq
 ```
 
 ## Next steps

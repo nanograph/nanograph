@@ -32,7 +32,10 @@ query pipeline_by_stage($stage: String) {
 // ═══════════════════════════════════════════════════════════════
 
 // From an opportunity, trace who decided and what signal drove it
-query decision_trace($opp: String) {
+query decision_trace($opp: String)
+  @description("Trace an opportunity back to the decision, actor, and signal that created motion.")
+  @instruction("Use as the default 'why did this happen?' query for an opportunity slug.")
+{
     match {
         $o: Opportunity { slug: $opp }
         $d targets $o
@@ -54,7 +57,10 @@ query execution_trace($opp: String) {
 }
 
 // Full trace: signal → decision → action → opportunity (cycle-closing join)
-query full_trace($sig: String) {
+query full_trace($sig: String)
+  @description("Trace a signal through decision and action back to the opportunity it influenced.")
+  @instruction("Use when you need the full causal chain from input signal to outcome.")
+{
     match {
         $s: Signal { slug: $sig }
         $s surfaced $o
@@ -79,7 +85,10 @@ query full_trace($sig: String) {
 // ═══════════════════════════════════════════════════════════════
 
 // Signal → Opportunity
-query signal_value($sig: String) {
+query signal_value($sig: String)
+  @description("Show the commercial value created by a signal.")
+  @instruction("Use for value attribution once a signal slug is known.")
+{
     match {
         $s: Signal { slug: $sig }
         $s surfaced $o
@@ -96,6 +105,52 @@ query signal_to_project($sig: String) {
         $o contains $p
     }
     return { $s.summary, $o.title, $p.name, $p.status }
+}
+
+query client_signal_search($client: String, $q: String)
+  @description("Search signals affecting a specific client using lexical term matching.")
+  @instruction("Prefer this when the user gives concrete keywords and the client scope is known.")
+{
+    match {
+        $c: Client { slug: $client }
+        $s: Signal
+        $s signalAffects $c
+        search($s.summary, $q)
+    }
+    return { $s.slug, $s.summary, $c.name }
+    order { $s.slug asc }
+}
+
+query semantic_signals_for_client($client: String, $q: String)
+  @description("Rank signals affecting a client by semantic similarity.")
+  @instruction("Use for broad intent-style search once the client scope is known.")
+{
+    match {
+        $c: Client { slug: $client }
+        $s: Signal
+        $s signalAffects $c
+    }
+    return { $s.slug, $s.summary, nearest($s.summaryEmbedding, $q) as score }
+    order { nearest($s.summaryEmbedding, $q) }
+    limit 5
+}
+
+query signal_lookup($slug: String) {
+    match { $s: Signal { slug: $slug } }
+    return { $s.slug, $s.summary, $s.urgency, $s.sourceType }
+    limit 1
+}
+
+query task_lookup($slug: String) {
+    match { $t: ActionItem { slug: $slug } }
+    return { $t.slug, $t.status, $t.priority }
+    limit 1
+}
+
+query opportunity_lookup($slug: String) {
+    match { $o: Opportunity { slug: $slug } }
+    return { $o.slug, $o.title, $o.stage, $o.amountPaid }
+    limit 1
 }
 
 // ═══════════════════════════════════════════════════════════════

@@ -45,6 +45,12 @@ jobs:
       - name: Cargo check
         run: cargo check --workspace --all-targets
 
+      - name: Core integration tests
+        run: cargo test -p nanograph --test engine_integration
+
+      - name: CLI end-to-end tests
+        run: cargo test -p nanograph-cli
+
       - name: Install TypeScript SDK dependencies
         run: npm install
         working-directory: crates/nanograph-ts
