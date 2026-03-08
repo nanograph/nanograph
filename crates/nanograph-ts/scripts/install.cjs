@@ -37,15 +37,8 @@ if (bundledBinary && existsSync(join(packageRoot, bundledBinary))) {
   process.exit(0)
 }
 
-const napiBin = join(
-  packageRoot,
-  'node_modules',
-  '.bin',
-  process.platform === 'win32' ? 'napi.cmd' : 'napi'
-)
-
 execFileSync(
-  napiBin,
+  process.platform === 'win32' ? 'napi.cmd' : 'napi',
   ['build', '--platform', '--js', 'index.js', '--release'],
   {
     cwd: packageRoot,
