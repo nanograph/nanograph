@@ -34,7 +34,7 @@ fn build_vector_query_result(rows: usize, dim: i32) -> QueryResult {
     QueryResult::new(schema, vec![batch])
 }
 
-fn average_duration(mut f: impl FnMut() -> ()) -> Duration {
+fn average_duration(mut f: impl FnMut()) -> Duration {
     let iterations = std::env::var("NANOGRAPH_JSON_PERF_ITERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())

@@ -591,20 +591,20 @@ fn append_entity_diff_events(
     }
 
     for (id, after) in after_rows {
-        if let Some(before) = before_rows.get(id) {
-            if before != after {
-                out.push(make_pending_cdc_event(
-                    "update",
-                    entity_kind,
-                    type_name,
-                    *id,
-                    after,
-                    serde_json::json!({
-                        "before": before,
-                        "after": after,
-                    }),
-                ));
-            }
+        if let Some(before) = before_rows.get(id)
+            && before != after
+        {
+            out.push(make_pending_cdc_event(
+                "update",
+                entity_kind,
+                type_name,
+                *id,
+                after,
+                serde_json::json!({
+                    "before": before,
+                    "after": after,
+                }),
+            ));
         }
     }
 

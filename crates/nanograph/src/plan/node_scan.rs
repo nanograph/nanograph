@@ -145,32 +145,31 @@ impl NodeScanExec {
             DataType::FixedSizeList(actual, actual_dim),
             DataType::FixedSizeList(expected, expected_dim),
         ) = (col.data_type(), field.data_type())
+            && actual_dim == expected_dim
+            && actual.data_type() == expected.data_type()
         {
-            if actual_dim == expected_dim && actual.data_type() == expected.data_type() {
-                let list = col
-                    .as_any()
-                    .downcast_ref::<FixedSizeListArray>()
-                    .ok_or_else(|| {
-                        DataFusionError::Execution(
-                            "failed to downcast FixedSizeList column while aligning schema"
-                                .to_string(),
-                        )
-                    })?;
-                let rebuilt = FixedSizeListArray::try_new(
-                    expected.clone(),
-                    *expected_dim,
-                    list.values().clone(),
-                    list.nulls().cloned(),
-                )
-                .map_err(|e| {
-                    DataFusionError::Execution(format!(
-                        "failed to align FixedSizeList column '{}': {}",
-                        field.name(),
-                        e
-                    ))
+            let list = col
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    DataFusionError::Execution(
+                        "failed to downcast FixedSizeList column while aligning schema".to_string(),
+                    )
                 })?;
-                return Ok(Arc::new(rebuilt) as ArrayRef);
-            }
+            let rebuilt = FixedSizeListArray::try_new(
+                expected.clone(),
+                *expected_dim,
+                list.values().clone(),
+                list.nulls().cloned(),
+            )
+            .map_err(|e| {
+                DataFusionError::Execution(format!(
+                    "failed to align FixedSizeList column '{}': {}",
+                    field.name(),
+                    e
+                ))
+            })?;
+            return Ok(Arc::new(rebuilt) as ArrayRef);
         }
 
         arrow_cast::cast(col, field.data_type()).map_err(|e| {

@@ -20,16 +20,12 @@ pub fn parse_schema_diagnostic(input: &str) -> std::result::Result<SchemaFile, P
 
     let mut declarations = Vec::new();
     for pair in pairs {
-        match pair.as_rule() {
-            Rule::schema_file => {
-                for inner in pair.into_inner() {
-                    if let Rule::schema_decl = inner.as_rule() {
-                        declarations
-                            .push(parse_schema_decl(inner).map_err(nano_error_to_diagnostic)?);
-                    }
+        if pair.as_rule() == Rule::schema_file {
+            for inner in pair.into_inner() {
+                if let Rule::schema_decl = inner.as_rule() {
+                    declarations.push(parse_schema_decl(inner).map_err(nano_error_to_diagnostic)?);
                 }
             }
-            _ => {}
         }
     }
     let schema = SchemaFile { declarations };

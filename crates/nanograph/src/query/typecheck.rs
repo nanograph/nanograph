@@ -573,13 +573,13 @@ fn typecheck_binding(catalog: &Catalog, binding: &Binding, ctx: &mut TypeContext
     }
 
     // Don't overwrite if already bound to same type (re-binding same var is OK)
-    if let Some(existing) = ctx.bindings.get(&binding.variable) {
-        if existing.type_name != binding.type_name {
-            return Err(NanoError::Type(format!(
-                "variable `${}` already bound to type `{}`, cannot rebind to `{}`",
-                binding.variable, existing.type_name, binding.type_name
-            )));
-        }
+    if let Some(existing) = ctx.bindings.get(&binding.variable)
+        && existing.type_name != binding.type_name
+    {
+        return Err(NanoError::Type(format!(
+            "variable `${}` already bound to type `{}`, cannot rebind to `{}`",
+            binding.variable, existing.type_name, binding.type_name
+        )));
     }
 
     ctx.bindings.insert(
@@ -718,29 +718,24 @@ fn typecheck_filter(
     let right_type = resolve_expr_type(catalog, &filter.right, ctx, params)?;
 
     // T7: check type compatibility
-    match (&left_type, &right_type) {
-        (ResolvedType::Scalar(l), ResolvedType::Scalar(r)) => {
-            if l.list || r.list {
-                return Err(NanoError::Type(
-                    "T7: list comparisons in filters are not supported".to_string(),
-                ));
-            }
-            if matches!(l.scalar, ScalarType::Vector(_))
-                || matches!(r.scalar, ScalarType::Vector(_))
-            {
-                return Err(NanoError::Type(
-                    "T7: vector comparisons in filters are not supported".to_string(),
-                ));
-            }
-            if !types_compatible(l, r) {
-                return Err(NanoError::Type(format!(
-                    "T7: cannot compare {} with {}",
-                    l.display_name(),
-                    r.display_name()
-                )));
-            }
+    if let (ResolvedType::Scalar(l), ResolvedType::Scalar(r)) = (&left_type, &right_type) {
+        if l.list || r.list {
+            return Err(NanoError::Type(
+                "T7: list comparisons in filters are not supported".to_string(),
+            ));
         }
-        _ => {} // node or aggregate types — comparison may be on ids etc
+        if matches!(l.scalar, ScalarType::Vector(_)) || matches!(r.scalar, ScalarType::Vector(_)) {
+            return Err(NanoError::Type(
+                "T7: vector comparisons in filters are not supported".to_string(),
+            ));
+        }
+        if !types_compatible(l, r) {
+            return Err(NanoError::Type(format!(
+                "T7: cannot compare {} with {}",
+                l.display_name(),
+                r.display_name()
+            )));
+        }
     }
 
     Ok(())
@@ -812,19 +807,19 @@ fn resolve_expr_type(
                 ));
             }
 
-            if let Expr::Literal(lit) = query.as_ref() {
-                if let Some(dim) = numeric_vector_literal_dim(lit) {
-                    if dim != vector_dim {
-                        return Err(NanoError::Type(format!(
-                            "T15: nearest vector dimension mismatch: property is Vector({}), query literal has {} elements",
-                            vector_dim, dim
-                        )));
-                    }
-                    return Ok(ResolvedType::Scalar(PropType::scalar(
-                        ScalarType::F64,
-                        false,
+            if let Expr::Literal(lit) = query.as_ref()
+                && let Some(dim) = numeric_vector_literal_dim(lit)
+            {
+                if dim != vector_dim {
+                    return Err(NanoError::Type(format!(
+                        "T15: nearest vector dimension mismatch: property is Vector({}), query literal has {} elements",
+                        vector_dim, dim
                     )));
                 }
+                return Ok(ResolvedType::Scalar(PropType::scalar(
+                    ScalarType::F64,
+                    false,
+                )));
             }
 
             let query_type = resolve_expr_type(catalog, query, ctx, params)?;
@@ -1106,12 +1101,12 @@ fn resolve_expr_type(
                         ));
                     }
                 }
-                if let Expr::Literal(Literal::Integer(v)) = k_expr.as_ref() {
-                    if *v <= 0 {
-                        return Err(NanoError::Type(
-                            "T21: rrf k must be greater than 0".to_string(),
-                        ));
-                    }
+                if let Expr::Literal(Literal::Integer(v)) = k_expr.as_ref()
+                    && *v <= 0
+                {
+                    return Err(NanoError::Type(
+                        "T21: rrf k must be greater than 0".to_string(),
+                    ));
                 }
             }
 
@@ -1140,14 +1135,14 @@ fn resolve_expr_type(
             // T8: sum/avg/min/max require numeric
             match func {
                 AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max => {
-                    if let ResolvedType::Scalar(s) = &arg_type {
-                        if s.list || !s.scalar.is_numeric() {
-                            return Err(NanoError::Type(format!(
-                                "T8: {} requires numeric type, got {}",
-                                func,
-                                s.display_name()
-                            )));
-                        }
+                    if let ResolvedType::Scalar(s) = &arg_type
+                        && (s.list || !s.scalar.is_numeric())
+                    {
+                        return Err(NanoError::Type(format!(
+                            "T8: {} requires numeric type, got {}",
+                            func,
+                            s.display_name()
+                        )));
                     }
                 }
                 _ => {} // count works on any type
@@ -1270,18 +1265,17 @@ fn literal_type(lit: &Literal) -> Result<PropType> {
 }
 
 fn check_literal_type(lit: &Literal, expected: &PropType, prop_name: &str) -> Result<()> {
-    if !expected.list {
-        if let ScalarType::Vector(expected_dim) = expected.scalar {
-            if let Some(actual_dim) = numeric_vector_literal_dim(lit) {
-                if actual_dim == expected_dim {
-                    return Ok(());
-                }
-                return Err(NanoError::Type(format!(
-                    "T3: property `{}` has type Vector({}) but got vector literal with {} elements",
-                    prop_name, expected_dim, actual_dim
-                )));
-            }
+    if !expected.list
+        && let ScalarType::Vector(expected_dim) = expected.scalar
+        && let Some(actual_dim) = numeric_vector_literal_dim(lit)
+    {
+        if actual_dim == expected_dim {
+            return Ok(());
         }
+        return Err(NanoError::Type(format!(
+            "T3: property `{}` has type Vector({}) but got vector literal with {} elements",
+            prop_name, expected_dim, actual_dim
+        )));
     }
 
     let lit_type = literal_type(lit)?;

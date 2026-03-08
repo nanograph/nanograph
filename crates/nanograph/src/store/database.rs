@@ -124,19 +124,10 @@ pub struct CleanupResult {
     pub dataset_bytes_removed: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct CdcAnalyticsMaterializeOptions {
     pub min_new_rows: usize,
     pub force: bool,
-}
-
-impl Default for CdcAnalyticsMaterializeOptions {
-    fn default() -> Self {
-        Self {
-            min_new_rows: 0,
-            force: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -173,7 +164,7 @@ struct CdcAnalyticsState {
 enum MutationSource {
     LoadString { mode: LoadMode, data_source: String },
     LoadFile { mode: LoadMode, data_path: PathBuf },
-    PreparedStorage(GraphStorage),
+    PreparedStorage(Box<GraphStorage>),
 }
 
 #[derive(Debug, Clone)]
@@ -230,7 +221,7 @@ impl MutationPlan {
 
     fn prepared_storage(storage: GraphStorage, op_summary: &str) -> Self {
         Self {
-            source: MutationSource::PreparedStorage(storage),
+            source: MutationSource::PreparedStorage(Box::new(storage)),
             op_summary: op_summary.to_string(),
             cdc_events: Vec::new(),
         }

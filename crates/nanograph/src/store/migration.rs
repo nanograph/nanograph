@@ -513,13 +513,13 @@ fn build_desired_schema_ir_with_ids(
             });
         }
 
-        if let Some(from) = rename_from {
-            if from == node.name {
-                warnings.push(format!(
-                    "node `{}` uses redundant @rename_from(\"{}\")",
-                    node.name, from
-                ));
-            }
+        if let Some(from) = rename_from
+            && from == node.name
+        {
+            warnings.push(format!(
+                "node `{}` uses redundant @rename_from(\"{}\")",
+                node.name, from
+            ));
         }
 
         node_defs.push(NodeTypeDef {
@@ -616,13 +616,13 @@ fn build_desired_schema_ir_with_ids(
             });
         }
 
-        if let Some(from) = rename_from {
-            if from == edge.name {
-                warnings.push(format!(
-                    "edge `{}` uses redundant @rename_from(\"{}\")",
-                    edge.name, from
-                ));
-            }
+        if let Some(from) = rename_from
+            && from == edge.name
+        {
+            warnings.push(format!(
+                "edge `{}` uses redundant @rename_from(\"{}\")",
+                edge.name, from
+            ));
         }
 
         edge_defs.push(EdgeTypeDef {
@@ -854,20 +854,24 @@ fn analyze_schema_changes(
                     });
                 }
                 analyze_metadata_change(
-                    "node",
-                    &new_node.name,
-                    new_node.type_id,
-                    None,
+                    MetadataTarget {
+                        target_kind: "node",
+                        type_name: &new_node.name,
+                        type_id: new_node.type_id,
+                        prop: None,
+                    },
                     "description",
                     old_node.description.as_deref(),
                     new_node.description.as_deref(),
                     steps,
                 );
                 analyze_metadata_change(
-                    "node",
-                    &new_node.name,
-                    new_node.type_id,
-                    None,
+                    MetadataTarget {
+                        target_kind: "node",
+                        type_name: &new_node.name,
+                        type_id: new_node.type_id,
+                        prop: None,
+                    },
                     "instruction",
                     old_node.instruction.as_deref(),
                     new_node.instruction.as_deref(),
@@ -897,11 +901,7 @@ fn analyze_schema_changes(
                     old_node.name, new_name
                 )
             });
-        let classification = if remediation.is_some() {
-            SchemaCompatibility::CompatibleWithConfirmation
-        } else {
-            SchemaCompatibility::CompatibleWithConfirmation
-        };
+        let classification = SchemaCompatibility::CompatibleWithConfirmation;
         let reason = if remediation.is_some() {
             format!(
                 "possible node rename from `{}` without @rename_from",
@@ -970,20 +970,24 @@ fn analyze_schema_changes(
                     });
                 }
                 analyze_metadata_change(
-                    "edge",
-                    &new_edge.name,
-                    new_edge.type_id,
-                    None,
+                    MetadataTarget {
+                        target_kind: "edge",
+                        type_name: &new_edge.name,
+                        type_id: new_edge.type_id,
+                        prop: None,
+                    },
                     "description",
                     old_edge.description.as_deref(),
                     new_edge.description.as_deref(),
                     steps,
                 );
                 analyze_metadata_change(
-                    "edge",
-                    &new_edge.name,
-                    new_edge.type_id,
-                    None,
+                    MetadataTarget {
+                        target_kind: "edge",
+                        type_name: &new_edge.name,
+                        type_id: new_edge.type_id,
+                        prop: None,
+                    },
                     "instruction",
                     old_edge.instruction.as_deref(),
                     new_edge.instruction.as_deref(),
@@ -1142,10 +1146,12 @@ fn analyze_property_changes(
                     });
                 }
                 analyze_metadata_change(
-                    "property",
-                    display_type_name,
-                    type_id,
-                    Some((&new_prop.name, new_prop.prop_id)),
+                    MetadataTarget {
+                        target_kind: "property",
+                        type_name: display_type_name,
+                        type_id,
+                        prop: Some((&new_prop.name, new_prop.prop_id)),
+                    },
                     "description",
                     old_prop.description.as_deref(),
                     new_prop.description.as_deref(),
@@ -1307,11 +1313,15 @@ fn analyze_property_changes(
     }
 }
 
-fn analyze_metadata_change(
-    target_kind: &str,
-    type_name: &str,
+struct MetadataTarget<'a> {
+    target_kind: &'a str,
+    type_name: &'a str,
     type_id: u32,
-    prop: Option<(&str, u32)>,
+    prop: Option<(&'a str, u32)>,
+}
+
+fn analyze_metadata_change(
+    target: MetadataTarget<'_>,
     annotation: &str,
     old_value: Option<&str>,
     new_value: Option<&str>,
@@ -1320,14 +1330,15 @@ fn analyze_metadata_change(
     if old_value == new_value {
         return;
     }
-    let (prop_name, _prop_id) = prop
+    let (prop_name, _prop_id) = target
+        .prop
         .map(|(name, prop_id)| (Some(name.to_string()), Some(prop_id)))
         .unwrap_or((None, None));
     steps.push(SchemaDiffStep {
         step: MigrationStep::AlterMetadata {
-            target_kind: target_kind.to_string(),
-            type_name: type_name.to_string(),
-            type_id,
+            target_kind: target.target_kind.to_string(),
+            type_name: target.type_name.to_string(),
+            type_id: target.type_id,
             prop_name,
             annotation: annotation.to_string(),
             old_value: old_value.map(str::to_string),
@@ -1391,17 +1402,17 @@ fn classify_schema_only_type_change(
 
     let old_scalar = ScalarType::from_str_name(&old_prop.scalar_type);
     let new_scalar = ScalarType::from_str_name(&new_prop.scalar_type);
-    if let (Some(old_scalar), Some(new_scalar)) = (old_scalar, new_scalar) {
-        if is_lossless_scalar_change(old_scalar, new_scalar) {
-            return (
-                SchemaCompatibility::CompatibleWithConfirmation,
-                format!(
-                    "lossless scalar widening for `{}`.`{}` requires a rewrite",
-                    type_name, prop_name
-                ),
-                None,
-            );
-        }
+    if let (Some(old_scalar), Some(new_scalar)) = (old_scalar, new_scalar)
+        && is_lossless_scalar_change(old_scalar, new_scalar)
+    {
+        return (
+            SchemaCompatibility::CompatibleWithConfirmation,
+            format!(
+                "lossless scalar widening for `{}`.`{}` requires a rewrite",
+                type_name, prop_name
+            ),
+            None,
+        );
     }
 
     (
@@ -1642,9 +1653,11 @@ fn diff_schema(
                     });
                 }
                 diff_properties(
-                    &old_node.name,
-                    &new_node.name,
-                    old_node.type_id,
+                    PropertyDiffTarget {
+                        source_type_name: &old_node.name,
+                        display_type_name: &new_node.name,
+                        type_id: old_node.type_id,
+                    },
                     &old_node.properties,
                     &new_node.properties,
                     get_node_column,
@@ -1719,9 +1732,11 @@ fn diff_schema(
                 }
 
                 diff_properties(
-                    &old_edge.name,
-                    &new_edge.name,
-                    old_edge.type_id,
+                    PropertyDiffTarget {
+                        source_type_name: &old_edge.name,
+                        display_type_name: &new_edge.name,
+                        type_id: old_edge.type_id,
+                    },
                     &old_edge.properties,
                     &new_edge.properties,
                     get_edge_column,
@@ -1749,10 +1764,14 @@ fn diff_schema(
     Ok(())
 }
 
-fn diff_properties<F>(
-    source_type_name: &str,
-    display_type_name: &str,
+struct PropertyDiffTarget<'a> {
+    source_type_name: &'a str,
+    display_type_name: &'a str,
     type_id: u32,
+}
+
+fn diff_properties<F>(
+    target: PropertyDiffTarget<'_>,
     old_props: &[PropDef],
     new_props: &[PropDef],
     column_getter: F,
@@ -1780,14 +1799,14 @@ where
                 } else {
                     blocked.push(format!(
                         "type `{}` adds non-nullable property `{}` without a default/backfill",
-                        display_type_name, new_p.name
+                        target.display_type_name, new_p.name
                     ));
                     MigrationSafety::Blocked
                 };
                 steps.push(PlannedStep {
                     step: MigrationStep::AddProperty {
-                        type_name: display_type_name.to_string(),
-                        type_id,
+                        type_name: target.display_type_name.to_string(),
+                        type_id: target.type_id,
                         prop_name: new_p.name.clone(),
                         prop_id: new_p.prop_id,
                         data_type: new_p.scalar_type.clone(),
@@ -1801,8 +1820,8 @@ where
                 if old_p.name != new_p.name {
                     steps.push(PlannedStep {
                         step: MigrationStep::RenameProperty {
-                            type_name: display_type_name.to_string(),
-                            type_id,
+                            type_name: target.display_type_name.to_string(),
+                            type_id: target.type_id,
                             old_name: old_p.name.clone(),
                             new_name: new_p.name.clone(),
                             prop_id: new_p.prop_id,
@@ -1814,8 +1833,8 @@ where
                 if old_p.scalar_type != new_p.scalar_type {
                     let (safety, reason) = classify_type_change(
                         db,
-                        source_type_name,
-                        display_type_name,
+                        target.source_type_name,
+                        target.display_type_name,
                         &old_p.name,
                         &new_p.scalar_type,
                         &column_getter,
@@ -1825,8 +1844,8 @@ where
                     }
                     steps.push(PlannedStep {
                         step: MigrationStep::AlterPropertyType {
-                            type_name: display_type_name.to_string(),
-                            type_id,
+                            type_name: target.display_type_name.to_string(),
+                            type_id: target.type_id,
                             prop_name: new_p.name.clone(),
                             prop_id: new_p.prop_id,
                             old_type: old_p.scalar_type.clone(),
@@ -1839,8 +1858,8 @@ where
                 if old_p.nullable != new_p.nullable {
                     let (safety, reason) = classify_nullability_change(
                         db,
-                        source_type_name,
-                        display_type_name,
+                        target.source_type_name,
+                        target.display_type_name,
                         &old_p.name,
                         old_p.nullable,
                         new_p.nullable,
@@ -1851,8 +1870,8 @@ where
                     }
                     steps.push(PlannedStep {
                         step: MigrationStep::AlterPropertyNullability {
-                            type_name: display_type_name.to_string(),
-                            type_id,
+                            type_name: target.display_type_name.to_string(),
+                            type_id: target.type_id,
                             prop_name: new_p.name.clone(),
                             prop_id: new_p.prop_id,
                             nullable: new_p.nullable,
@@ -1869,8 +1888,8 @@ where
         if !new_by_id.contains_key(&old_p.prop_id) {
             steps.push(PlannedStep {
                 step: MigrationStep::DropProperty {
-                    type_name: display_type_name.to_string(),
-                    type_id,
+                    type_name: target.display_type_name.to_string(),
+                    type_id: target.type_id,
                     prop_name: old_p.name.clone(),
                     prop_id: old_p.prop_id,
                 },
@@ -1935,18 +1954,18 @@ where
     F: Fn(&Database, &str, &str) -> Result<Option<ArrayRef>>,
 {
     if old_nullable && !new_nullable {
-        if let Some(col) = column_getter(db, source_type_name, old_prop_name)? {
-            if col.null_count() > 0 {
-                return Ok((
-                    MigrationSafety::Blocked,
-                    format!(
-                        "cannot make `{}`.`{}` non-nullable: {} null value(s) exist",
-                        display_type_name,
-                        old_prop_name,
-                        col.null_count()
-                    ),
-                ));
-            }
+        if let Some(col) = column_getter(db, source_type_name, old_prop_name)?
+            && col.null_count() > 0
+        {
+            return Ok((
+                MigrationSafety::Blocked,
+                format!(
+                    "cannot make `{}`.`{}` non-nullable: {} null value(s) exist",
+                    display_type_name,
+                    old_prop_name,
+                    col.null_count()
+                ),
+            ));
         }
         return Ok((
             MigrationSafety::Confirm,
@@ -2032,13 +2051,12 @@ fn build_node_id_sets_by_type_id(
             continue;
         };
         let mut set = HashSet::new();
-        if let Ok(Some(batch)) = storage.get_all_nodes(&n.name) {
-            if let Some(col) = batch.column_by_name("id") {
-                if let Some(ids) = col.as_any().downcast_ref::<UInt64Array>() {
-                    for i in 0..ids.len() {
-                        set.insert(ids.value(i));
-                    }
-                }
+        if let Ok(Some(batch)) = storage.get_all_nodes(&n.name)
+            && let Some(col) = batch.column_by_name("id")
+            && let Some(ids) = col.as_any().downcast_ref::<UInt64Array>()
+        {
+            for i in 0..ids.len() {
+                set.insert(ids.value(i));
             }
         }
         out.insert(n.type_id, set);

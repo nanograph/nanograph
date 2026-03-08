@@ -304,15 +304,15 @@ fn find_outer_var(clauses: &[Clause], outer_bound: &HashSet<String>) -> Option<S
                 }
             }
             Clause::Filter(f) => {
-                if let Some(v) = expr_var(&f.left) {
-                    if outer_bound.contains(&v) {
-                        return Some(v);
-                    }
+                if let Some(v) = expr_var(&f.left)
+                    && outer_bound.contains(&v)
+                {
+                    return Some(v);
                 }
-                if let Some(v) = expr_var(&f.right) {
-                    if outer_bound.contains(&v) {
-                        return Some(v);
-                    }
+                if let Some(v) = expr_var(&f.right)
+                    && outer_bound.contains(&v)
+                {
+                    return Some(v);
                 }
             }
             Clause::Binding(b) => {

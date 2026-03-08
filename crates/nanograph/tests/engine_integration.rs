@@ -1038,7 +1038,7 @@ query q() {
 async fn test_insert_mutation_query() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let mut db = Database::init(&db_path, test_schema()).await.unwrap();
+    let db = Database::init(&db_path, test_schema()).await.unwrap();
     db.load(test_data()).await.unwrap();
 
     let mut params = ParamMap::new();
@@ -1059,7 +1059,7 @@ query add_person($name: String, $age: I32) {
     }
 }
 "#,
-        &mut db,
+        &db,
         &params,
     )
     .await;
@@ -1087,7 +1087,7 @@ query q() {
 async fn test_insert_edge_mutation_query() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let mut db = Database::init(&db_path, test_schema()).await.unwrap();
+    let db = Database::init(&db_path, test_schema()).await.unwrap();
     db.load(test_data()).await.unwrap();
 
     let mut params = ParamMap::new();
@@ -1109,7 +1109,7 @@ query add_knows($from: String, $to: String) {
     }
 }
 "#,
-        &mut db,
+        &db,
         &params,
     )
     .await;
@@ -1123,7 +1123,7 @@ query add_knows($from: String, $to: String) {
 async fn test_update_mutation_query_preserves_id_and_edges() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let mut db = Database::init(&db_path, keyed_mutation_schema())
+    let db = Database::init(&db_path, keyed_mutation_schema())
         .await
         .unwrap();
     db.load(keyed_mutation_data()).await.unwrap();
@@ -1163,7 +1163,7 @@ query update_person($name: String, $age: I32) {
     update Person set { age: $age } where name = $name
 }
 "#,
-        &mut db,
+        &db,
         &params,
     )
     .await;
@@ -1221,7 +1221,7 @@ query update_person($name: String, $age: I32) {
 async fn test_delete_edge_mutation_query() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let mut db = Database::init(&db_path, test_schema()).await.unwrap();
+    let db = Database::init(&db_path, test_schema()).await.unwrap();
     db.load(test_data()).await.unwrap();
 
     let mut params = ParamMap::new();
@@ -1235,7 +1235,7 @@ query delete_knows($from: String) {
     delete Knows where from = $from
 }
 "#,
-        &mut db,
+        &db,
         &params,
     )
     .await;
@@ -1249,7 +1249,7 @@ query delete_knows($from: String) {
 async fn test_delete_mutation_query_cascades_edges() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");
-    let mut db = Database::init(&db_path, test_schema()).await.unwrap();
+    let db = Database::init(&db_path, test_schema()).await.unwrap();
     db.load(test_data()).await.unwrap();
 
     let mut params = ParamMap::new();
@@ -1263,7 +1263,7 @@ query delete_person($name: String) {
     delete Person where name = $name
 }
 "#,
-        &mut db,
+        &db,
         &params,
     )
     .await;

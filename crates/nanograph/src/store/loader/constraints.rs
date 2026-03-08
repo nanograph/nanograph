@@ -29,13 +29,11 @@ pub(crate) fn load_node_constraint_annotations(
         let mut node_unique_props: Vec<String> = Vec::new();
 
         for prop in &node.properties {
-            if prop.key {
-                if node_key_prop.replace(prop.name.clone()).is_some() {
-                    return Err(NanoError::Storage(format!(
-                        "node type {} has multiple @key properties; only one is currently supported",
-                        node.name
-                    )));
-                }
+            if prop.key && node_key_prop.replace(prop.name.clone()).is_some() {
+                return Err(NanoError::Storage(format!(
+                    "node type {} has multiple @key properties; only one is currently supported",
+                    node.name
+                )));
             }
             if prop.unique {
                 node_unique_props.push(prop.name.clone());
@@ -168,7 +166,7 @@ pub(crate) fn node_property_index(schema: &Schema, prop_name: &str) -> Option<us
 }
 
 pub(crate) fn node_property_field<'a>(schema: &'a Schema, prop_name: &str) -> Option<&'a Field> {
-    node_property_index(schema, prop_name).map(|idx| schema.field(idx).as_ref())
+    node_property_index(schema, prop_name).map(|idx| schema.field(idx))
 }
 
 pub(crate) fn key_value_string(array: &ArrayRef, row: usize, prop_name: &str) -> Result<String> {

@@ -42,19 +42,33 @@ pub(crate) struct ExpandExec {
     properties: PlanProperties,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ExpandSpec {
+    pub src_var: String,
+    pub dst_var: String,
+    pub edge_type: String,
+    pub direction: Direction,
+    pub dst_type: String,
+    pub min_hops: u32,
+    pub max_hops: Option<u32>,
+}
+
 impl ExpandExec {
     pub(crate) fn new(
         input: Arc<dyn ExecutionPlan>,
-        src_var: String,
-        dst_var: String,
-        edge_type: String,
-        direction: Direction,
-        dst_type: String,
-        min_hops: u32,
-        max_hops: Option<u32>,
+        spec: ExpandSpec,
         storage: Arc<GraphStorage>,
     ) -> Self {
         let input_schema = input.schema();
+        let ExpandSpec {
+            src_var,
+            dst_var,
+            edge_type,
+            direction,
+            dst_type,
+            min_hops,
+            max_hops,
+        } = spec;
 
         // Build output schema: input fields + new struct column for dst
         let dst_node_type = &storage.catalog.node_types[&dst_type];
@@ -139,13 +153,15 @@ impl ExecutionPlan for ExpandExec {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         Ok(Arc::new(ExpandExec::new(
             children[0].clone(),
-            self.src_var.clone(),
-            self.dst_var.clone(),
-            self.edge_type.clone(),
-            self.direction,
-            self.dst_type.clone(),
-            self.min_hops,
-            self.max_hops,
+            ExpandSpec {
+                src_var: self.src_var.clone(),
+                dst_var: self.dst_var.clone(),
+                edge_type: self.edge_type.clone(),
+                direction: self.direction,
+                dst_type: self.dst_type.clone(),
+                min_hops: self.min_hops,
+                max_hops: self.max_hops,
+            },
             self.storage.clone(),
         )))
     }
@@ -263,32 +279,32 @@ impl ExpandExec {
             DataType::FixedSizeList(actual, actual_dim),
             DataType::FixedSizeList(expected, expected_dim),
         ) = (col.data_type(), field.data_type())
+            && actual_dim == expected_dim
+            && actual.data_type() == expected.data_type()
         {
-            if actual_dim == expected_dim && actual.data_type() == expected.data_type() {
-                let list = col
-                    .as_any()
-                    .downcast_ref::<FixedSizeListArray>()
-                    .ok_or_else(|| {
-                        datafusion_common::DataFusionError::Execution(
-                            "failed to downcast FixedSizeList column while aligning expand output"
-                                .to_string(),
-                        )
-                    })?;
-                let rebuilt = FixedSizeListArray::try_new(
-                    expected.clone(),
-                    *expected_dim,
-                    list.values().clone(),
-                    list.nulls().cloned(),
-                )
-                .map_err(|e| {
-                    datafusion_common::DataFusionError::Execution(format!(
-                        "failed to align FixedSizeList column '{}': {}",
-                        field.name(),
-                        e
-                    ))
+            let list = col
+                .as_any()
+                .downcast_ref::<FixedSizeListArray>()
+                .ok_or_else(|| {
+                    datafusion_common::DataFusionError::Execution(
+                        "failed to downcast FixedSizeList column while aligning expand output"
+                            .to_string(),
+                    )
                 })?;
-                return Ok(Arc::new(rebuilt) as ArrayRef);
-            }
+            let rebuilt = FixedSizeListArray::try_new(
+                expected.clone(),
+                *expected_dim,
+                list.values().clone(),
+                list.nulls().cloned(),
+            )
+            .map_err(|e| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "failed to align FixedSizeList column '{}': {}",
+                    field.name(),
+                    e
+                ))
+            })?;
+            return Ok(Arc::new(rebuilt) as ArrayRef);
         }
 
         arrow_cast::cast(col, field.data_type()).map_err(|e| {

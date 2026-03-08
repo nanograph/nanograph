@@ -51,10 +51,12 @@ impl Database {
                 })?;
             let before_version = dataset.version().version;
 
-            let mut compact_opts = LanceCompactionOptions::default();
-            compact_opts.target_rows_per_fragment = options.target_rows_per_fragment;
-            compact_opts.materialize_deletions = options.materialize_deletions;
-            compact_opts.materialize_deletions_threshold = options.materialize_deletions_threshold;
+            let compact_opts = LanceCompactionOptions {
+                target_rows_per_fragment: options.target_rows_per_fragment,
+                materialize_deletions: options.materialize_deletions,
+                materialize_deletions_threshold: options.materialize_deletions_threshold,
+                ..Default::default()
+            };
 
             let metrics = compact_files(&mut dataset, compact_opts, None)
                 .await
@@ -375,10 +377,10 @@ pub(super) fn cleanup_stale_dirs(db_path: &Path, manifest: &GraphManifest) -> Re
         if dir.exists() {
             for entry in std::fs::read_dir(&dir)? {
                 let entry = entry?;
-                if let Some(name) = entry.file_name().to_str() {
-                    if !valid.contains(name) {
-                        let _ = std::fs::remove_dir_all(entry.path());
-                    }
+                if let Some(name) = entry.file_name().to_str()
+                    && !valid.contains(name)
+                {
+                    let _ = std::fs::remove_dir_all(entry.path());
                 }
             }
         }

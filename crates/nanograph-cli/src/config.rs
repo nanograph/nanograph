@@ -342,14 +342,12 @@ impl LoadedConfig {
             embedding.chunk_overlap_chars,
         );
 
-        if !exists("OPENAI_API_KEY") {
-            if let Some(api_key_env) = trim_nonempty(embedding.api_key_env.as_deref()) {
-                if let Some(value) = get(api_key_env) {
-                    if let Some(value) = trim_nonempty(Some(value.as_str())) {
-                        set("OPENAI_API_KEY", value);
-                    }
-                }
-            }
+        if !exists("OPENAI_API_KEY")
+            && let Some(api_key_env) = trim_nonempty(embedding.api_key_env.as_deref())
+            && let Some(value) = get(api_key_env)
+            && let Some(value) = trim_nonempty(Some(value.as_str()))
+        {
+            set("OPENAI_API_KEY", value);
         }
 
         Ok(())

@@ -241,78 +241,74 @@ async fn materialize_embeddings_for_load_to_tempfile_inner_with_chunking<R: BufR
             .get("type")
             .and_then(|value| value.as_str())
             .map(|value| value.to_string())
+            && let Some(specs) = embed_specs.get(type_name.as_str())
         {
-            if let Some(specs) = embed_specs.get(type_name.as_str()) {
-                let data_obj = obj
-                    .get_mut("data")
-                    .and_then(|value| value.as_object_mut())
-                    .ok_or_else(|| {
-                        NanoError::Storage(format!(
-                            "node {} line {} is missing object field `data`",
-                            type_name,
-                            line_no + 1
-                        ))
-                    })?;
-                let mut mutated = false;
+            let data_obj = obj
+                .get_mut("data")
+                .and_then(|value| value.as_object_mut())
+                .ok_or_else(|| {
+                    NanoError::Storage(format!(
+                        "node {} line {} is missing object field `data`",
+                        type_name,
+                        line_no + 1
+                    ))
+                })?;
+            let mut mutated = false;
 
-                for spec in specs {
-                    let needs_embedding = match data_obj.get(&spec.target_prop) {
-                        Some(value) => value.is_null(),
-                        None => true,
-                    };
-                    if !needs_embedding {
-                        continue;
-                    }
-
-                    let source_value = data_obj.get(&spec.source_prop).ok_or_else(|| {
-                        NanoError::Storage(format!(
-                            "node {} line {} missing @embed source property `{}` for `{}`",
-                            type_name,
-                            line_no + 1,
-                            spec.source_prop,
-                            spec.target_prop
-                        ))
-                    })?;
-                    let source_text = source_value.as_str().ok_or_else(|| {
-                        NanoError::Storage(format!(
-                            "node {} line {} @embed source property `{}` must be String",
-                            type_name,
-                            line_no + 1,
-                            spec.source_prop
-                        ))
-                    })?;
-
-                    let assignment = StreamPendingAssignment {
-                        line_id: next_line_id,
-                        target_prop: spec.target_prop.clone(),
-                        source_text: source_text.to_string(),
-                        dim: spec.dim,
-                        content_hash: hash_string(source_text),
-                    };
-                    let cache_key = assignment.cache_key(&model, chunking);
-                    if let Some(vector) = cache.get(&cache_key) {
-                        data_obj.insert(
-                            spec.target_prop.clone(),
-                            serde_json::to_value(vector).map_err(|e| {
-                                NanoError::Storage(format!(
-                                    "serialize embedding vector failed: {}",
-                                    e
-                                ))
-                            })?,
-                        );
-                    } else {
-                        missing_assignments += 1;
-                        pending_by_dim
-                            .entry(spec.dim)
-                            .or_default()
-                            .push_back(assignment);
-                    }
-                    mutated = true;
+            for spec in specs {
+                let needs_embedding = match data_obj.get(&spec.target_prop) {
+                    Some(value) => value.is_null(),
+                    None => true,
+                };
+                if !needs_embedding {
+                    continue;
                 }
 
-                if mutated {
-                    output_line = ParsedLine::Json(obj);
+                let source_value = data_obj.get(&spec.source_prop).ok_or_else(|| {
+                    NanoError::Storage(format!(
+                        "node {} line {} missing @embed source property `{}` for `{}`",
+                        type_name,
+                        line_no + 1,
+                        spec.source_prop,
+                        spec.target_prop
+                    ))
+                })?;
+                let source_text = source_value.as_str().ok_or_else(|| {
+                    NanoError::Storage(format!(
+                        "node {} line {} @embed source property `{}` must be String",
+                        type_name,
+                        line_no + 1,
+                        spec.source_prop
+                    ))
+                })?;
+
+                let assignment = StreamPendingAssignment {
+                    line_id: next_line_id,
+                    target_prop: spec.target_prop.clone(),
+                    source_text: source_text.to_string(),
+                    dim: spec.dim,
+                    content_hash: hash_string(source_text),
+                };
+                let cache_key = assignment.cache_key(&model, chunking);
+                if let Some(vector) = cache.get(&cache_key) {
+                    data_obj.insert(
+                        spec.target_prop.clone(),
+                        serde_json::to_value(vector).map_err(|e| {
+                            NanoError::Storage(format!("serialize embedding vector failed: {}", e))
+                        })?,
+                    );
+                } else {
+                    missing_assignments += 1;
+                    pending_by_dim
+                        .entry(spec.dim)
+                        .or_default()
+                        .push_back(assignment);
                 }
+                mutated = true;
+            }
+
+            if mutated {
+                output_line = ParsedLine::Json(obj);
             }
         }
 
@@ -323,33 +319,34 @@ async fn materialize_embeddings_for_load_to_tempfile_inner_with_chunking<R: BufR
         });
         next_line_id += 1;
 
+        let mut runtime = StreamEmbedRuntime {
+            cache: &mut cache,
+            model: &model,
+            client,
+            new_cache_records: &mut new_cache_records,
+            batch_size,
+            chunking,
+        };
         resolve_pending_stream_batches(
             &mut pending_by_dim,
             &mut pending_lines,
-            &mut cache,
-            &model,
-            client,
-            &mut new_cache_records,
-            batch_size,
-            chunking,
+            &mut runtime,
             false,
         )
         .await?;
         flush_ready_stream_lines(&mut writer, &mut pending_lines)?;
     }
 
-    resolve_pending_stream_batches(
-        &mut pending_by_dim,
-        &mut pending_lines,
-        &mut cache,
-        &model,
+    let mut runtime = StreamEmbedRuntime {
+        cache: &mut cache,
+        model: &model,
         client,
-        &mut new_cache_records,
+        new_cache_records: &mut new_cache_records,
         batch_size,
         chunking,
-        true,
-    )
-    .await?;
+    };
+    resolve_pending_stream_batches(&mut pending_by_dim, &mut pending_lines, &mut runtime, true)
+        .await?;
     flush_ready_stream_lines(&mut writer, &mut pending_lines)?;
     writer.flush()?;
 
@@ -505,55 +502,54 @@ fn parse_input_lines(
             .get("type")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
+            && let Some(specs) = embed_specs.get(type_name.as_str())
         {
-            if let Some(specs) = embed_specs.get(type_name.as_str()) {
-                let data_obj = obj
-                    .get_mut("data")
-                    .and_then(|v| v.as_object_mut())
-                    .ok_or_else(|| {
-                        NanoError::Storage(format!(
-                            "node {} line {} is missing object field `data`",
-                            type_name,
-                            line_no + 1
-                        ))
-                    })?;
-                let line_index = lines.len();
+            let data_obj = obj
+                .get_mut("data")
+                .and_then(|v| v.as_object_mut())
+                .ok_or_else(|| {
+                    NanoError::Storage(format!(
+                        "node {} line {} is missing object field `data`",
+                        type_name,
+                        line_no + 1
+                    ))
+                })?;
+            let line_index = lines.len();
 
-                for spec in specs {
-                    let needs_embedding = match data_obj.get(&spec.target_prop) {
-                        Some(value) => value.is_null(),
-                        None => true,
-                    };
-                    if !needs_embedding {
-                        continue;
-                    }
-
-                    let source_value = data_obj.get(&spec.source_prop).ok_or_else(|| {
-                        NanoError::Storage(format!(
-                            "node {} line {} missing @embed source property `{}` for `{}`",
-                            type_name,
-                            line_no + 1,
-                            spec.source_prop,
-                            spec.target_prop
-                        ))
-                    })?;
-                    let source_text = source_value.as_str().ok_or_else(|| {
-                        NanoError::Storage(format!(
-                            "node {} line {} @embed source property `{}` must be String",
-                            type_name,
-                            line_no + 1,
-                            spec.source_prop
-                        ))
-                    })?;
-
-                    pending.push(PendingAssignment {
-                        line_index,
-                        target_prop: spec.target_prop.clone(),
-                        source_text: source_text.to_string(),
-                        dim: spec.dim,
-                        content_hash: hash_string(source_text),
-                    });
+            for spec in specs {
+                let needs_embedding = match data_obj.get(&spec.target_prop) {
+                    Some(value) => value.is_null(),
+                    None => true,
+                };
+                if !needs_embedding {
+                    continue;
                 }
+
+                let source_value = data_obj.get(&spec.source_prop).ok_or_else(|| {
+                    NanoError::Storage(format!(
+                        "node {} line {} missing @embed source property `{}` for `{}`",
+                        type_name,
+                        line_no + 1,
+                        spec.source_prop,
+                        spec.target_prop
+                    ))
+                })?;
+                let source_text = source_value.as_str().ok_or_else(|| {
+                    NanoError::Storage(format!(
+                        "node {} line {} @embed source property `{}` must be String",
+                        type_name,
+                        line_no + 1,
+                        spec.source_prop
+                    ))
+                })?;
+
+                pending.push(PendingAssignment {
+                    line_index,
+                    target_prop: spec.target_prop.clone(),
+                    source_text: source_text.to_string(),
+                    dim: spec.dim,
+                    content_hash: hash_string(source_text),
+                });
             }
         }
 
@@ -637,12 +633,7 @@ fn render_output_lines(original: &str, lines: Vec<ParsedLine>) -> Result<String>
 async fn resolve_pending_stream_batches(
     pending_by_dim: &mut BTreeMap<usize, VecDeque<StreamPendingAssignment>>,
     pending_lines: &mut VecDeque<StreamPendingLine>,
-    cache: &mut HashMap<CacheKey, Vec<f32>>,
-    model: &str,
-    client: &EmbeddingClient,
-    new_cache_records: &mut Vec<CacheRecord>,
-    batch_size: usize,
-    chunking: EmbedChunkingConfig,
+    runtime: &mut StreamEmbedRuntime<'_>,
     flush_all: bool,
 ) -> Result<()> {
     loop {
@@ -652,7 +643,7 @@ async fn resolve_pending_stream_batches(
                 if flush_all {
                     !queue.is_empty()
                 } else {
-                    queue.len() >= batch_size.max(1)
+                    queue.len() >= runtime.batch_size.max(1)
                 }
             })
             .map(|(dim, _)| *dim);
@@ -663,17 +654,7 @@ async fn resolve_pending_stream_batches(
         let queue = pending_by_dim.get_mut(&dim).ok_or_else(|| {
             NanoError::Storage(format!("missing pending embedding queue for dim {}", dim))
         })?;
-        resolve_pending_stream_batch(
-            queue,
-            pending_lines,
-            cache,
-            model,
-            client,
-            new_cache_records,
-            batch_size,
-            chunking,
-        )
-        .await?;
+        resolve_pending_stream_batch(queue, pending_lines, runtime).await?;
         if queue.is_empty() {
             pending_by_dim.remove(&dim);
         }
@@ -685,20 +666,15 @@ async fn resolve_pending_stream_batches(
 async fn resolve_pending_stream_batch(
     queue: &mut VecDeque<StreamPendingAssignment>,
     pending_lines: &mut VecDeque<StreamPendingLine>,
-    cache: &mut HashMap<CacheKey, Vec<f32>>,
-    model: &str,
-    client: &EmbeddingClient,
-    new_cache_records: &mut Vec<CacheRecord>,
-    batch_size: usize,
-    chunking: EmbedChunkingConfig,
+    runtime: &mut StreamEmbedRuntime<'_>,
 ) -> Result<()> {
-    let batch_size = batch_size.max(1);
+    let batch_size = runtime.batch_size.max(1);
     let mut assignments = Vec::new();
     let mut unique_entries = Vec::new();
     let mut seen_keys = HashSet::new();
 
     while let Some(assignment) = queue.pop_front() {
-        let cache_key = assignment.cache_key(model, chunking);
+        let cache_key = assignment.cache_key(runtime.model, runtime.chunking);
         if seen_keys.insert(cache_key.clone()) {
             unique_entries.push((cache_key, assignment.source_text.clone()));
         }
@@ -712,10 +688,16 @@ async fn resolve_pending_stream_batch(
         return Ok(());
     }
 
-    if chunking.is_enabled() {
+    if runtime.chunking.is_enabled() {
         for (cache_key, text) in &unique_entries {
-            let vector =
-                embed_text_with_chunking(client, text, cache_key.dim, batch_size, chunking).await?;
+            let vector = embed_text_with_chunking(
+                runtime.client,
+                text,
+                cache_key.dim,
+                batch_size,
+                runtime.chunking,
+            )
+            .await?;
             if vector.len() != cache_key.dim {
                 return Err(NanoError::Storage(format!(
                     "embedding dimension mismatch for {}: expected {}, got {}",
@@ -724,8 +706,8 @@ async fn resolve_pending_stream_batch(
                     vector.len()
                 )));
             }
-            cache.insert(cache_key.clone(), vector.clone());
-            new_cache_records.push(CacheRecord {
+            runtime.cache.insert(cache_key.clone(), vector.clone());
+            runtime.new_cache_records.push(CacheRecord {
                 model: cache_key.model.clone(),
                 dim: cache_key.dim,
                 content_hash: cache_key.content_hash.clone(),
@@ -740,7 +722,8 @@ async fn resolve_pending_stream_batch(
             .map(|(_, text)| text.clone())
             .collect();
         let dim = unique_entries[0].0.dim;
-        let vectors = client
+        let vectors = runtime
+            .client
             .embed_texts(&texts, dim)
             .await
             .map_err(|err| NanoError::Storage(format!("embedding request failed: {}", err)))?;
@@ -761,8 +744,8 @@ async fn resolve_pending_stream_batch(
                     vector.len()
                 )));
             }
-            cache.insert(cache_key.clone(), vector.clone());
-            new_cache_records.push(CacheRecord {
+            runtime.cache.insert(cache_key.clone(), vector.clone());
+            runtime.new_cache_records.push(CacheRecord {
                 model: cache_key.model.clone(),
                 dim: cache_key.dim,
                 content_hash: cache_key.content_hash.clone(),
@@ -774,10 +757,25 @@ async fn resolve_pending_stream_batch(
     }
 
     for assignment in &assignments {
-        apply_stream_assignment(pending_lines, assignment, cache, model, chunking)?;
+        apply_stream_assignment(
+            pending_lines,
+            assignment,
+            runtime.cache,
+            runtime.model,
+            runtime.chunking,
+        )?;
     }
 
     Ok(())
+}
+
+struct StreamEmbedRuntime<'a> {
+    cache: &'a mut HashMap<CacheKey, Vec<f32>>,
+    model: &'a str,
+    client: &'a EmbeddingClient,
+    new_cache_records: &'a mut Vec<CacheRecord>,
+    batch_size: usize,
+    chunking: EmbedChunkingConfig,
 }
 
 fn apply_stream_assignment(

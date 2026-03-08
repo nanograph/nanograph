@@ -10,9 +10,7 @@ fn revops_load_modes_and_standalone_delete_work() {
 
     workspace.write_file(
         "append_patch.jsonl",
-        concat!(
-            "{\"type\":\"ActionItem\",\"data\":{\"slug\":\"ai-follow-up-renewal\",\"title\":\"Follow up on renewal risk\",\"description\":\"Reach out before the renewal window closes.\",\"status\":\"open\",\"priority\":\"high\",\"dueDate\":\"2026-02-20T10:00:00Z\",\"createdAt\":\"2026-02-16T09:00:00Z\",\"updatedAt\":\"2026-02-16T09:00:00Z\"}}\n"
-        ),
+        "{\"type\":\"ActionItem\",\"data\":{\"slug\":\"ai-follow-up-renewal\",\"title\":\"Follow up on renewal risk\",\"description\":\"Reach out before the renewal window closes.\",\"status\":\"open\",\"priority\":\"high\",\"dueDate\":\"2026-02-20T10:00:00Z\",\"createdAt\":\"2026-02-16T09:00:00Z\",\"updatedAt\":\"2026-02-16T09:00:00Z\"}}\n",
     );
     let append = workspace.json_value(&[
         "--json",
@@ -40,9 +38,7 @@ fn revops_load_modes_and_standalone_delete_work() {
 
     workspace.write_file(
         "merge_patch.jsonl",
-        concat!(
-            "{\"type\":\"Opportunity\",\"data\":{\"slug\":\"opp-stripe-migration\",\"title\":\"Stripe Migration\",\"description\":\"Migration opportunity tied to vendor dissatisfaction.\",\"dealType\":\"net_new\",\"stage\":\"hold\",\"priority\":\"high\",\"risk\":\"medium\",\"amount\":25000.0,\"currency\":\"USD\",\"amountPaid\":0.0,\"expectedClose\":\"2026-03-01T00:00:00Z\",\"createdAt\":\"2026-02-01T09:00:00Z\",\"updatedAt\":\"2026-02-16T10:30:00Z\",\"notes\":[\"stage changed via merge mode\"]}}\n"
-        ),
+        "{\"type\":\"Opportunity\",\"data\":{\"slug\":\"opp-stripe-migration\",\"title\":\"Stripe Migration\",\"description\":\"Migration opportunity tied to vendor dissatisfaction.\",\"dealType\":\"net_new\",\"stage\":\"hold\",\"priority\":\"high\",\"risk\":\"medium\",\"amount\":25000.0,\"currency\":\"USD\",\"amountPaid\":0.0,\"expectedClose\":\"2026-03-01T00:00:00Z\",\"createdAt\":\"2026-02-01T09:00:00Z\",\"updatedAt\":\"2026-02-16T10:30:00Z\",\"notes\":[\"stage changed via merge mode\"]}}\n",
     );
     let merge = workspace.json_value(&[
         "--json",

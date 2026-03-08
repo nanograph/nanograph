@@ -27,7 +27,7 @@ use tracing::{debug, info, instrument};
 
 use super::literal_utils;
 use super::node_scan::{NodeScanExec, NodeScanPredicate};
-use super::physical::ExpandExec;
+use super::physical::{ExpandExec, ExpandSpec};
 
 type ScanProjectionMap = AHashMap<String, Option<AHashSet<String>>>;
 
@@ -45,25 +45,23 @@ pub async fn execute_query(
         .iter()
         .any(|p| matches!(&p.expr, IRExpr::Aggregate { .. }));
 
-    if !has_aggregation {
-        if let Some(candidate) = analyze_single_node_nearest_ann_candidate(&resolved_ir, params) {
-            if let Some(result) = try_execute_single_node_nearest_ann_fast_path(
-                &resolved_ir,
-                storage.clone(),
-                params,
-                &candidate,
-            )
-            .await?
-            {
-                info!(
-                    result_batches = result.len(),
-                    node_type = %candidate.type_name,
-                    property = %candidate.property,
-                    "query execution complete (nearest ANN fast path)"
-                );
-                return Ok(result);
-            }
-        }
+    if !has_aggregation
+        && let Some(candidate) = analyze_single_node_nearest_ann_candidate(&resolved_ir, params)
+        && let Some(result) = try_execute_single_node_nearest_ann_fast_path(
+            &resolved_ir,
+            storage.clone(),
+            params,
+            &candidate,
+        )
+        .await?
+    {
+        info!(
+            result_batches = result.len(),
+            node_type = %candidate.type_name,
+            property = %candidate.property,
+            "query execution complete (nearest ANN fast path)"
+        );
+        return Ok(result);
     }
 
     let single_scan_pushdown = analyze_single_scan_pushdown(&resolved_ir.pipeline, params);
@@ -612,7 +610,7 @@ fn apply_resolved_nearest_embeddings_to_expr(
                         dim
                     ))
                 })?;
-                *query = Box::new(IRExpr::Literal(vector_to_literal(vector)));
+                **query = IRExpr::Literal(vector_to_literal(vector));
             }
         }
         IRExpr::Search { field, query }
@@ -1129,13 +1127,15 @@ fn build_physical_plan(
                     .ok_or_else(|| NanoError::Plan("Expand without input".to_string()))?;
                 let expand = ExpandExec::new(
                     input,
-                    src_var.clone(),
-                    dst_var.clone(),
-                    edge_type.clone(),
-                    *direction,
-                    dst_type.clone(),
-                    *min_hops,
-                    *max_hops,
+                    ExpandSpec {
+                        src_var: src_var.clone(),
+                        dst_var: dst_var.clone(),
+                        edge_type: edge_type.clone(),
+                        direction: *direction,
+                        dst_type: dst_type.clone(),
+                        min_hops: *min_hops,
+                        max_hops: *max_hops,
+                    },
                     storage.clone(),
                 );
                 current_plan = Some(Arc::new(expand));
@@ -1263,13 +1263,15 @@ fn build_physical_plan_with_input(
                     .ok_or_else(|| NanoError::Plan("Expand without input".to_string()))?;
                 let expand = ExpandExec::new(
                     input,
-                    src_var.clone(),
-                    dst_var.clone(),
-                    edge_type.clone(),
-                    *direction,
-                    dst_type.clone(),
-                    *min_hops,
-                    *max_hops,
+                    ExpandSpec {
+                        src_var: src_var.clone(),
+                        dst_var: dst_var.clone(),
+                        edge_type: edge_type.clone(),
+                        direction: *direction,
+                        dst_type: dst_type.clone(),
+                        min_hops: *min_hops,
+                        max_hops: *max_hops,
+                    },
                     storage.clone(),
                 );
                 current_plan = Some(Arc::new(expand));
@@ -1416,10 +1418,8 @@ fn analyze_scan_projection_requirements(ir: &QueryIR) -> ScanProjectionMap {
     }
 
     // Keep id available for join/expand semantics and stable downstream behavior.
-    for required in requirements.values_mut() {
-        if let Some(props) = required {
-            props.insert("id".to_string());
-        }
+    for props in requirements.values_mut().flatten() {
+        props.insert("id".to_string());
     }
 
     requirements
@@ -1547,10 +1547,10 @@ fn collect_expr_projection_requirements(
 }
 
 fn mark_scan_property(requirements: &mut ScanProjectionMap, variable: &str, property: &str) {
-    if let Some(required) = requirements.get_mut(variable) {
-        if let Some(props) = required {
-            props.insert(property.to_string());
-        }
+    if let Some(required) = requirements.get_mut(variable)
+        && let Some(props) = required
+    {
+        props.insert(property.to_string());
     }
 }
 
@@ -1866,14 +1866,14 @@ fn evaluate_fuzzy_boolean_array(
             query_arr.len()
         )));
     }
-    if let Some(max_edits) = max_edits_arr {
-        if max_edits.len() != field_arr.len() {
-            return Err(NanoError::Execution(format!(
-                "fuzzy() max_edits length mismatch: expected {}, got {}",
-                field_arr.len(),
-                max_edits.len()
-            )));
-        }
+    if let Some(max_edits) = max_edits_arr
+        && max_edits.len() != field_arr.len()
+    {
+        return Err(NanoError::Execution(format!(
+            "fuzzy() max_edits length mismatch: expected {}, got {}",
+            field_arr.len(),
+            max_edits.len()
+        )));
     }
 
     let field_utf8 = field_arr
@@ -2034,7 +2034,12 @@ fn evaluate_bm25_score_array(
     }
 
     let mut scores = Vec::with_capacity(field_arr.len());
-    for row in 0..field_arr.len() {
+    for (row, dl) in doc_lengths
+        .iter()
+        .copied()
+        .enumerate()
+        .take(field_arr.len())
+    {
         if query_utf8.is_null(row) {
             scores.push(0.0);
             continue;
@@ -2044,7 +2049,6 @@ fn evaluate_bm25_score_array(
             continue;
         };
 
-        let dl = doc_lengths[row];
         let norm = if avg_doc_len > 0.0 {
             BM25_K1 * (1.0 - BM25_B + BM25_B * (dl / avg_doc_len))
         } else {
@@ -2244,12 +2248,12 @@ fn array_value_to_optional_positive_usize(
     row: usize,
 ) -> Result<Option<usize>> {
     let value = array_value_to_optional_non_negative_usize(arr, row)?;
-    if let Some(v) = value {
-        if v == 0 {
-            return Err(NanoError::Execution(
-                "rrf() k must be greater than 0".to_string(),
-            ));
-        }
+    if let Some(v) = value
+        && v == 0
+    {
+        return Err(NanoError::Execution(
+            "rrf() k must be greater than 0".to_string(),
+        ));
     }
     Ok(value)
 }
@@ -2700,7 +2704,7 @@ fn array_value_to_string(arr: &arrow_array::ArrayRef, row: usize) -> String {
     if let Some(a) = arr.as_any().downcast_ref::<BooleanArray>() {
         return a.value(row).to_string();
     }
-    format!("?")
+    "?".to_string()
 }
 
 fn array_value_to_f64(arr: &arrow_array::ArrayRef, row: usize) -> Option<f64> {
@@ -2821,16 +2825,16 @@ fn apply_order_and_limit(
         }
 
         // Deterministic tie-break for nearest: id ascending.
-        if let Some(var) = nearest_tie_break_var {
-            if let Some(id_col) = sort_column_from_prop_or_flat(&result, &var, "id") {
-                sort_columns.push(arrow_ord::sort::SortColumn {
-                    values: id_col,
-                    options: Some(arrow_ord::sort::SortOptions {
-                        descending: false,
-                        nulls_first: false,
-                    }),
-                });
-            }
+        if let Some(var) = nearest_tie_break_var
+            && let Some(id_col) = sort_column_from_prop_or_flat(&result, &var, "id")
+        {
+            sort_columns.push(arrow_ord::sort::SortColumn {
+                values: id_col,
+                options: Some(arrow_ord::sort::SortOptions {
+                    descending: false,
+                    nulls_first: false,
+                }),
+            });
         }
 
         if !sort_columns.is_empty() {
@@ -2953,8 +2957,8 @@ fn compute_nearest_distance_column(
 
         let mut dot = 0.0f64;
         let mut vec_norm_sq = 0.0f64;
-        for i in 0..dim {
-            let a = query[i] as f64;
+        for (i, a) in query.iter().copied().enumerate().take(dim) {
+            let a = a as f64;
             let b = vec.value(i) as f64;
             dot += a * b;
             vec_norm_sq += b * b;
@@ -3405,16 +3409,14 @@ impl ExecutionPlan for AntiJoinExec {
                                     let col = filtered.column(col_idx);
                                     if let Some(struct_arr) =
                                         col.as_any().downcast_ref::<StructArray>()
+                                        && let Some(id_col) = struct_arr.column_by_name("id")
+                                        && let Some(id_arr) = id_col
+                                            .as_any()
+                                            .downcast_ref::<arrow_array::UInt64Array>(
+                                        )
                                     {
-                                        if let Some(id_col) = struct_arr.column_by_name("id") {
-                                            if let Some(id_arr) = id_col
-                                                .as_any()
-                                                .downcast_ref::<arrow_array::UInt64Array>(
-                                            ) {
-                                                for i in 0..id_arr.len() {
-                                                    inner_ids.insert(id_arr.value(i));
-                                                }
-                                            }
+                                        for i in 0..id_arr.len() {
+                                            inner_ids.insert(id_arr.value(i));
                                         }
                                     }
                                 }
@@ -3620,8 +3622,8 @@ mod tests {
 
         let out = evaluate_search_boolean_array(&field, &query).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), true);
+        assert!(out.value(0));
+        assert!(out.value(1));
     }
 
     #[test]
@@ -3637,8 +3639,8 @@ mod tests {
 
         let out = evaluate_match_text_boolean_array(&field, &query).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), false);
-        assert_eq!(out.value(1), true);
+        assert!(!out.value(0));
+        assert!(out.value(1));
     }
 
     #[test]
@@ -3650,11 +3652,11 @@ mod tests {
 
         let search = evaluate_search_boolean_array(&field, &query).unwrap();
         let search = search.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(search.value(0), true);
+        assert!(search.value(0));
 
         let match_text = evaluate_match_text_boolean_array(&field, &query).unwrap();
         let match_text = match_text.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(match_text.value(0), false);
+        assert!(!match_text.value(0));
     }
 
     #[test]
@@ -3791,14 +3793,14 @@ mod tests {
 
         let out = evaluate_fuzzy_boolean_array(&field, &query, None).unwrap();
         let out = out.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(out.value(0), true);
-        assert_eq!(out.value(1), true);
+        assert!(out.value(0));
+        assert!(out.value(1));
 
         let strict_edits: ArrayRef = Arc::new(Int64Array::from(vec![0_i64, 0_i64]));
         let strict = evaluate_fuzzy_boolean_array(&field, &query, Some(&strict_edits)).unwrap();
         let strict = strict.as_any().downcast_ref::<BooleanArray>().unwrap();
-        assert_eq!(strict.value(0), false);
-        assert_eq!(strict.value(1), false);
+        assert!(!strict.value(0));
+        assert!(!strict.value(1));
     }
 
     #[test]

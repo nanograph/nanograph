@@ -123,6 +123,14 @@ struct DatasetSnapshot {
     bytes: u64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MutationDatasetMetrics {
+    person_before: DatasetSnapshot,
+    person_after: DatasetSnapshot,
+    knows_before: DatasetSnapshot,
+    knows_after: DatasetSnapshot,
+}
+
 async fn snapshot_dataset(
     db_path: &Path,
     manifest: &GraphManifest,
@@ -181,10 +189,7 @@ fn build_metrics(
     elapsed_ms: f64,
     before_manifest: &GraphManifest,
     after_manifest: &GraphManifest,
-    before_person: DatasetSnapshot,
-    after_person: DatasetSnapshot,
-    before_knows: DatasetSnapshot,
-    after_knows: DatasetSnapshot,
+    datasets: MutationDatasetMetrics,
 ) -> ScenarioMetrics {
     ScenarioMetrics {
         name,
@@ -207,19 +212,31 @@ fn build_metrics(
             dataset_version(after_manifest, "edge", "WorksAt"),
         ),
         person_versions_len_delta: diff_usize(
-            before_person.versions_len,
-            after_person.versions_len,
+            datasets.person_before.versions_len,
+            datasets.person_after.versions_len,
         ),
-        knows_versions_len_delta: diff_usize(before_knows.versions_len, after_knows.versions_len),
-        person_fragments_delta: diff_usize(before_person.fragments, after_person.fragments),
-        knows_fragments_delta: diff_usize(before_knows.fragments, after_knows.fragments),
+        knows_versions_len_delta: diff_usize(
+            datasets.knows_before.versions_len,
+            datasets.knows_after.versions_len,
+        ),
+        person_fragments_delta: diff_usize(
+            datasets.person_before.fragments,
+            datasets.person_after.fragments,
+        ),
+        knows_fragments_delta: diff_usize(
+            datasets.knows_before.fragments,
+            datasets.knows_after.fragments,
+        ),
         person_deleted_rows_delta: diff_usize(
-            before_person.deleted_rows,
-            after_person.deleted_rows,
+            datasets.person_before.deleted_rows,
+            datasets.person_after.deleted_rows,
         ),
-        knows_deleted_rows_delta: diff_usize(before_knows.deleted_rows, after_knows.deleted_rows),
-        person_bytes_delta: diff_i64(before_person.bytes, after_person.bytes),
-        knows_bytes_delta: diff_i64(before_knows.bytes, after_knows.bytes),
+        knows_deleted_rows_delta: diff_usize(
+            datasets.knows_before.deleted_rows,
+            datasets.knows_after.deleted_rows,
+        ),
+        person_bytes_delta: diff_i64(datasets.person_before.bytes, datasets.person_after.bytes),
+        knows_bytes_delta: diff_i64(datasets.knows_before.bytes, datasets.knows_after.bytes),
     }
 }
 
@@ -287,10 +304,12 @@ async fn run_append_scenario(rows: usize) -> ScenarioMetrics {
         elapsed_ms,
         &before_manifest,
         &after_manifest,
-        before_person,
-        after_person,
-        before_knows,
-        after_knows,
+        MutationDatasetMetrics {
+            person_before: before_person,
+            person_after: after_person,
+            knows_before: before_knows,
+            knows_after: after_knows,
+        },
     )
 }
 
@@ -321,10 +340,12 @@ async fn run_update_scenario(rows: usize) -> ScenarioMetrics {
         elapsed_ms,
         &before_manifest,
         &after_manifest,
-        before_person,
-        after_person,
-        before_knows,
-        after_knows,
+        MutationDatasetMetrics {
+            person_before: before_person,
+            person_after: after_person,
+            knows_before: before_knows,
+            knows_after: after_knows,
+        },
     )
 }
 
@@ -357,10 +378,12 @@ async fn run_delete_scenario(rows: usize) -> ScenarioMetrics {
         elapsed_ms,
         &before_manifest,
         &after_manifest,
-        before_person,
-        after_person,
-        before_knows,
-        after_knows,
+        MutationDatasetMetrics {
+            person_before: before_person,
+            person_after: after_person,
+            knows_before: before_knows,
+            knows_after: after_knows,
+        },
     )
 }
 

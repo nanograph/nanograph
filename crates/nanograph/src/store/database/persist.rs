@@ -182,7 +182,7 @@ impl Database {
                 )
                 .await?
             }
-            MutationSource::PreparedStorage(storage) => storage,
+            MutationSource::PreparedStorage(storage) => *storage,
         };
         let effective_cdc_events = if cdc_events.is_empty() {
             build_cdc_events_for_storage_transition(
@@ -258,15 +258,13 @@ impl Database {
                 let entity_key = dataset_entity_key("node", &node_def.name);
                 let previous_entry = previous_entries_by_key.get(&entity_key).cloned();
 
-                if !changed_entities.contains(&entity_key) {
-                    if let Some(prev) = previous_entry {
-                        storage.set_node_dataset_path(
-                            &node_def.name,
-                            self.path.join(&prev.dataset_path),
-                        );
-                        dataset_entries.push(prev);
-                        continue;
-                    }
+                if !changed_entities.contains(&entity_key)
+                    && let Some(prev) = previous_entry
+                {
+                    storage
+                        .set_node_dataset_path(&node_def.name, self.path.join(&prev.dataset_path));
+                    dataset_entries.push(prev);
+                    continue;
                 }
 
                 let row_count = batch.num_rows() as u64;
@@ -404,11 +402,11 @@ impl Database {
                 let entity_key = dataset_entity_key("edge", &edge_def.name);
                 let previous_entry = previous_entries_by_key.get(&entity_key).cloned();
 
-                if !changed_entities.contains(&entity_key) {
-                    if let Some(prev) = previous_entry {
-                        dataset_entries.push(prev);
-                        continue;
-                    }
+                if !changed_entities.contains(&entity_key)
+                    && let Some(prev) = previous_entry
+                {
+                    dataset_entries.push(prev);
+                    continue;
                 }
 
                 let row_count = batch.num_rows() as u64;

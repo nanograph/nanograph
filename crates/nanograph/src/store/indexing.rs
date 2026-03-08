@@ -113,7 +113,7 @@ fn choose_ivf_partitions(row_count: usize) -> usize {
 
 fn choose_pq_sub_vectors(dim: usize) -> usize {
     for candidate in [32, 16, 8, 4, 2, 1] {
-        if candidate <= dim && dim % candidate == 0 {
+        if candidate <= dim && dim.is_multiple_of(candidate) {
             return candidate;
         }
     }

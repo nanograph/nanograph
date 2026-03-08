@@ -465,13 +465,16 @@ fn merge_edge_batches(
                 .iter()
                 .map(|&idx| array_value_to_json(batch.column(idx), row))
                 .collect::<Vec<_>>();
-            if row_props.contains_key(&key) {
-                if overwrite {
-                    row_props.insert(key, props);
+            match row_props.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if overwrite {
+                        entry.insert(props);
+                    }
                 }
-            } else {
-                row_order.push(key);
-                row_props.insert(key, props);
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    row_order.push(key);
+                    entry.insert(props);
+                }
             }
         }
 

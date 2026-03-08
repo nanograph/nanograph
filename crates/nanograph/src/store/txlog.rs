@@ -435,13 +435,13 @@ fn compute_tx_visible_prefix(path: &Path, manifest_db_version: u64) -> Result<(u
             ))
         })?;
 
-        if let Some(prev) = prev_db_version {
-            if entry.db_version <= prev {
-                return Err(NanoError::Manifest(format!(
-                    "non-monotonic db_version in tx catalog at line {} (prev {}, got {})",
-                    line_no, prev, entry.db_version
-                )));
-            }
+        if let Some(prev) = prev_db_version
+            && entry.db_version <= prev
+        {
+            return Err(NanoError::Manifest(format!(
+                "non-monotonic db_version in tx catalog at line {} (prev {}, got {})",
+                line_no, prev, entry.db_version
+            )));
         }
         prev_db_version = Some(entry.db_version);
 

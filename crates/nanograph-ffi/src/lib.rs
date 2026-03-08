@@ -382,6 +382,10 @@ pub extern "C" fn nanograph_last_error_message() -> *const c_char {
 }
 
 #[unsafe(no_mangle)]
+/// Frees a string previously returned by this library.
+///
+/// # Safety
+/// `value` must be null or a pointer returned by `CString::into_raw` from this library.
 pub unsafe extern "C" fn nanograph_string_free(value: *mut c_char) {
     if value.is_null() {
         return;
@@ -495,6 +499,10 @@ pub extern "C" fn nanograph_db_close(handle: *mut NanoGraphHandle) -> c_int {
 }
 
 #[unsafe(no_mangle)]
+/// Destroys a database handle previously returned by this library.
+///
+/// # Safety
+/// `handle` must be null or a pointer returned by `Box::into_raw` from this library.
 pub unsafe extern "C" fn nanograph_db_destroy(handle: *mut NanoGraphHandle) {
     if handle.is_null() {
         return;

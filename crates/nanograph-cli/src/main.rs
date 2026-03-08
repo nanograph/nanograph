@@ -387,7 +387,7 @@ async fn main() -> Result<()> {
 
 #[instrument(skip(format), fields(db_path = %db_path.display(), dry_run = dry_run, format = format))]
 async fn cmd_migrate(
-    db_path: &PathBuf,
+    db_path: &Path,
     dry_run: bool,
     format: &str,
     auto_approve: bool,
@@ -450,7 +450,7 @@ fn print_migration_plan_table(plan: &MigrationPlan) {
     println!();
 
     if !plan.steps.is_empty() {
-        println!("{:<10} {:<24} {}", "SAFETY", "STEP", "DETAIL");
+        println!("{:<10} {:<24} DETAIL", "SAFETY", "STEP");
         for planned in &plan.steps {
             let safety = match planned.safety {
                 nanograph::store::migration::MigrationSafety::Safe => "safe",
@@ -540,7 +540,7 @@ fn render_schema_diff_report(report: &SchemaDiffReport, format: &str) -> Result<
             if report.steps.is_empty() {
                 println!("No schema changes.");
             } else {
-                println!("{:<28} {:<30} {}", "CLASSIFICATION", "STEP", "DETAIL");
+                println!("{:<28} {:<30} DETAIL", "CLASSIFICATION", "STEP");
                 for step in &report.steps {
                     println!(
                         "{:<28} {:<30} {}",
@@ -723,10 +723,10 @@ fn build_describe_payload(
 
     let mut nodes = Vec::new();
     for node in db.schema_ir.node_types() {
-        if let Some(type_name) = type_name {
-            if node.name != type_name {
-                continue;
-            }
+        if let Some(type_name) = type_name
+            && node.name != type_name
+        {
+            continue;
         }
         let rows = storage
             .get_all_nodes(&node.name)?
@@ -789,10 +789,10 @@ fn build_describe_payload(
 
     let mut edges = Vec::new();
     for edge in db.schema_ir.edge_types() {
-        if let Some(type_name) = type_name {
-            if edge.name != type_name {
-                continue;
-            }
+        if let Some(type_name) = type_name
+            && edge.name != type_name
+        {
+            continue;
         }
         let rows = storage
             .edge_batch_for_save(&edge.name)?
@@ -829,10 +829,11 @@ fn build_describe_payload(
         }));
     }
 
-    if let Some(type_name) = type_name {
-        if nodes.is_empty() && edges.is_empty() {
-            return Err(eyre!("type `{}` not found in schema", type_name));
-        }
+    if let Some(type_name) = type_name
+        && nodes.is_empty()
+        && edges.is_empty()
+    {
+        return Err(eyre!("type `{}` not found in schema", type_name));
     }
 
     Ok(serde_json::json!({
@@ -905,47 +906,47 @@ fn print_describe_table(payload: &serde_json::Value) {
             if let Some(key_property) = node["key_property"].as_str() {
                 println!("  key: {}", key_property);
             }
-            if let Some(unique_properties) = node["unique_properties"].as_array() {
-                if !unique_properties.is_empty() {
-                    let joined = unique_properties
-                        .iter()
-                        .filter_map(|value| value.as_str())
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    println!("  unique: {}", joined);
-                }
+            if let Some(unique_properties) = node["unique_properties"].as_array()
+                && !unique_properties.is_empty()
+            {
+                let joined = unique_properties
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  unique: {}", joined);
             }
-            if let Some(outgoing) = node["outgoing_edges"].as_array() {
-                if !outgoing.is_empty() {
-                    let joined = outgoing
-                        .iter()
-                        .map(|edge| {
-                            format!(
-                                "{} -> {}",
-                                edge["name"].as_str().unwrap_or_default(),
-                                edge["to_type"].as_str().unwrap_or_default()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    println!("  outgoing: {}", joined);
-                }
+            if let Some(outgoing) = node["outgoing_edges"].as_array()
+                && !outgoing.is_empty()
+            {
+                let joined = outgoing
+                    .iter()
+                    .map(|edge| {
+                        format!(
+                            "{} -> {}",
+                            edge["name"].as_str().unwrap_or_default(),
+                            edge["to_type"].as_str().unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  outgoing: {}", joined);
             }
-            if let Some(incoming) = node["incoming_edges"].as_array() {
-                if !incoming.is_empty() {
-                    let joined = incoming
-                        .iter()
-                        .map(|edge| {
-                            format!(
-                                "{} <- {}",
-                                edge["name"].as_str().unwrap_or_default(),
-                                edge["from_type"].as_str().unwrap_or_default()
-                            )
-                        })
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    println!("  incoming: {}", joined);
-                }
+            if let Some(incoming) = node["incoming_edges"].as_array()
+                && !incoming.is_empty()
+            {
+                let joined = incoming
+                    .iter()
+                    .map(|edge| {
+                        format!(
+                            "{} <- {}",
+                            edge["name"].as_str().unwrap_or_default(),
+                            edge["from_type"].as_str().unwrap_or_default()
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                println!("  incoming: {}", joined);
             }
             if let Some(props) = node["properties"].as_array() {
                 for prop in props {
@@ -1521,7 +1522,7 @@ fn parse_query_or_report(path: &Path, source: &str) -> Result<nanograph::query::
 }
 
 #[instrument(skip(schema_path), fields(db_path = %db_path.display()))]
-async fn cmd_init(db_path: &PathBuf, schema_path: &PathBuf, json: bool) -> Result<()> {
+async fn cmd_init(db_path: &Path, schema_path: &Path, json: bool) -> Result<()> {
     let schema_src = std::fs::read_to_string(schema_path)
         .wrap_err_with(|| format!("failed to read schema: {}", schema_path.display()))?;
     let _ = parse_schema_or_report(schema_path, &schema_src)?;
@@ -1663,12 +1664,7 @@ const DEFAULT_DOTENV_NANO: &str = "\
 # NANOGRAPH_EMBEDDINGS_MOCK=1\n";
 
 #[instrument(skip(data_path), fields(db_path = %db_path.display(), mode = ?mode))]
-async fn cmd_load(
-    db_path: &PathBuf,
-    data_path: &PathBuf,
-    mode: LoadModeArg,
-    json: bool,
-) -> Result<()> {
+async fn cmd_load(db_path: &Path, data_path: &Path, mode: LoadModeArg, json: bool) -> Result<()> {
     let db = Database::open(db_path).await?;
 
     if let Err(err) = db.load_file_with_mode(data_path, mode.into()).await {
@@ -1731,7 +1727,7 @@ fn render_load_error(db_path: &Path, err: &NanoError, json: bool) {
 }
 
 #[instrument(skip(type_name, predicate), fields(db_path = %db_path.display(), type_name = type_name))]
-async fn cmd_delete(db_path: &PathBuf, type_name: &str, predicate: &str, json: bool) -> Result<()> {
+async fn cmd_delete(db_path: &Path, type_name: &str, predicate: &str, json: bool) -> Result<()> {
     let pred = parse_delete_predicate(predicate)?;
     let db = Database::open(db_path).await?;
     let result = db.delete_nodes(type_name, &pred).await?;
@@ -1814,7 +1810,7 @@ fn resolve_changes_window(
     )
 )]
 async fn cmd_changes(
-    db_path: &PathBuf,
+    db_path: &Path,
     since: Option<u64>,
     from_version: Option<u64>,
     to_version: Option<u64>,
@@ -1861,7 +1857,7 @@ fn render_changes(format: &str, rows: &[CdcLogEntry]) -> Result<()> {
     )
 )]
 async fn cmd_compact(
-    db_path: &PathBuf,
+    db_path: &Path,
     target_rows_per_fragment: usize,
     materialize_deletions: bool,
     materialize_deletions_threshold: f32,
@@ -1914,7 +1910,7 @@ async fn cmd_compact(
     )
 )]
 async fn cmd_cleanup(
-    db_path: &PathBuf,
+    db_path: &Path,
     retain_tx_versions: u64,
     retain_dataset_versions: usize,
     json: bool,
@@ -1965,7 +1961,7 @@ async fn cmd_cleanup(
     )
 )]
 async fn cmd_cdc_materialize(
-    db_path: &PathBuf,
+    db_path: &Path,
     min_new_rows: usize,
     force: bool,
     json: bool,
@@ -2014,7 +2010,7 @@ async fn cmd_cdc_materialize(
 }
 
 #[instrument(fields(db_path = %db_path.display()))]
-async fn cmd_doctor(db_path: &PathBuf, json: bool) -> Result<()> {
+async fn cmd_doctor(db_path: &Path, json: bool) -> Result<()> {
     let db = Database::open(db_path).await?;
     let report = db.doctor().await?;
 
