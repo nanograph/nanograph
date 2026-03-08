@@ -6,6 +6,8 @@
 docs/internal/
 docs/backlog/
 docs/archive/
+docs/dev/backlog.md
+backlog/
 .claude/
 .env
 .env.nano
