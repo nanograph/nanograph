@@ -3,10 +3,10 @@
 ## Current release shape
 
 - `CI` runs on PRs and pushes to `main` via [ci.yml](/Users/andrew/code/nanograph/.github/workflows/ci.yml). It is split into parallel jobs:
-  - `Core Rust` on Blacksmith Linux for workspace `cargo check`, core tests, and workspace clippy
+  - `Core Rust` on Blacksmith Linux for workspace `cargo check`, core tests, workspace clippy, and the Rust `nanograph-ffi` crate build
   - `CLI E2E` on Blacksmith Linux for `cargo test -p nanograph-cli`
   - `TypeScript SDK` on Blacksmith Linux for `npm install`, `npm test`, and the TS consumer smoke test
-  - `Swift SDK` on GitHub `macos-14` runners for `cargo build -p nanograph-ffi` and `swift test`
+  - `Swift SDK` on GitHub `macos-14` runners for `swift test`
 - `Release` runs on tag pushes via [release.yml](/Users/andrew/code/nanograph/.github/workflows/release.yml). It currently automates:
   - macOS ARM CLI binary build + `.sha256` on `macos-14`
   - Swift XCFramework build for macOS arm64 + `.sha256` on `macos-14`

@@ -47,6 +47,9 @@ jobs:
       - name: Workspace clippy
         run: cargo clippy --workspace --all-targets
 
+      - name: Build Rust FFI crate
+        run: cargo build -p nanograph-ffi
+
   cli-e2e:
     name: CLI E2E
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -148,9 +151,6 @@ jobs:
             target
           key: ci-swift-macos-${{ hashFiles('Cargo.lock') }}
           restore-keys: ci-swift-macos-
-
-      - name: Build Swift FFI library
-        run: cargo build -p nanograph-ffi
 
       - name: Swift SDK tests
         run: swift test
