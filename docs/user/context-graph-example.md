@@ -89,6 +89,12 @@ Description: Trace an opportunity back to the decision, actor, and signal that c
 Instruction: Use as the default 'why did this happen?' query for an opportunity slug.
 ```
 
+For record-oriented inspection of one result at a time, switch to `kv`:
+
+```bash
+nanograph run why opp-stripe-migration --format kv
+```
+
 ## Why this example matters
 
 This example shows how NanoGraph can represent operational reasoning directly:

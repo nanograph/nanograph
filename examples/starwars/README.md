@@ -31,9 +31,12 @@ nanograph load --data starwars.jsonl --mode overwrite
 nanograph check --query starwars.gq
 nanograph run search "father and son conflict"
 nanograph run debut anakin-skywalker
+nanograph run search "father and son conflict" --format kv
 ```
 
 The config also enables deterministic mock embeddings and exposes aliases like `search`, `hybrid`, `family`, and `debut`.
+
+`kv` is the record-oriented human view. Use it when table output is too compact and you want one result block per row.
 
 See also:
 

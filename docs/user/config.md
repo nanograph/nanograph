@@ -5,7 +5,7 @@ slug: config
 
 # Project Config
 
-NanoGraph supports a project-level `nanograph.toml` plus local env files for secrets and machine-specific overrides.
+nanograph supports a project-level `nanograph.toml` plus local env files for secrets and machine-specific overrides.
 
 Use this for:
 
@@ -73,19 +73,19 @@ You can also put non-secret local overrides here, but the intended use is secret
 
 ### `.env`
 
-NanoGraph also loads `./.env` after `./.env.nano`. It is a fallback compatibility path, not the preferred place for NanoGraph secrets.
+nanograph also loads `./.env` after `./.env.nano`. It is a fallback compatibility path, not the preferred place for nanograph secrets.
 
 ## Discovery
 
 Config discovery is intentionally simple:
 
-- if you pass `--config <path>`, NanoGraph loads that file
+- if you pass `--config <path>`, nanograph loads that file
 - otherwise, it looks for `./nanograph.toml`
 - it does not walk parent directories
 
 Env files are loaded from the config base directory:
 
-- when `--config path/to/nanograph.toml` is used, NanoGraph looks for `path/to/.env.nano` and `path/to/.env`
+- when `--config path/to/nanograph.toml` is used, nanograph looks for `path/to/.env.nano` and `path/to/.env`
 - otherwise, it looks in the current working directory
 
 ## Precedence
@@ -163,7 +163,7 @@ Query file search roots for `check` and `run`.
 roots = ["queries", "examples"]
 ```
 
-If a relative query path is not found directly, NanoGraph searches these roots in order.
+If a relative query path is not found directly, nanograph searches these roots in order.
 
 ### `[embedding]`
 
@@ -205,6 +205,7 @@ json = false
 
 `output_format` is used when a command supports multiple formats and no explicit `--format` is passed.
 For `nanograph run`, supported formats are `table`, `kv`, `csv`, `jsonl`, and `json`.
+`json = true` acts like a shared default for the global `--json` flag on commands that support machine-readable JSON output.
 `--quiet` is always a runtime flag; it is not stored in project config.
 
 `table_max_column_width` controls the width budget for `nanograph run --format table`.

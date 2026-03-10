@@ -88,6 +88,12 @@ Description: Rank characters by semantic similarity against their embedded notes
 Instruction: Use for broad conceptual search, not exact spelling.
 ```
 
+If you want the same results as separated record blocks instead of a table, use `kv`:
+
+```bash
+nanograph run search "father and son conflict" --format kv
+```
+
 ## Useful commands
 
 Semantic search across character notes:

@@ -79,6 +79,9 @@ For new projects outside the examples, `init` also scaffolds `nanograph.toml` an
 # semantic search
 nanograph run search "father and son conflict"
 
+# inspect the same results in record-oriented form
+nanograph run search "father and son conflict" --format kv
+
 # inspect agent-facing schema metadata
 nanograph describe --type Character --format json
 

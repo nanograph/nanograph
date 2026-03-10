@@ -23,6 +23,7 @@ nanograph check --query revops.gq
 nanograph run why opp-stripe-migration
 nanograph run pipeline
 nanograph run signals cli-priya-shah "procurement approval timing"
+nanograph run why opp-stripe-migration --format kv
 ```
 
 The checked-in `nanograph.toml` provides:
@@ -32,7 +33,10 @@ The checked-in `nanograph.toml` provides:
 - aliases like `why`, `trace`, `value`, `pipeline`, and `signals`
 - deterministic mock embeddings for `Signal.summaryEmbedding`
 
-Output formats remain `table` (default), `csv`, `jsonl`, and `json`.
+`nanograph run` supports `table` (default), `kv`, `csv`, `jsonl`, and `json`.
+- `kv` is the record-oriented human view
+- `json` wraps result rows with query metadata plus `rows`
+- `jsonl` emits a metadata header first, then row records
 
 See also:
 
