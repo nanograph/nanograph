@@ -18,7 +18,7 @@
 ## Pre-release
 
 - [ ] CI workflow green on `main` / PRs (`Core Rust`, `CLI E2E`, `TypeScript SDK`, `Swift SDK`)
-- [ ] All tests pass: `cargo test`
+- [ ] Rust workspace tests pass: `cargo test --workspace --all-targets`
 - [ ] CLI e2e pass: `cargo test -p nanograph-cli`
 - [ ] Clippy clean: `cargo clippy --workspace --all-targets`
 - [ ] Bump version in all Cargo.toml files (currently lockstep: `nanograph`, `nanograph-cli`, `nanograph-ffi`, `nanograph-ts`)
@@ -61,9 +61,9 @@ cd crates/nanograph-ts
 npm publish --otp=<code>
 ```
 
-### 4. Swift distribution repo (`nanograph-swift`) — only if/when it exists
+### 4. Swift distribution repo (`nanograph-swift`)
 
-This is not automated yet. If the external Swift package repo exists, update it from the monorepo release outputs:
+This is not automated yet. Update the external Swift package repo from the monorepo release outputs:
 
 - Point its `Package.swift` binary target at:
   - `https://github.com/nanograph/nanograph/releases/download/vX.Y.Z/NanoGraphFFI.xcframework.zip`
@@ -84,7 +84,7 @@ This is not automated yet. If the external Swift package repo exists, update it 
 - [ ] Brew install works: `brew install nanograph/tap/nanograph` (or `brew upgrade nanograph`)
 - [ ] crates.io: `cargo search nanograph` shows new version
 - [ ] npm: `npm view nanograph-db version` shows new version
-- [ ] If `nanograph-swift` exists: verify its `Package.swift` points at the new GitHub Release asset URL + checksum and a clean SPM consumer still builds
+- [ ] `nanograph-swift`: verify its `Package.swift` points at the new GitHub Release asset URL + checksum and a clean SPM consumer still builds
 
 ## Assets
 
@@ -99,7 +99,7 @@ This is not automated yet. If the external Swift package repo exists, update it 
 | crates.io (FFI) | `crates.io/crates/nanograph-ffi` |
 | crates.io (TS) | `crates.io/crates/nanograph-ts` |
 | npm | `npmjs.com/package/nanograph-db` |
-| Swift package repo (optional) | `github.com/nanograph/nanograph-swift` |
+| Swift package repo | `github.com/nanograph/nanograph-swift` |
 
 ## Infrastructure
 
