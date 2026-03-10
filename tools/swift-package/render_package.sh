@@ -9,13 +9,13 @@ Usage:
 Examples:
   render_package.sh \
     --output /tmp/nanograph-swift \
-    --version 0.10.0 \
+    --version 0.10.1 \
     --artifact-url https://example.com/NanoGraphFFI.xcframework.zip \
     --checksum abcdef123456
 
   render_package.sh \
     --output /tmp/nanograph-swift \
-    --version 0.10.0 \
+    --version 0.10.1 \
     --artifact-path /tmp/NanoGraphFFI.xcframework
 EOF
 }

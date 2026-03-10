@@ -1,6 +1,6 @@
 [package]
 name = "nanograph"
-version = "0.10.0"
+version = "0.10.1"
 edition = "2024"
 description = "Embedded typed property graph database. Schema-as-code, compile-time validated, Arrow-native."
 repository = "https://github.com/nanograph/nanograph"
