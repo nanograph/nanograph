@@ -28,6 +28,7 @@ datafusion-common = "52"
 
 # Lance (local-only — no cloud backends)
 lance = { version = "3.0", default-features = false }
+lance-file = "3.0"
 lance-index = "3.0"
 lance-linalg = "3.0"
 

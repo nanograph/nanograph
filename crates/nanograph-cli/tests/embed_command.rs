@@ -188,13 +188,7 @@ fn embed_only_null_backfills_missing_vectors_and_preserves_existing_values() {
     let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
     init_embed_db(&workspace);
 
-    let result = workspace.json_value(&[
-        "--json",
-        "embed",
-        "--db",
-        "embed.nano",
-        "--only-null",
-    ]);
+    let result = workspace.json_value(&["--json", "embed", "--db", "embed.nano", "--only-null"]);
     assert_eq!(result["status"], "ok");
     assert_eq!(result["dry_run"], false);
     assert_eq!(result["rows_selected"], 2);

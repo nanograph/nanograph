@@ -162,12 +162,22 @@ pub struct EmbedResult {
 }
 
 #[derive(Debug, Clone, Default)]
+pub struct DoctorDatasetReport {
+    pub kind: String,
+    pub type_name: String,
+    pub dataset_path: String,
+    pub dataset_version: u64,
+    pub storage_version: String,
+}
+
+#[derive(Debug, Clone, Default)]
 pub struct DoctorReport {
     pub healthy: bool,
     pub issues: Vec<String>,
     pub warnings: Vec<String>,
     pub manifest_db_version: u64,
     pub datasets_checked: usize,
+    pub datasets: Vec<DoctorDatasetReport>,
     pub tx_rows: usize,
     pub cdc_rows: usize,
 }

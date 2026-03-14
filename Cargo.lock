@@ -3446,7 +3446,7 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nanograph"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -3463,6 +3463,7 @@ dependencies = [
  "datafusion-physical-plan",
  "futures",
  "lance",
+ "lance-file",
  "lance-index",
  "lance-linalg",
  "pest",
@@ -3478,7 +3479,7 @@ dependencies = [
 
 [[package]]
 name = "nanograph-cli"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "ariadne",
  "arrow-array",
@@ -3500,7 +3501,7 @@ dependencies = [
 
 [[package]]
 name = "nanograph-ffi"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "arrow-ipc",
  "nanograph",
@@ -3510,7 +3511,7 @@ dependencies = [
 
 [[package]]
 name = "nanograph-ts"
-version = "0.10.1"
+version = "0.11.0"
 dependencies = [
  "nanograph",
  "napi",

@@ -1,6 +1,8 @@
 use super::maintenance::read_cdc_analytics_state;
 use super::*;
 use crate::store::lance_io::LANCE_INTERNAL_ID_FIELD;
+use crate::store::lance_io::write_lance_batch_with_mode_and_storage_version;
+use crate::store::manifest::DatasetEntry;
 use crate::store::migration::{MigrationStatus, execute_schema_migration};
 use crate::store::txlog::{
     append_tx_catalog_entry, read_tx_catalog_entries, read_visible_cdc_entries,
@@ -8,6 +10,8 @@ use crate::store::txlog::{
 use arrow_array::{Array, StringArray, UInt64Array};
 use arrow_schema::{DataType, Field, Schema};
 use lance::Dataset;
+use lance::dataset::WriteMode;
+use lance_file::version::LanceFileVersion;
 use lance_index::DatasetIndexExt;
 use std::collections::HashSet;
 use tempfile::TempDir;
@@ -407,6 +411,92 @@ fn dataset_rel_path_for(manifest: &GraphManifest, kind: &str, type_name: &str) -
         .unwrap()
 }
 
+async fn dataset_storage_version(dataset_path: &std::path::Path) -> LanceFileVersion {
+    let uri = dataset_path.to_string_lossy().to_string();
+    let dataset = Dataset::open(&uri).await.unwrap();
+    dataset
+        .manifest
+        .data_storage_format
+        .lance_file_version()
+        .unwrap()
+}
+
+async fn write_fixture_database_with_storage_version(
+    db_path: &std::path::Path,
+    schema_source: &str,
+    data_source: &str,
+    storage_version: LanceFileVersion,
+) {
+    let source_db = Database::open_in_memory(schema_source).await.unwrap();
+    source_db
+        .load_with_mode(data_source, LoadMode::Overwrite)
+        .await
+        .unwrap();
+    let storage = source_db.snapshot();
+    let schema_ir = source_db.schema_ir.clone();
+
+    let fixture_db = Database::init(db_path, schema_source).await.unwrap();
+    drop(fixture_db);
+
+    let mut manifest = GraphManifest::read(db_path).unwrap();
+    manifest.committed_at = now_unix_seconds_string();
+    manifest.last_tx_id = format!("fixture-{}", storage_version);
+    manifest.next_node_id = storage.next_node_id();
+    manifest.next_edge_id = storage.next_edge_id();
+
+    let mut datasets = Vec::new();
+    for node_def in schema_ir.node_types() {
+        if let Some(batch) = storage.get_all_nodes(&node_def.name).unwrap() {
+            let row_count = batch.num_rows() as u64;
+            let dataset_rel_path = format!("nodes/{}", SchemaIR::dir_name(node_def.type_id));
+            let dataset_path = db_path.join(&dataset_rel_path);
+            let dataset_version = write_lance_batch_with_mode_and_storage_version(
+                &dataset_path,
+                batch,
+                WriteMode::Overwrite,
+                Some(storage_version),
+            )
+            .await
+            .unwrap();
+            datasets.push(DatasetEntry {
+                type_id: node_def.type_id,
+                type_name: node_def.name.clone(),
+                kind: "node".to_string(),
+                dataset_path: dataset_rel_path,
+                dataset_version,
+                row_count,
+            });
+        }
+    }
+
+    for edge_def in schema_ir.edge_types() {
+        if let Some(batch) = storage.edge_batch_for_save(&edge_def.name).unwrap() {
+            let row_count = batch.num_rows() as u64;
+            let dataset_rel_path = format!("edges/{}", SchemaIR::dir_name(edge_def.type_id));
+            let dataset_path = db_path.join(&dataset_rel_path);
+            let dataset_version = write_lance_batch_with_mode_and_storage_version(
+                &dataset_path,
+                batch,
+                WriteMode::Overwrite,
+                Some(storage_version),
+            )
+            .await
+            .unwrap();
+            datasets.push(DatasetEntry {
+                type_id: edge_def.type_id,
+                type_name: edge_def.name.clone(),
+                kind: "edge".to_string(),
+                dataset_path: dataset_rel_path,
+                dataset_version,
+                row_count,
+            });
+        }
+    }
+
+    manifest.datasets = datasets;
+    manifest.write_atomic(db_path).unwrap();
+}
+
 #[tokio::test]
 async fn test_init_creates_directory_structure() {
     let dir = test_dir("init");
@@ -422,6 +512,96 @@ async fn test_init_creates_directory_structure() {
 
     assert_eq!(db.catalog.node_types.len(), 2);
     assert_eq!(db.catalog.edge_types.len(), 2);
+}
+
+#[tokio::test]
+async fn test_new_datasets_use_lance_v2_2_storage_format() {
+    let dir = test_dir("new_dataset_v2_2");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+
+    let manifest = GraphManifest::read(path).unwrap();
+    for entry in &manifest.datasets {
+        let dataset_path = path.join(&entry.dataset_path);
+        assert_eq!(
+            dataset_storage_version(&dataset_path).await,
+            LanceFileVersion::V2_2,
+            "expected {} dataset {} to use Lance V2_2",
+            entry.kind,
+            entry.type_name
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_lance_v2_0_datasets_remain_operational_in_v0_11_0() {
+    let dir = test_dir("lance_v2_0_compat");
+    let path = dir.path();
+
+    write_fixture_database_with_storage_version(
+        path,
+        test_schema_src(),
+        test_data_src(),
+        LanceFileVersion::V2_0,
+    )
+    .await;
+
+    let manifest_before = GraphManifest::read(path).unwrap();
+    for entry in &manifest_before.datasets {
+        let dataset_path = path.join(&entry.dataset_path);
+        assert_eq!(
+            dataset_storage_version(&dataset_path).await,
+            LanceFileVersion::V2_0,
+            "fixture dataset {} should start on Lance V2_0",
+            entry.type_name
+        );
+    }
+
+    let db = Database::open(path).await.unwrap();
+    let people = db.snapshot().get_all_nodes("Person").unwrap().unwrap();
+    assert_eq!(people.num_rows(), 3);
+
+    db.load_with_mode(test_data_src(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.delete_edges(
+        "Knows",
+        &DeletePredicate {
+            property: "src".to_string(),
+            op: DeleteOp::Eq,
+            value: "0".to_string(),
+        },
+    )
+    .await
+    .unwrap();
+    db.compact(CompactOptions::default()).await.unwrap();
+    db.cleanup(CleanupOptions {
+        retain_tx_versions: 1,
+        retain_dataset_versions: 1,
+    })
+    .await
+    .unwrap();
+
+    let manifest_after = GraphManifest::read(path).unwrap();
+    for entry in &manifest_after.datasets {
+        let dataset_path = path.join(&entry.dataset_path);
+        assert_eq!(
+            dataset_storage_version(&dataset_path).await,
+            LanceFileVersion::V2_0,
+            "existing dataset {} should preserve Lance V2_0",
+            entry.type_name
+        );
+    }
+
+    let reopened = Database::open(path).await.unwrap();
+    let people = reopened
+        .snapshot()
+        .get_all_nodes("Person")
+        .unwrap()
+        .unwrap();
+    assert_eq!(people.num_rows(), 3);
 }
 
 #[tokio::test]
@@ -1419,6 +1599,14 @@ async fn test_doctor_reports_healthy_database() {
     );
     assert!(report.issues.is_empty());
     assert!(report.datasets_checked >= 1);
+    assert_eq!(report.datasets.len(), report.datasets_checked);
+    assert!(
+        report
+            .datasets
+            .iter()
+            .all(|dataset| dataset.storage_version == "2.2"),
+        "expected doctor to report Lance 2.2 storage versions for new datasets"
+    );
 }
 
 #[tokio::test]

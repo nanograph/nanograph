@@ -1,6 +1,6 @@
 [package]
 name = "nanograph"
-version = "0.10.1"
+version = "0.11.0"
 edition = "2024"
 description = "Embedded typed property graph database. Schema-as-code, compile-time validated, Arrow-native."
 repository = "https://github.com/nanograph/nanograph"
@@ -21,6 +21,7 @@ datafusion-physical-expr = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-common = { workspace = true }
 lance = { workspace = true }
+lance-file = { workspace = true }
 lance-index = { workspace = true }
 lance-linalg = { workspace = true }
 pest = { workspace = true }

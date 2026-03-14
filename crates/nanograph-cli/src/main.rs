@@ -212,6 +212,9 @@ enum Commands {
         /// Desired schema file to compare against the current DB schema
         #[arg(long)]
         schema: Option<PathBuf>,
+        /// Show per-dataset Lance storage formats
+        #[arg(long)]
+        verbose: bool,
     },
     /// Materialize visible CDC into a derived Lance analytics dataset
     CdcMaterialize {
@@ -436,12 +439,16 @@ async fn dispatch_cli(
             )
             .await
         }
-        Commands::Doctor { db_path, schema } => {
+        Commands::Doctor {
+            db_path,
+            schema,
+            verbose,
+        } => {
             let db_path = config.resolve_db_path(db_path)?;
             let schema = schema
                 .map(|path| config.resolve_schema_path(Some(path)))
                 .transpose()?;
-            cmd_doctor(&db_path, schema.as_deref(), json, quiet).await
+            cmd_doctor(&db_path, schema.as_deref(), verbose, json, quiet).await
         }
         Commands::CdcMaterialize {
             db_path,
@@ -1023,12 +1030,7 @@ async fn cmd_load(
         dry_run = options.dry_run
     )
 )]
-async fn cmd_embed(
-    db_path: &Path,
-    options: EmbedOptions,
-    json: bool,
-    quiet: bool,
-) -> Result<()> {
+async fn cmd_embed(db_path: &Path, options: EmbedOptions, json: bool, quiet: bool) -> Result<()> {
     let db = Database::open(db_path).await?;
     let result = db.embed(options.clone()).await?;
 
@@ -1068,10 +1070,7 @@ async fn cmd_embed(
             )
         };
         if result.reindexed_types > 0 {
-            message.push_str(&format!(
-                " (reindexed {} type(s))",
-                result.reindexed_types
-            ));
+            message.push_str(&format!(" (reindexed {} type(s))", result.reindexed_types));
         }
         let tone = if result.dry_run {
             StatusTone::Skip
@@ -1521,6 +1520,7 @@ fn render_check_error(
 async fn cmd_doctor(
     db_path: &Path,
     desired_schema_path: Option<&Path>,
+    verbose: bool,
     json: bool,
     quiet: bool,
 ) -> Result<()> {
@@ -1557,6 +1557,20 @@ async fn cmd_doctor(
         report.healthy = false;
     }
 
+    let dataset_storage_formats: Vec<serde_json::Value> = report
+        .datasets
+        .iter()
+        .map(|dataset| {
+            serde_json::json!({
+                "kind": dataset.kind,
+                "type_name": dataset.type_name,
+                "dataset_path": dataset.dataset_path,
+                "dataset_version": dataset.dataset_version,
+                "storage_version": dataset.storage_version,
+            })
+        })
+        .collect();
+
     if json {
         let schema_status = schema_drift.as_ref().map(|drift| {
             serde_json::json!({
@@ -1581,6 +1595,7 @@ async fn cmd_doctor(
                 "healthy": report.healthy,
                 "manifest_db_version": report.manifest_db_version,
                 "datasets_checked": report.datasets_checked,
+                "dataset_storage_formats": dataset_storage_formats,
                 "tx_rows": report.tx_rows,
                 "cdc_rows": report.cdc_rows,
                 "issues": report.issues,
@@ -1612,6 +1627,23 @@ async fn cmd_doctor(
                         color
                     )
                 );
+                if verbose && !report.datasets.is_empty() {
+                    println!("{}", style_label("Dataset storage formats:", color));
+                    for dataset in &report.datasets {
+                        println!(
+                            "  {} {}: {} ({}, v{})",
+                            dataset.kind,
+                            dataset.type_name,
+                            style_scalar(
+                                &format!("Lance {}", dataset.storage_version),
+                                "1;34",
+                                color
+                            ),
+                            dataset.dataset_path,
+                            dataset.dataset_version
+                        );
+                    }
+                }
                 for warning in &report.warnings {
                     println!("{}", format_status_line(StatusTone::Warn, warning, color));
                 }
@@ -1631,6 +1663,23 @@ async fn cmd_doctor(
             );
             if use_stderr {
                 eprintln!("{}", summary);
+                if verbose && !report.datasets.is_empty() {
+                    eprintln!("{}", style_label("Dataset storage formats:", color));
+                    for dataset in &report.datasets {
+                        eprintln!(
+                            "  {} {}: {} ({}, v{})",
+                            dataset.kind,
+                            dataset.type_name,
+                            style_scalar(
+                                &format!("Lance {}", dataset.storage_version),
+                                "1;34",
+                                color
+                            ),
+                            dataset.dataset_path,
+                            dataset.dataset_version
+                        );
+                    }
+                }
                 for issue in &report.issues {
                     eprintln!("{}", format_status_line(StatusTone::Error, issue, color));
                 }
@@ -1639,6 +1688,23 @@ async fn cmd_doctor(
                 }
             } else {
                 println!("{}", summary);
+                if verbose && !report.datasets.is_empty() {
+                    println!("{}", style_label("Dataset storage formats:", color));
+                    for dataset in &report.datasets {
+                        println!(
+                            "  {} {}: {} ({}, v{})",
+                            dataset.kind,
+                            dataset.type_name,
+                            style_scalar(
+                                &format!("Lance {}", dataset.storage_version),
+                                "1;34",
+                                color
+                            ),
+                            dataset.dataset_path,
+                            dataset.dataset_version
+                        );
+                    }
+                }
                 for issue in &report.issues {
                     println!("{}", format_status_line(StatusTone::Error, issue, color));
                 }

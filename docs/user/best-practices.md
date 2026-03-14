@@ -89,6 +89,18 @@ format = "jsonl"
 
 ## 3. Mutation constraints to know
 
+- **All mutations must be parameterized.** Never hardcode slugs, dates, or values directly in mutation queries. Hardcoded mutations are single-use throwaway code — agents write them once, run them, and leave dead queries in the `.gq` file. Use parameters for every variable value:
+  ```graphql
+  // Wrong — hardcoded, single-use
+  query advance_stage() {
+      update Opportunity set { stage: "won" } where slug = "opp-stripe-migration"
+  }
+
+  // Right — reusable
+  query advance_stage($slug: String, $stage: String) {
+      update Opportunity set { stage: $stage } where slug = $slug
+  }
+  ```
 - **`update` requires `@key`** on the target node type. Without it, the engine has no identity to match against.
 - **`now()` is available for timestamps.** Use `now()` in filters, projections, and mutation assignments instead of hardcoding datetime literals. It resolves to the current UTC time once per query execution:
   ```graphql
@@ -173,16 +185,21 @@ Agents frequently exclude graph files from version control. These files **should
 | `schema.pg` | Yes | Schema is code — review it like any source file |
 | `queries.gq` | Yes | Query library — the operational interface |
 | `seed.jsonl` | Yes | Seed data for reproducible bootstrapping |
+| `*.nano/` | **Yes** (small) | The database holds state mutations have created — it is not disposable |
 | `.env.nano` | **No** | Secrets (API keys) — gitignore this |
-| `*.nano/` | **Usually no** | Runtime database directory — regenerable from schema + seed |
 
-The database directory (`*.nano/`) is typically gitignored because it's large and regenerable. But the schema, queries, config, and seed data are source artifacts — losing them means losing the graph's definition.
+**The database is not regenerable from seed.** Once agents start making mutations, the database holds records, edges, CDC history, and embeddings that don't exist anywhere else. The seed file only captures the initial load. Do not gitignore the database and assume you can rebuild it.
 
-Add to `.gitignore`:
+**Small databases (under ~50 MB):** Commit the entire `*.nano/` directory. nanograph databases are embedded assets — treat them like a SQLite file checked into the repo. This is the default for most agent-scale graphs. GitHub warns at 50 MB per file and blocks at 100 MB.
+
+**Large databases (over ~50 MB):** The `*.nano/` directory contains binary Lance datasets that will bloat git history. Gitignore it, but still commit everything else — `schema.pg`, `queries.gq`, `nanograph.toml`, and seed `.jsonl`. These let you recreate the database structure if needed. For the database itself, set up a real backup strategy — S3 sync, filesystem snapshots, or rsync to durable storage. The database directory is the complete source of truth: Lance datasets, CDC log, transaction catalog, manifest, and schema IR. Back up the entire directory as-is.
 
 ```
-*.nano/
+# Always gitignore secrets
 .env.nano
+
+# Only gitignore the database if it's too large for git
+# *.nano/
 ```
 
 ## 7. Schema changes: migrate, don't rebuild
@@ -235,29 +252,61 @@ nanograph doctor
 
 `describe --format json` returns structured metadata including `@description`, `@instruction`, key properties, edge summaries, and row counts. This is the best way for an agent to understand a graph's structure before querying.
 
-## 9. Use query aliases and `--format json` for agent workflows
+## 9. Define aliases for every operation agents will use
 
-Agents should consume `json` or `jsonl` output, not `table`:
+Aliases are the single most effective way to prevent agent errors. Without them, agents construct long `--query`/`--name`/`--param`/`--format` commands from memory and get them wrong. With aliases, every operation becomes a short positional call that's hard to break.
 
-```bash
-# For agent consumption
-nanograph run search "renewal risk" --format json
-
-# Table is for humans
-nanograph run search "renewal risk" --format table
-```
-
-`json` output wraps results in a metadata object with query name, description, instruction, and rows. `jsonl` emits a metadata header record followed by row records. Both are machine-parseable.
-
-Define aliases in `nanograph.toml` for every operation the agent performs regularly. This reduces the chance of malformed commands:
+**Cover reads, mutations, and lookups.** A well-aliased project has one alias per agent-facing operation:
 
 ```toml
+# Reads
 [query_aliases.search]
 query = "queries.gq"
 name = "semantic_search"
 args = ["q"]
 format = "json"
+
+[query_aliases.pipeline]
+query = "queries.gq"
+name = "pipeline_summary"
+format = "json"
+
+# Lookups
+[query_aliases.client]
+query = "queries.gq"
+name = "client_lookup"
+args = ["slug"]
+format = "json"
+
+# Mutations
+[query_aliases.add-task]
+query = "queries.gq"
+name = "add_task"
+args = ["slug", "title", "status"]
+format = "jsonl"
+
+[query_aliases.status]
+query = "queries.gq"
+name = "update_task_status"
+args = ["slug", "status"]
+format = "jsonl"
 ```
+
+```bash
+# Agents use these — no flags to remember
+nanograph run search "renewal risk"
+nanograph run client cli-acme
+nanograph run add-task task-42 "Draft proposal" open
+nanograph run status task-42 done
+```
+
+**Alias design rules:**
+
+- **Always set `format`** in the alias. Use `json` for reads (agents get metadata + rows), `jsonl` for mutations (one confirmation record). Don't rely on agents remembering `--format`.
+- **Use short, verb-like names.** `search`, `add-task`, `status`, `trace` — not `run_semantic_search_query` or `update_task_status_mutation`. Agents type these frequently.
+- **Match `args` order to natural usage.** Put the scoping argument first (e.g. slug), then the action or search term. `nanograph run signals cli-acme "renewal"` reads naturally.
+- **List your aliases in `CLAUDE.md` or `AGENTS.md`.** Agents can't discover aliases from `nanograph.toml` unless told to look. A simple list like "Available aliases: `search`, `client`, `add-task`, `status`" is enough.
+- **Don't create aliases that duplicate CLI commands.** `nanograph describe` and `nanograph doctor` already work — aliases are for queries defined in `.gq` files.
 
 ## 10. JSONL data format: nodes vs. edges
 
@@ -347,7 +396,43 @@ nanograph schema-diff --from old.pg --to new.pg
 
 **Make this a hard rule:** no `.gq` or `.pg` edit is complete until `check` passes. Agents that skip this step produce silent errors that compound — a typo in a mutation query can go unnoticed until a user tries to run it days later.
 
-## 14. Keep nanograph up to date
+## 14. Backfill embeddings after `@embed` changes
+
+When you add a new `@embed(source_prop)` property to the schema, or change the source property or embedding settings, existing rows won't have vectors. Agents often forget this step and then get empty results from `nearest()` queries.
+
+```bash
+# Fill only rows where the vector is currently null
+nanograph embed --only-null
+
+# Recompute all embeddings (e.g. after changing model or chunk settings)
+nanograph embed
+
+# Restrict to one type
+nanograph embed --type Signal --only-null
+
+# Preview what would be embedded without writing
+nanograph embed --dry-run
+```
+
+After backfilling, if the property has `@index`, add `--reindex` to rebuild the vector index:
+
+```bash
+nanograph embed --only-null --reindex
+```
+
+## 15. Follow the post-change workflow
+
+Schema and query changes involve multiple steps that must happen in order. Agents that skip steps end up with typechecking errors, missing embeddings, or a DB schema that's drifted from the spec. Follow this checklist every time:
+
+1. **Edit** `.pg` and/or `.gq` files
+2. **Typecheck**: `nanograph check --query queries.gq`
+3. **If schema changed**: `nanograph migrate` (use `--dry-run` first to preview)
+4. **If `@embed` fields added or changed**: `nanograph embed --only-null`
+5. **Smoke test**: `nanograph run <alias>` to confirm runtime works
+
+Don't skip steps 2-4. Don't reorder them — migrating before typechecking means you might apply a broken schema, and querying before embedding means search returns no results.
+
+## 16. Keep nanograph up to date
 
 nanograph is under active development. New releases fix bugs, improve migration reliability, add query features, and tighten agent-facing output. Agents that operate against an old CLI version hit avoidable errors — especially around schema migration, CDC, and search.
 
@@ -364,7 +449,7 @@ cargo install nanograph-cli
 
 Make `brew upgrade nanograph` part of your project setup. When something behaves unexpectedly, check the version first — the fix may already be shipped.
 
-## 15. Treat `nanograph.toml` as the operational backbone
+## 17. Treat `nanograph.toml` as the operational backbone
 
 `nanograph.toml` is not optional boilerplate — it is the primary interface contract between the project and agents operating on it. A well-configured `nanograph.toml` means agents can run short, predictable commands instead of constructing long flag-heavy invocations that are easy to get wrong.
 
@@ -417,7 +502,7 @@ nanograph run --query queries.gq --name update_task_status --param slug=task-123
 nanograph run status task-123 done
 ```
 
-## 16. Always use `--json` or `--format json` for agent output
+## 18. Always use `--json` or `--format json` for agent output
 
 `table` output is for humans reading a terminal. Agents should never parse it — column widths change, values get truncated, and multiline content is collapsed. Always use structured output.
 
@@ -448,7 +533,7 @@ nanograph doctor --json
 
 Set `format = "json"` in your query aliases so agents get structured output by default without remembering to pass the flag.
 
-## 17. Use `describe` as the agent's entry point to a graph
+## 19. Use `describe` as the agent's entry point to a graph
 
 Before an agent writes queries, runs mutations, or ingests data, it should call `describe` to understand the graph's structure. This is especially important when the schema includes `@description` and `@instruction` annotations — they tell the agent what each type means and how to use it.
 
@@ -474,7 +559,7 @@ This is everything an agent needs to construct correct queries, mutations, and J
 2. `nanograph check --query queries.gq` — verify queries are valid
 3. `nanograph run <alias> ...` — execute queries and mutations
 
-## 18. Never commit `.env.nano` — always gitignore it
+## 20. Never commit `.env.nano` — always gitignore it
 
 `.env.nano` holds secrets like `OPENAI_API_KEY`. Agents creating new projects frequently forget to gitignore it, or worse, commit it and push.
 
@@ -498,7 +583,7 @@ Then rotate the exposed API key immediately.
 
 Keep secrets in `.env.nano` and shared defaults in `nanograph.toml`. Never put raw API keys in `nanograph.toml` — use `api_key_env = "OPENAI_API_KEY"` to reference the env var by name.
 
-## 19. Add nanograph rules to your project's `CLAUDE.md` or `AGENTS.md`
+## 21. Add nanograph rules to your project's `CLAUDE.md` or `AGENTS.md`
 
 AI agents read `CLAUDE.md` and `AGENTS.md` at the repo root for project-specific instructions. If your project uses nanograph, add operational rules there — otherwise agents will discover the graph by trial and error and repeat every mistake in this guide.
 
@@ -536,15 +621,17 @@ Without these instructions, every new agent session starts from zero. With them,
 | PascalCase edge names in queries | Use camelCase: `HasMentor` → `hasMentor` |
 | Using `type` key for edge JSONL records | Use `edge` key with `from`/`to` |
 | Rebuilding DB instead of migrating | Use `nanograph migrate` with `@rename_from` |
-| Not committing schema/queries to git | Commit `.pg`, `.gq`, `nanograph.toml`, seed `.jsonl` |
+| Not committing schema/queries/database to git | Commit `.pg`, `.gq`, `nanograph.toml`, seed `.jsonl`, and `*.nano/` (if under ~50 MB) |
 | Committing `.env.nano` with API keys | Add `.env.nano` to `.gitignore` before first commit |
 | Parsing `table` output programmatically | Use `--format json` or `--format jsonl` |
 | No `@description`/`@instruction` on types | Add metadata so agents can self-orient via `describe` |
-| No `nanograph.toml` or missing aliases | Config + aliases prevent malformed commands |
+| No aliases or missing `format` in aliases | Alias every agent operation with `format` set |
 | Guessing schema instead of calling `describe` | `nanograph describe --format json` first |
 | Global search + post-filter | Graph-constrained search (traverse, then rank) |
 | Editing `.gq`/`.pg` without typechecking | Run `nanograph check --query <file>` after every edit |
-| Hardcoding timestamps in mutations | Use `now()` for current UTC time |
+| Hardcoded slugs/values in mutations | Parameterize everything — no single-use queries |
+| Missing embeddings after `@embed` change | Run `nanograph embed --only-null` after schema changes |
+| Skipping steps after schema/query edits | Follow the 5-step post-change workflow |
 | Running on outdated CLI version | `brew upgrade nanograph` regularly |
 | No nanograph rules in `CLAUDE.md`/`AGENTS.md` | Add operational rules so agents don't start from zero |
 

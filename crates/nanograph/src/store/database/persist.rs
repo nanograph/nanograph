@@ -8,8 +8,7 @@ use serde_json::{Map as JsonMap, Value as JsonValue};
 use tracing::{debug, info};
 
 use super::{
-    Database, DatabaseWriteGuard, EmbedOptions, EmbedResult, LoadMode, MutationPlan,
-    MutationSource,
+    Database, DatabaseWriteGuard, EmbedOptions, EmbedResult, LoadMode, MutationPlan, MutationSource,
 };
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
@@ -205,7 +204,11 @@ impl Database {
                             ))
                         })?;
 
-                    row_assignments.push((prop.target_prop.clone(), source_text.to_string(), prop.dim));
+                    row_assignments.push((
+                        prop.target_prop.clone(),
+                        source_text.to_string(),
+                        prop.dim,
+                    ));
                 }
 
                 if row_assignments.is_empty() {
@@ -231,7 +234,8 @@ impl Database {
             }
 
             let vectors = resolve_embedding_requests(self.path(), &requests).await?;
-            for ((row_idx, target_prop), vector) in assignments.into_iter().zip(vectors.into_iter()) {
+            for ((row_idx, target_prop), vector) in assignments.into_iter().zip(vectors.into_iter())
+            {
                 rows[row_idx].insert(
                     target_prop,
                     serde_json::to_value(vector).map_err(|e| {
@@ -705,7 +709,12 @@ fn select_embed_types<'a>(
     embed_specs: &'a HashMap<String, Vec<crate::store::loader::EmbedSpec>>,
     type_name: Option<&str>,
     property_name: Option<&str>,
-) -> Result<Vec<(&'a crate::catalog::schema_ir::NodeTypeDef, Vec<SelectedEmbedProp>)>> {
+) -> Result<
+    Vec<(
+        &'a crate::catalog::schema_ir::NodeTypeDef,
+        Vec<SelectedEmbedProp>,
+    )>,
+> {
     let mut selected = Vec::new();
 
     for node_def in schema_ir.node_types() {
@@ -719,7 +728,11 @@ fn select_embed_types<'a>(
         };
         let props: Vec<SelectedEmbedProp> = specs
             .iter()
-            .filter(|spec| property_name.map(|name| spec.target_prop == name).unwrap_or(true))
+            .filter(|spec| {
+                property_name
+                    .map(|name| spec.target_prop == name)
+                    .unwrap_or(true)
+            })
             .map(|spec| SelectedEmbedProp {
                 target_prop: spec.target_prop.clone(),
                 source_prop: spec.source_prop.clone(),

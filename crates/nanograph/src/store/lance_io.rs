@@ -5,6 +5,7 @@ use arrow_array::{RecordBatch, RecordBatchIterator};
 use futures::StreamExt;
 use lance::Dataset;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
+use lance_file::version::LanceFileVersion;
 use tracing::info;
 
 use crate::error::{NanoError, Result};
@@ -12,6 +13,7 @@ use crate::error::{NanoError, Result};
 pub(crate) const LANCE_INTERNAL_ID_FIELD: &str = "__ng_id";
 pub(crate) const LANCE_INTERNAL_SRC_FIELD: &str = "__ng_src";
 pub(crate) const LANCE_INTERNAL_DST_FIELD: &str = "__ng_dst";
+const DEFAULT_NEW_DATASET_STORAGE_VERSION: LanceFileVersion = LanceFileVersion::V2_2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LanceDatasetKind {
@@ -112,6 +114,20 @@ pub(crate) async fn write_lance_batch_with_mode(
     batch: RecordBatch,
     mode: WriteMode,
 ) -> Result<u64> {
+    let storage_version = if path.exists() || matches!(mode, WriteMode::Append) {
+        None
+    } else {
+        Some(DEFAULT_NEW_DATASET_STORAGE_VERSION)
+    };
+    write_lance_batch_with_mode_and_storage_version(path, batch, mode, storage_version).await
+}
+
+pub(crate) async fn write_lance_batch_with_mode_and_storage_version(
+    path: &Path,
+    batch: RecordBatch,
+    mode: WriteMode,
+    storage_version: Option<LanceFileVersion>,
+) -> Result<u64> {
     info!(
         dataset_path = %path.display(),
         rows = batch.num_rows(),
@@ -124,10 +140,16 @@ pub(crate) async fn write_lance_batch_with_mode(
     let uri = path.to_string_lossy().to_string();
 
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
-
-    let write_params = WriteParams {
-        mode,
-        ..Default::default()
+    let write_params = match storage_version {
+        Some(version) => {
+            let mut params = WriteParams::with_storage_version(version);
+            params.mode = mode;
+            params
+        }
+        None => WriteParams {
+            mode,
+            ..Default::default()
+        },
     };
 
     let dataset = Dataset::write(reader, &uri, Some(write_params))

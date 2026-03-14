@@ -266,14 +266,16 @@ If `db.default_path` is set in `nanograph.toml`, `db_path` can be omitted.
 ### `doctor`
 
 Validate manifest/dataset/log consistency and graph integrity.
+Also reports the Lance storage format used by each tracked dataset.
 
 ```bash
-nanograph doctor [<db_path>] [--schema <schema.pg>]
+nanograph doctor [<db_path>] [--schema <schema.pg>] [--verbose]
 ```
 
 Returns non-zero when issues are detected.
 If `db.default_path` is set in `nanograph.toml`, `db_path` can be omitted.
 With `--schema`, `doctor` also compares the current DB schema against the desired schema file and reports drift as part of the health check. This is useful when queries have been updated ahead of the database schema.
+Use `--verbose` to show per-dataset Lance storage formats in human output. JSON output always includes `dataset_storage_formats`.
 
 ### `cdc-materialize`
 

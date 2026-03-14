@@ -12,11 +12,13 @@ mod embeddings;
 mod jsonl;
 mod merge;
 
+pub(crate) use embeddings::{
+    EmbedSpec, EmbedValueRequest, collect_embed_specs, resolve_embedding_requests,
+};
 pub(crate) use jsonl::{
     json_values_to_array, load_jsonl_reader_with_name_seed_at_path, parse_date32_literal,
     parse_date64_literal,
 };
-pub(crate) use embeddings::{EmbedSpec, EmbedValueRequest, collect_embed_specs, resolve_embedding_requests};
 
 /// Build the next storage snapshot for a `Database::load` operation.
 ///

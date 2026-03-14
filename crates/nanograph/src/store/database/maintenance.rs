@@ -236,6 +236,7 @@ impl Database {
         let mut issues = Vec::new();
         let mut warnings = Vec::new();
         let storage = self.snapshot();
+        let mut datasets = Vec::new();
 
         let tx_rows = read_tx_catalog_entries(&self.path)?;
         for (idx, window) in tx_rows.windows(2).enumerate() {
@@ -270,16 +271,30 @@ impl Database {
             }
             let uri = dataset_path.to_string_lossy().to_string();
             match Dataset::open(&uri).await {
-                Ok(dataset) => {
-                    if let Err(e) = dataset.checkout_version(entry.dataset_version).await {
+                Ok(dataset) => match dataset.checkout_version(entry.dataset_version).await {
+                    Ok(dataset) => {
+                        datasets_checked += 1;
+                        let storage_version = dataset
+                            .manifest
+                            .data_storage_format
+                            .lance_file_version()
+                            .map(|version| version.to_string())
+                            .unwrap_or_else(|_| "unknown".to_string());
+                        datasets.push(crate::store::database::DoctorDatasetReport {
+                            kind: entry.kind.clone(),
+                            type_name: entry.type_name.clone(),
+                            dataset_path: entry.dataset_path.clone(),
+                            dataset_version: entry.dataset_version,
+                            storage_version,
+                        });
+                    }
+                    Err(e) => {
                         issues.push(format!(
                             "dataset {} missing pinned version {}: {}",
                             entry.dataset_path, entry.dataset_version, e
                         ));
-                    } else {
-                        datasets_checked += 1;
                     }
-                }
+                },
                 Err(e) => {
                     issues.push(format!(
                         "failed to open dataset {}: {}",
@@ -334,6 +349,7 @@ impl Database {
             warnings,
             manifest_db_version: manifest.db_version,
             datasets_checked,
+            datasets,
             tx_rows: tx_rows.len(),
             cdc_rows: cdc_rows.len(),
         })

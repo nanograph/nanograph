@@ -1110,7 +1110,9 @@ async fn maintenance_commands_work_on_real_db() {
     cmd_cdc_materialize(&db_path, 0, true, false, false)
         .await
         .unwrap();
-    cmd_doctor(&db_path, None, false, false).await.unwrap();
+    cmd_doctor(&db_path, None, false, false, false)
+        .await
+        .unwrap();
 
     assert!(db_path.join("__cdc_analytics").exists());
 

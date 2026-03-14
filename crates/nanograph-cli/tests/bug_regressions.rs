@@ -351,6 +351,70 @@ fn doctor_reports_schema_drift_against_desired_schema() {
             .unwrap_or_default()
             .contains("database schema differs from desired schema")
     }));
+    let storage_formats = value["dataset_storage_formats"]
+        .as_array()
+        .expect("dataset storage formats");
+    assert!(storage_formats.is_empty());
+}
+
+#[test]
+fn doctor_json_reports_dataset_storage_versions_for_loaded_db() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
+    write_bug_fixture(&workspace);
+
+    let init = workspace.json_value(&["--json", "init", "bug.nano", "--schema", "bug.pg"]);
+    assert_eq!(init["status"], "ok");
+    let load = workspace.json_value(&[
+        "--json",
+        "load",
+        "bug.nano",
+        "--data",
+        "bug.jsonl",
+        "--mode",
+        "overwrite",
+    ]);
+    assert_eq!(load["status"], "ok");
+
+    let doctor = workspace.run_ok(&["--json", "doctor", "bug.nano"]);
+    let value = serde_json::from_str::<serde_json::Value>(&doctor.stdout).expect("doctor json");
+    let storage_formats = value["dataset_storage_formats"]
+        .as_array()
+        .expect("dataset storage formats");
+    assert!(!storage_formats.is_empty());
+    assert!(
+        storage_formats
+            .iter()
+            .all(|dataset| dataset["storage_version"] == "2.2")
+    );
+}
+
+#[test]
+fn doctor_human_output_shows_storage_formats_only_in_verbose_mode() {
+    let workspace = ExampleWorkspace::copy(ExampleProject::Revops);
+    write_bug_fixture(&workspace);
+
+    let init = workspace.json_value(&["--json", "init", "bug.nano", "--schema", "bug.pg"]);
+    assert_eq!(init["status"], "ok");
+    let load = workspace.json_value(&[
+        "--json",
+        "load",
+        "bug.nano",
+        "--data",
+        "bug.jsonl",
+        "--mode",
+        "overwrite",
+    ]);
+    assert_eq!(load["status"], "ok");
+
+    let compact = workspace.run_ok(&["doctor", "bug.nano"]).stdout;
+    assert!(compact.contains("Doctor OK"));
+    assert!(!compact.contains("Dataset storage formats:"));
+
+    let verbose = workspace
+        .run_ok(&["doctor", "bug.nano", "--verbose"])
+        .stdout;
+    assert!(verbose.contains("Dataset storage formats:"));
+    assert!(verbose.contains("Lance 2.2"));
 }
 
 #[test]
@@ -398,7 +462,9 @@ fn check_and_run_surface_vector_schema_drift_end_to_end() {
     assert!(check.stderr.trim().is_empty());
     let check_value = serde_json::from_str::<serde_json::Value>(&check.stdout).expect("check json");
     assert_eq!(check_value["status"], "error");
-    let check_error = check_value["results"][0]["error"].as_str().expect("check error");
+    let check_error = check_value["results"][0]["error"]
+        .as_str()
+        .expect("check error");
     assert!(check_error.contains("has no property `embedding`"));
     assert!(check_error.contains("desired schema"));
     assert!(check_error.contains("run `nanograph migrate"));
@@ -418,18 +484,14 @@ fn check_and_run_surface_vector_schema_drift_end_to_end() {
     assert!(run.stderr.trim().is_empty());
     let run_value = serde_json::from_str::<serde_json::Value>(&run.stdout).expect("run json");
     assert_eq!(run_value["status"], "error");
-    assert!(run_value["message"]
-        .as_str()
-        .unwrap_or_default()
-        .contains("has no property `embedding`"));
+    assert!(
+        run_value["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("has no property `embedding`")
+    );
 
-    let doctor = workspace.run_fail(&[
-        "--json",
-        "doctor",
-        "stale.nano",
-        "--schema",
-        "desired.pg",
-    ]);
+    let doctor = workspace.run_fail(&["--json", "doctor", "stale.nano", "--schema", "desired.pg"]);
     assert!(doctor.stderr.trim().is_empty());
     let doctor_value =
         serde_json::from_str::<serde_json::Value>(&doctor.stdout).expect("doctor json");
@@ -437,12 +499,18 @@ fn check_and_run_surface_vector_schema_drift_end_to_end() {
     assert_eq!(doctor_value["healthy"], false);
     assert_eq!(doctor_value["schema_status"]["matches"], false);
     assert_eq!(doctor_value["schema_status"]["compatibility"], "additive");
-    assert!(doctor_value["issues"].as_array().unwrap().iter().any(|issue| {
-        issue
-            .as_str()
-            .unwrap_or_default()
-            .contains("database schema differs from desired schema")
-    }));
+    assert!(
+        doctor_value["issues"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| {
+                issue
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("database schema differs from desired schema")
+            })
+    );
 }
 
 #[test]
