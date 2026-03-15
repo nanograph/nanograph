@@ -13,8 +13,37 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  changes:
+    name: Change Scope
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          predicate-quantifier: every
+          filters: |
+            docs_only:
+              - 'docs/**'
+              - 'README.md'
+
+  docs-only:
+    name: Docs Only
+    needs: changes
+    if: needs.changes.outputs.docs_only == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - run: echo "Docs-only change detected; skipping build and test matrix."
+
   core-rust:
     name: Core Rust
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -52,6 +81,8 @@ jobs:
 
   cli-e2e:
     name: CLI E2E
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -80,6 +111,8 @@ jobs:
 
   ts-sdk:
     name: TypeScript SDK
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -129,6 +162,8 @@ jobs:
 
   swift-sdk:
     name: Swift SDK
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4

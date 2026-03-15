@@ -13,6 +13,7 @@
 | [starwars-example.md](user/starwars-example.md) | Star Wars worked example with search |
 | [context-graph-example.md](user/context-graph-example.md) | CRM context graph case study |
 | [best-practices.md](user/best-practices.md) | Agent best practices — common mistakes and how to avoid them |
+| [lance-migration.md](user/lance-migration.md) | Lance v2 → v2.2 storage format migration procedure |
 
 ## Developer Docs
 
