@@ -1,0 +1,164 @@
+[project]
+name = "Codebase Agent Workspace"
+description = "Multi-agent code collaboration graph. Files as nodes, imports as edges, agents on branches."
+instruction = "Run commands from this directory. Queries model agent tool calls: read, write, search, blast radius, conflict detection, review routing."
+
+[db]
+default_path = "codebase.nano"
+
+[schema]
+default_path = "codebase.pg"
+
+[query]
+roots = ["."]
+
+[embedding]
+provider = "mock"
+chunk_size = 1500
+chunk_overlap_chars = 200
+
+[cli]
+output_format = "table"
+
+# ── File operations (agent tool call equivalents) ──────────────
+
+[query_aliases.read]
+query = "codebase.gq"
+name = "read_file"
+args = ["path"]
+format = "kv"
+
+[query_aliases.ls]
+query = "codebase.gq"
+name = "list_files"
+args = ["mod"]
+format = "table"
+
+[query_aliases.find]
+query = "codebase.gq"
+name = "semantic_search_files"
+args = ["q"]
+format = "table"
+
+[query_aliases.search]
+query = "codebase.gq"
+name = "hybrid_search_files"
+args = ["q"]
+format = "table"
+
+# ── Import graph ───────────────────────────────────────────────
+
+[query_aliases.deps]
+query = "codebase.gq"
+name = "file_dependencies"
+args = ["path"]
+format = "table"
+
+[query_aliases.dependents]
+query = "codebase.gq"
+name = "file_dependents"
+args = ["path"]
+format = "table"
+
+[query_aliases.blast]
+query = "codebase.gq"
+name = "import_chain"
+args = ["path"]
+format = "table"
+
+# ── Task management ───────────────────────────────────────────
+
+[query_aliases.tasks]
+query = "codebase.gq"
+name = "agent_tasks"
+args = ["agent"]
+format = "table"
+
+[query_aliases.files]
+query = "codebase.gq"
+name = "task_files"
+args = ["task"]
+format = "table"
+
+[query_aliases.active]
+query = "codebase.gq"
+name = "active_work"
+format = "table"
+
+[query_aliases.detail]
+query = "codebase.gq"
+name = "task_detail"
+args = ["task"]
+format = "table"
+
+# ── Conflict detection ────────────────────────────────────────
+
+[query_aliases.conflicts]
+query = "codebase.gq"
+name = "file_conflicts"
+args = ["task"]
+format = "table"
+
+[query_aliases.dep-conflicts]
+query = "codebase.gq"
+name = "import_conflicts"
+args = ["task"]
+format = "table"
+
+# ── Review routing ─────────────────────────────────────────────
+
+[query_aliases.reviewers]
+query = "codebase.gq"
+name = "review_candidates"
+args = ["task"]
+format = "table"
+
+[query_aliases.checks]
+query = "codebase.gq"
+name = "task_constraints"
+args = ["task"]
+format = "table"
+
+[query_aliases.reviews]
+query = "codebase.gq"
+name = "task_reviews"
+args = ["task"]
+format = "table"
+
+# ── Decisions ──────────────────────────────────────────────────
+
+[query_aliases.why]
+query = "codebase.gq"
+name = "search_decisions"
+args = ["q"]
+format = "kv"
+
+[query_aliases.history]
+query = "codebase.gq"
+name = "file_decisions"
+args = ["path"]
+format = "kv"
+
+# ── Aggregation ────────────────────────────────────────────────
+
+[query_aliases.stats]
+query = "codebase.gq"
+name = "files_per_module"
+format = "table"
+
+[query_aliases.hotspots]
+query = "codebase.gq"
+name = "most_imported"
+format = "table"
+
+# ── Gaps ───────────────────────────────────────────────────────
+
+[query_aliases.ungoverned]
+query = "codebase.gq"
+name = "ungoverned_files"
+format = "table"
+
+[query_aliases.unassigned]
+query = "codebase.gq"
+name = "unassigned_tasks"
+format = "table"
