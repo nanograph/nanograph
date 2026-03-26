@@ -19,6 +19,7 @@ use arrow_schema::{DataType, Field, Schema};
 use crate::error::{NanoError, Result};
 
 use super::super::graph::DatasetAccumulator;
+use super::super::media::resolve_media_value;
 use super::constraints::{key_value_string, node_property_field};
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -62,12 +63,15 @@ pub(crate) fn load_jsonl_reader_with_name_seed<R: BufRead>(
     name_seed: Option<&HashMap<(String, String), u64>>,
 ) -> Result<()> {
     let spool_dir = std::env::temp_dir();
-    load_jsonl_reader_with_name_seed_at_path(storage, &spool_dir, reader, key_props, name_seed)
+    load_jsonl_reader_with_name_seed_at_path(
+        storage, &spool_dir, None, reader, key_props, name_seed,
+    )
 }
 
 pub(crate) fn load_jsonl_reader_with_name_seed_at_path<R: BufRead>(
     storage: &mut DatasetAccumulator,
-    spool_dir: &Path,
+    db_path: &Path,
+    source_base: Option<&Path>,
     reader: R,
     key_props: &HashMap<String, String>,
     name_seed: Option<&HashMap<(String, String), u64>>,
@@ -98,7 +102,7 @@ pub(crate) fn load_jsonl_reader_with_name_seed_at_path<R: BufRead>(
                 )));
             }
             let writer = spool_writer_for_type(
-                spool_dir,
+                db_path,
                 "load_nodes",
                 type_name,
                 &mut node_writers,
@@ -109,7 +113,7 @@ pub(crate) fn load_jsonl_reader_with_name_seed_at_path<R: BufRead>(
         } else if let Some(edge_type) = obj.get("edge").and_then(|v| v.as_str()) {
             let edge_name = resolve_edge_name(storage, edge_type)?;
             let writer = spool_writer_for_type(
-                spool_dir,
+                db_path,
                 "load_edges",
                 &edge_name,
                 &mut edge_writers,
@@ -133,6 +137,8 @@ pub(crate) fn load_jsonl_reader_with_name_seed_at_path<R: BufRead>(
         })?;
         load_spooled_nodes(
             storage,
+            db_path,
+            source_base,
             &type_name,
             path,
             key_props,
@@ -187,6 +193,8 @@ impl Drop for TempSpoolPaths {
 
 fn load_spooled_nodes(
     storage: &mut DatasetAccumulator,
+    db_path: &Path,
+    source_base: Option<&Path>,
     type_name: &str,
     path: &Path,
     key_props: &HashMap<String, String>,
@@ -228,12 +236,28 @@ fn load_spooled_nodes(
         });
         next_row_idx += 1;
         if rows.len() >= batch_size {
-            flush_node_rows(storage, type_name, &mut rows, key_props, key_to_id)?;
+            flush_node_rows(
+                storage,
+                db_path,
+                source_base,
+                type_name,
+                &mut rows,
+                key_props,
+                key_to_id,
+            )?;
         }
     }
 
     if !rows.is_empty() {
-        flush_node_rows(storage, type_name, &mut rows, key_props, key_to_id)?;
+        flush_node_rows(
+            storage,
+            db_path,
+            source_base,
+            type_name,
+            &mut rows,
+            key_props,
+            key_to_id,
+        )?;
     }
 
     Ok(())
@@ -241,6 +265,8 @@ fn load_spooled_nodes(
 
 fn flush_node_rows(
     storage: &mut DatasetAccumulator,
+    db_path: &Path,
+    source_base: Option<&Path>,
     type_name: &str,
     rows: &mut Vec<PendingNodeRow>,
     key_props: &HashMap<String, String>,
@@ -254,6 +280,7 @@ fn flush_node_rows(
         storage.catalog.node_types.get(type_name).ok_or_else(|| {
             NanoError::Storage(format!("unknown node type in data: {}", type_name))
         })?;
+    normalize_media_uri_rows(db_path, source_base, type_name, node_type, rows)?;
     let prop_fields: Vec<Field> = node_type
         .arrow_schema
         .fields()
@@ -327,6 +354,87 @@ fn flush_node_rows(
     }
 
     rows.clear();
+    Ok(())
+}
+
+fn normalize_media_uri_rows(
+    db_path: &Path,
+    source_base: Option<&Path>,
+    type_name: &str,
+    node_type: &crate::catalog::NodeType,
+    rows: &mut [PendingNodeRow],
+) -> Result<()> {
+    if node_type.media_uri_props.is_empty() {
+        return Ok(());
+    }
+
+    for row in rows.iter_mut() {
+        for (uri_prop, mime_prop) in &node_type.media_uri_props {
+            let raw_value = row
+                .data
+                .get(uri_prop)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            if raw_value.is_null() {
+                match row.data.get(mime_prop) {
+                    Some(serde_json::Value::Null) | None => {
+                        row.data.insert(mime_prop.clone(), serde_json::Value::Null);
+                    }
+                    Some(other) => {
+                        return Err(NanoError::Storage(format!(
+                            "media mime property '{}.{}' must be null when '{}.{}' is null; got {} on row {}",
+                            type_name,
+                            mime_prop,
+                            type_name,
+                            uri_prop,
+                            describe_json_value(other),
+                            row.row_idx
+                        )));
+                    }
+                }
+                continue;
+            }
+
+            let raw_value_str = raw_value.as_str().ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "media property '{}.{}' must be a String, got {} on row {}",
+                    type_name,
+                    uri_prop,
+                    describe_json_value(&raw_value),
+                    row.row_idx
+                ))
+            })?;
+            let mime_hint = match row.data.get(mime_prop) {
+                Some(serde_json::Value::Null) | None => None,
+                Some(serde_json::Value::String(value)) => Some(value.as_str()),
+                Some(other) => {
+                    return Err(NanoError::Storage(format!(
+                        "media mime property '{}.{}' must be a String, got {} on row {}",
+                        type_name,
+                        mime_prop,
+                        describe_json_value(other),
+                        row.row_idx
+                    )));
+                }
+            };
+
+            let resolved = resolve_media_value(
+                db_path,
+                source_base,
+                type_name,
+                uri_prop,
+                raw_value_str,
+                mime_hint,
+            )?;
+            row.data
+                .insert(uri_prop.clone(), serde_json::Value::String(resolved.uri));
+            row.data.insert(
+                mime_prop.clone(),
+                serde_json::Value::String(resolved.mime_type),
+            );
+        }
+    }
+
     Ok(())
 }
 
@@ -1198,8 +1306,11 @@ pub(crate) fn parse_date64_literal(s: &str) -> Result<i64> {
 mod tests {
     use std::collections::HashMap;
     use std::io::Cursor;
+    use std::path::Path;
 
     use serde_json::json;
+    use tempfile::TempDir;
+    use url::Url;
 
     use crate::catalog::schema_ir::{build_catalog_from_ir, build_schema_ir};
     use crate::schema::parser::parse_schema;
@@ -1223,6 +1334,24 @@ edge Knows: Person -> Person
 
     fn person_key_props() -> HashMap<String, String> {
         HashMap::from([("Person".to_string(), "name".to_string())])
+    }
+
+    fn media_schema() -> &'static str {
+        r#"node Photo {
+    slug: String @key
+    uri: String @media_uri(mime)
+    mime: String?
+}
+"#
+    }
+
+    fn write_media_file(dir: &Path, name: &str, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join(name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&path, bytes).unwrap();
+        path
     }
 
     fn person_id_by_name(storage: &DatasetAccumulator, name: &str) -> u64 {
@@ -1527,6 +1656,112 @@ edge WorksWith: Person -> Person {
         assert_eq!(
             err.to_string(),
             r#"storage error: type mismatch for Person.age: expected I32, got String "not-a-number""#
+        );
+    }
+
+    #[test]
+    fn load_jsonl_imports_media_file_and_sets_mime() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join(".nano");
+        std::fs::create_dir_all(&db_path).unwrap();
+        let source_base = temp.path().join("fixtures");
+        let _source = write_media_file(
+            &source_base,
+            "images/pixel.png",
+            b"\x89PNG\r\n\x1a\nfake-png",
+        );
+
+        let mut storage = build_storage(media_schema());
+        let key_props = HashMap::from([("Photo".to_string(), "slug".to_string())]);
+        let data = r#"{"type":"Photo","data":{"slug":"hero","uri":"@file:images/pixel.png"}}"#;
+
+        load_jsonl_reader_with_name_seed_at_path(
+            &mut storage,
+            &db_path,
+            Some(&source_base),
+            Cursor::new(data.as_bytes()),
+            &key_props,
+            None,
+        )
+        .unwrap();
+
+        let batch = storage.get_all_nodes("Photo").unwrap().unwrap();
+        let uri_col = batch
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mime_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(mime_col.value(0), "image/png");
+        let parsed = Url::parse(uri_col.value(0)).unwrap();
+        assert_eq!(parsed.scheme(), "file");
+        let imported_path = parsed.to_file_path().unwrap();
+        assert!(imported_path.exists());
+        let media_root = temp.path().join("media").canonicalize().unwrap();
+        assert!(
+            imported_path
+                .strip_prefix(&media_root)
+                .unwrap()
+                .starts_with("photo")
+        );
+    }
+
+    #[test]
+    fn load_jsonl_imports_base64_media_and_sets_mime() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join(".nano");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        let mut storage = build_storage(media_schema());
+        let key_props = HashMap::from([("Photo".to_string(), "slug".to_string())]);
+        let data =
+            r#"{"type":"Photo","data":{"slug":"hero","uri":"@base64:iVBORw0KGgpmYWtlLXBuZw=="}}"#;
+
+        load_jsonl_reader_with_name_seed_at_path(
+            &mut storage,
+            &db_path,
+            None,
+            Cursor::new(data.as_bytes()),
+            &key_props,
+            None,
+        )
+        .unwrap();
+
+        let batch = storage.get_all_nodes("Photo").unwrap().unwrap();
+        let mime_col = batch
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(mime_col.value(0), "image/png");
+    }
+
+    #[test]
+    fn load_jsonl_rejects_relative_media_file_without_source_base() {
+        let temp = TempDir::new().unwrap();
+        let db_path = temp.path().join(".nano");
+        std::fs::create_dir_all(&db_path).unwrap();
+
+        let mut storage = build_storage(media_schema());
+        let key_props = HashMap::from([("Photo".to_string(), "slug".to_string())]);
+        let data = r#"{"type":"Photo","data":{"slug":"hero","uri":"@file:images/pixel.png"}}"#;
+
+        let err = load_jsonl_reader_with_name_seed_at_path(
+            &mut storage,
+            &db_path,
+            None,
+            Cursor::new(data.as_bytes()),
+            &key_props,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("requires a source file location"),
+            "unexpected error: {err}"
         );
     }
 }

@@ -14,7 +14,9 @@ use nanograph::error::NanoError;
 use nanograph::json_output::record_batches_to_rust_json_rows;
 use nanograph::query::parser::parse_query;
 use nanograph::query::typecheck::{CheckedQuery, typecheck_query_decl};
-use nanograph::store::database::{CleanupOptions, CompactOptions, Database, LoadMode};
+use nanograph::store::database::{
+    CleanupOptions, CompactOptions, Database, EmbedOptions, LoadMode,
+};
 use nanograph::{JsonParamMode, RunInputError, find_named_query, json_params_to_param_map};
 
 type FfiResult<T> = std::result::Result<T, String>;
@@ -235,9 +237,73 @@ fn parse_cleanup_options(opts: Option<&serde_json::Value>) -> FfiResult<CleanupO
     Ok(result)
 }
 
+fn parse_embed_options(opts: Option<&serde_json::Value>) -> FfiResult<EmbedOptions> {
+    let mut result = EmbedOptions::default();
+    let obj = match opts {
+        Some(serde_json::Value::Object(obj)) => obj,
+        Some(serde_json::Value::Null) | None => return Ok(result),
+        Some(_) => return Err("embed options must be a JSON object".to_string()),
+    };
+    for key in obj.keys() {
+        match key.as_str() {
+            "typeName" | "property" | "onlyNull" | "limit" | "reindex" | "dryRun" => {}
+            _ => return Err(format!("unknown embed option '{}'", key)),
+        }
+    }
+    if let Some(v) = obj.get("typeName") {
+        let type_name = v
+            .as_str()
+            .ok_or_else(|| "typeName must be a string".to_string())?
+            .trim();
+        if type_name.is_empty() {
+            return Err("typeName must not be empty".to_string());
+        }
+        result.type_name = Some(type_name.to_string());
+    }
+    if let Some(v) = obj.get("property") {
+        let property = v
+            .as_str()
+            .ok_or_else(|| "property must be a string".to_string())?
+            .trim();
+        if property.is_empty() {
+            return Err("property must not be empty".to_string());
+        }
+        result.property = Some(property.to_string());
+    }
+    if let Some(v) = obj.get("onlyNull") {
+        result.only_null = v
+            .as_bool()
+            .ok_or_else(|| "onlyNull must be a boolean".to_string())?;
+    }
+    if let Some(v) = obj.get("limit") {
+        let limit = v
+            .as_u64()
+            .ok_or_else(|| "limit must be a positive integer".to_string())?;
+        if limit == 0 {
+            return Err("limit must be a positive integer".to_string());
+        }
+        result.limit = Some(
+            usize::try_from(limit)
+                .map_err(|_| "limit is too large for this platform".to_string())?,
+        );
+    }
+    if let Some(v) = obj.get("reindex") {
+        result.reindex = v
+            .as_bool()
+            .ok_or_else(|| "reindex must be a boolean".to_string())?;
+    }
+    if let Some(v) = obj.get("dryRun") {
+        result.dry_run = v
+            .as_bool()
+            .ok_or_else(|| "dryRun must be a boolean".to_string())?;
+    }
+    Ok(result)
+}
+
 fn prop_def_to_json(prop: &nanograph::schema_ir::PropDef) -> serde_json::Value {
     let mut obj = serde_json::json!({
         "name": prop.name,
+        "propId": prop.prop_id,
         "type": prop.scalar_type,
         "nullable": prop.nullable,
     });
@@ -258,6 +324,9 @@ fn prop_def_to_json(prop: &nanograph::schema_ir::PropDef) -> serde_json::Value {
     }
     if let Some(ref src) = prop.embed_source {
         obj["embedSource"] = serde_json::Value::String(src.clone());
+    }
+    if let Some(ref mime_prop) = prop.media_mime_prop {
+        obj["mediaMimeProp"] = serde_json::Value::String(mime_prop.clone());
     }
     if let Some(ref description) = prop.description {
         obj["description"] = serde_json::Value::String(description.clone());
@@ -757,6 +826,33 @@ pub extern "C" fn nanograph_db_cleanup(
                 "datasetsCleaned": result.datasets_cleaned,
                 "datasetOldVersionsRemoved": result.dataset_old_versions_removed,
                 "datasetBytesRemoved": result.dataset_bytes_removed,
+            }))
+        })
+    })();
+    json_result_to_ptr(result)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nanograph_db_embed(
+    handle: *mut NanoGraphHandle,
+    options_json: *const c_char,
+) -> *mut c_char {
+    let result = (|| {
+        let options = parse_optional_json(options_json)?;
+        with_handle(handle, |handle| {
+            let opts = parse_embed_options(options.as_ref())?;
+            let db = handle.db()?;
+            let result = handle
+                .runtime
+                .block_on(db.embed(opts))
+                .map_err(to_ffi_err)?;
+            Ok(serde_json::json!({
+                "nodeTypesConsidered": result.node_types_considered,
+                "propertiesSelected": result.properties_selected,
+                "rowsSelected": result.rows_selected,
+                "embeddingsGenerated": result.embeddings_generated,
+                "reindexedTypes": result.reindexed_types,
+                "dryRun": result.dry_run,
             }))
         })
     })();

@@ -1,9 +1,12 @@
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Database, decodeArrow } from "../index.js";
+import { fileURLToPath, pathToFileURL } from "node:url";
+import { Database, decodeArrow, mediaFile, mediaUri } from "../index.js";
 
 // ---------- fixtures ----------
 
@@ -133,6 +136,9 @@ const U64_QUERY = `query validateU64($v: U64) {
   limit 1
 }`;
 
+const REPO_ROOT = fileURLToPath(new URL("../../..", import.meta.url));
+const CLI_BINARY_NAME = process.platform === "win32" ? "nanograph.exe" : "nanograph";
+
 let tmpDir;
 let dbCounter = 0;
 
@@ -147,6 +153,34 @@ async function writeDataFile(name, contents) {
   const path = join(tmpDir, `${name}-${++dbCounter}.jsonl`);
   await writeFile(path, contents);
   return path;
+}
+
+async function writeJpegAsset(name) {
+  const path = join(tmpDir, `${name}.jpg`);
+  await writeFile(path, Buffer.from([0xff, 0xd8, 0xff, 0xd9]));
+  return path;
+}
+
+function runNanograph(args) {
+  const debugBinary = join(REPO_ROOT, "target", "debug", CLI_BINARY_NAME);
+  const command = existsSync(debugBinary) ? debugBinary : "cargo";
+  const commandArgs = existsSync(debugBinary)
+    ? args
+    : ["run", "--quiet", "-p", "nanograph-cli", "--", ...args];
+
+  try {
+    execFileSync(command, commandArgs, {
+      cwd: REPO_ROOT,
+      encoding: "utf8",
+      env: process.env,
+    });
+  } catch (error) {
+    const stdout = error?.stdout ?? "";
+    const stderr = error?.stderr ?? "";
+    throw new Error(
+      `nanograph command failed: ${command} ${commandArgs.join(" ")}\nstdout:\n${stdout}\nstderr:\n${stderr}`,
+    );
+  }
 }
 
 // ---------- tests ----------
@@ -710,6 +744,28 @@ query coworkers() {
       assert.equal(rows[0].age, 28);
       await db2.close();
     });
+
+    it("should open a database created by the CLI", async () => {
+      const cliDir = await mkdtemp(join(tmpDir, `cli-db-${++dbCounter}-`));
+      const dbPath = join(cliDir, "interop.nano");
+      const schemaPath = join(cliDir, "schema.pg");
+      const dataPath = join(cliDir, "seed.jsonl");
+
+      await writeFile(schemaPath, SCHEMA);
+      await writeFile(dataPath, DATA);
+
+      runNanograph(["init", "--db", dbPath, "--schema", schemaPath]);
+      runNanograph(["load", "--db", dbPath, "--data", dataPath, "--mode", "overwrite"]);
+
+      const db = await Database.open(dbPath);
+      const rows = await db.run(QUERIES, "allPeople");
+      assert.deepEqual(rows, [
+        { name: "Alice", age: 30 },
+        { name: "Bob", age: 25 },
+        { name: "Carol", age: 35 },
+      ]);
+      await db.close();
+    });
   });
 
   // ---- compact + cleanup ----
@@ -928,6 +984,155 @@ query hybrid_rrf($vq: Vector(3), $tq: String) {
       assert.equal(rows[0].slug, "sig-billing-delay");
       assert.equal(typeof rows[0].score, "number");
       assert.ok(rows[0].score >= rows[1].score);
+      await db.close();
+    });
+  });
+
+  describe("media helpers", () => {
+    const MEDIA_SCHEMA = `
+node PhotoAsset {
+  slug: String @key
+  uri: String @media_uri(mime)
+  mime: String
+  embedding: Vector(16) @embed(uri) @index
+}
+
+node Product {
+  slug: String @key
+  name: String
+}
+
+edge HasPhoto: Product -> PhotoAsset
+`;
+
+    const MEDIA_QUERIES = `
+query photo_by_slug($slug: String) {
+  match { $img: PhotoAsset { slug: $slug } }
+  return { $img.slug as slug, $img.uri as uri, $img.mime as mime }
+}
+
+query products_from_image_search($q: String) {
+  match {
+    $product: Product
+    $product hasPhoto $img
+  }
+  return { $product.slug as product, $img.slug as image }
+  order { nearest($img.embedding, $q) }
+  limit 1
+}
+`;
+
+    async function freshMediaDb() {
+      const dbPath = join(tmpDir, `media-${++dbCounter}.nano`);
+      const db = await Database.init(dbPath, MEDIA_SCHEMA);
+      return db;
+    }
+
+    async function withMockEmbeddings(fn) {
+      const prev = process.env.NANOGRAPH_EMBEDDINGS_MOCK;
+      process.env.NANOGRAPH_EMBEDDINGS_MOCK = "1";
+      try {
+        await fn();
+      } finally {
+        if (prev === undefined) {
+          delete process.env.NANOGRAPH_EMBEDDINGS_MOCK;
+        } else {
+          process.env.NANOGRAPH_EMBEDDINGS_MOCK = prev;
+        }
+      }
+    }
+
+    const placeholderEmbedding = [1, ...Array(15).fill(0)];
+
+    it("describe exposes mediaMimeProp for media URI properties", async () => {
+      const db = await freshMediaDb();
+      const info = await db.describe();
+      const photo = info.nodeTypes.find((t) => t.name === "PhotoAsset");
+      const uriProp = photo.properties.find((p) => p.name === "uri");
+      assert.equal(uriProp.mediaMimeProp, "mime");
+      await db.close();
+    });
+
+    it("loadRows imports media files and fills the mime property", async () => {
+      const db = await freshMediaDb();
+      const heroPath = await writeJpegAsset("hero");
+
+      await db.loadRows(
+        [
+          {
+            type: "PhotoAsset",
+            data: {
+              slug: "hero",
+              uri: mediaFile(heroPath, "image/jpeg"),
+              embedding: placeholderEmbedding,
+            },
+          },
+        ],
+        "overwrite",
+      );
+
+      const rows = await db.run(MEDIA_QUERIES, "photo_by_slug", { slug: "hero" });
+      assert.equal(rows.length, 1);
+      assert.equal(rows[0].mime, "image/jpeg");
+      assert.match(rows[0].uri, /^file:\/\//);
+      await db.close();
+    });
+
+    it("embed backfills media embeddings and supports text-to-image traversal", async () => {
+      const db = await freshMediaDb();
+      const spacePath = await writeJpegAsset("space");
+      const beachPath = await writeJpegAsset("beach");
+
+      await db.loadRows(
+        [
+          {
+            type: "PhotoAsset",
+            data: {
+              slug: "space",
+              uri: mediaUri(pathToFileURL(spacePath).toString(), "image/jpeg"),
+              embedding: placeholderEmbedding,
+            },
+          },
+          {
+            type: "PhotoAsset",
+            data: {
+              slug: "beach",
+              uri: mediaUri(pathToFileURL(beachPath).toString(), "image/jpeg"),
+              embedding: placeholderEmbedding,
+            },
+          },
+          { type: "Product", data: { slug: "rocket", name: "Rocket Poster" } },
+          { type: "Product", data: { slug: "sand", name: "Beach Poster" } },
+          { edge: "HasPhoto", from: "rocket", to: "space" },
+          { edge: "HasPhoto", from: "sand", to: "beach" },
+        ],
+        "overwrite",
+      );
+
+      await withMockEmbeddings(async () => {
+        const onlyNull = await db.embed({
+          typeName: "PhotoAsset",
+          property: "embedding",
+          onlyNull: true,
+        });
+        assert.equal(onlyNull.rowsSelected, 0);
+
+        const result = await db.embed({
+          typeName: "PhotoAsset",
+          property: "embedding",
+          reindex: true,
+        });
+        assert.equal(result.propertiesSelected, 1);
+        assert.equal(result.embeddingsGenerated, 2);
+
+        const rows = await db.run(MEDIA_QUERIES, "products_from_image_search", {
+          q: "space",
+        });
+        assert.equal(rows.length, 1);
+        assert.equal(rows[0].product, "rocket");
+        assert.equal(rows[0].image, "space");
+      });
+
       await db.close();
     });
   });

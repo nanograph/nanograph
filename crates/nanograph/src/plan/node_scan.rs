@@ -3,7 +3,7 @@ use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, RecordBatch, StructArray};
+use arrow_array::{Array, ArrayRef, BooleanArray, FixedSizeListArray, RecordBatch};
 use arrow_schema::{DataType, Field, SchemaRef};
 use datafusion_common::{DataFusionError, Result};
 use datafusion_execution::TaskContext;
@@ -16,10 +16,11 @@ use futures::StreamExt;
 use lance::Dataset;
 use tracing::debug;
 
+use crate::plan::bindings::split_flat_binding_col;
 use crate::plan::literal_utils;
 use crate::query::ast::{CompOp, Literal};
 use crate::store::lance_io::logical_node_field_to_lance;
-use crate::store::runtime::DatabaseRuntime;
+use crate::store::runtime::{DatabaseRuntime, TextSearchKind, build_native_text_query};
 
 #[derive(Debug, Clone)]
 pub(crate) struct NodeScanPredicate {
@@ -29,13 +30,21 @@ pub(crate) struct NodeScanPredicate {
     pub(crate) index_eligible: bool,
 }
 
-/// Physical execution plan that scans all nodes of a type, outputting a Struct column.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct NodeScanTextFilter {
+    pub(crate) property: String,
+    pub(crate) query: String,
+    pub(crate) kind: TextSearchKind,
+}
+
+/// Physical execution plan that scans all nodes of a type, outputting flat binding columns.
 #[derive(Debug)]
 pub(crate) struct NodeScanExec {
     type_name: String,
     variable_name: String,
     output_schema: SchemaRef,
     pushdown_filters: Vec<NodeScanPredicate>,
+    text_filter: Option<NodeScanTextFilter>,
     limit: Option<usize>,
     runtime: Arc<DatabaseRuntime>,
     properties: PlanProperties,
@@ -47,6 +56,7 @@ impl NodeScanExec {
         variable_name: String,
         output_schema: SchemaRef,
         pushdown_filters: Vec<NodeScanPredicate>,
+        text_filter: Option<NodeScanTextFilter>,
         limit: Option<usize>,
         runtime: Arc<DatabaseRuntime>,
     ) -> Self {
@@ -62,6 +72,7 @@ impl NodeScanExec {
             variable_name,
             output_schema,
             pushdown_filters,
+            text_filter,
             limit,
             runtime,
             properties,
@@ -133,17 +144,12 @@ impl NodeScanExec {
         Ok(current)
     }
 
-    fn output_struct_fields(output_schema: &SchemaRef) -> Result<Vec<Field>> {
-        let struct_field = output_schema.field(0);
-        match struct_field.data_type() {
-            DataType::Struct(fields) => Ok(fields
-                .iter()
-                .map(|f| f.as_ref().clone())
-                .collect::<Vec<Field>>()),
-            other => Err(DataFusionError::Execution(format!(
-                "NodeScanExec expected struct output field, found {other:?}"
-            ))),
-        }
+    fn output_fields(output_schema: &SchemaRef) -> Vec<Field> {
+        output_schema
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect()
     }
 
     fn align_column_to_field(col: &ArrayRef, field: &Field) -> Result<ArrayRef> {
@@ -193,37 +199,40 @@ impl NodeScanExec {
         })
     }
 
-    fn wrap_struct_batch_for_schema(
+    fn materialize_batch_for_schema(
         output_schema: &SchemaRef,
         batch: &RecordBatch,
     ) -> Result<RecordBatch> {
-        let struct_fields = Self::output_struct_fields(output_schema)?;
-        let mut struct_columns = Vec::with_capacity(struct_fields.len());
-        for field in &struct_fields {
+        let output_fields = Self::output_fields(output_schema);
+        let mut output_columns = Vec::with_capacity(output_fields.len());
+        for field in &output_fields {
+            let property = split_flat_binding_col(field.name())
+                .map(|(_, property)| property)
+                .unwrap_or_else(|| field.name());
             let col = batch
-                .column_by_name(field.name())
-                .or_else(|| batch.column_by_name(logical_node_field_to_lance(field.name())))
+                .column_by_name(property)
+                .or_else(|| batch.column_by_name(logical_node_field_to_lance(property)))
                 .ok_or_else(|| {
                     DataFusionError::Execution(format!(
                         "column {} not found while materializing node scan output",
-                        field.name()
+                        property
                     ))
                 })?;
-            struct_columns.push(Self::align_column_to_field(col, field)?);
+            output_columns.push(Self::align_column_to_field(col, field)?);
         }
 
-        let struct_array = StructArray::new(struct_fields.into(), struct_columns, None);
-        RecordBatch::try_new(
-            output_schema.clone(),
-            vec![Arc::new(struct_array) as ArrayRef],
-        )
-        .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
+        RecordBatch::try_new(output_schema.clone(), output_columns)
+            .map_err(|e| DataFusionError::ArrowError(Box::new(e), None))
     }
 
     fn projected_column_names(&self) -> Result<Vec<String>> {
-        Ok(Self::output_struct_fields(&self.output_schema)?
+        Ok(Self::output_fields(&self.output_schema)
             .into_iter()
-            .map(|f| logical_node_field_to_lance(f.name()).to_string())
+            .map(|f| {
+                split_flat_binding_col(f.name())
+                    .map(|(_, property)| logical_node_field_to_lance(property).to_string())
+                    .unwrap_or_else(|| logical_node_field_to_lance(f.name()).to_string())
+            })
             .collect())
     }
 
@@ -278,6 +287,11 @@ impl NodeScanExec {
 
     fn has_index_eligible_pushdown(&self) -> bool {
         self.pushdown_filters.iter().any(|p| p.index_eligible)
+    }
+
+    fn text_query(&self) -> Option<lance_index::scalar::FullTextSearchQuery> {
+        let text_filter = self.text_filter.as_ref()?;
+        build_native_text_query(&text_filter.property, &text_filter.query, &text_filter.kind)
     }
 }
 
@@ -350,6 +364,7 @@ impl ExecutionPlan for NodeScanExec {
                 limit.and_then(|v| i64::try_from(v).ok())
             };
             let dataset_version = self.runtime.node_dataset_version(&self.type_name);
+            let text_query = self.text_query();
             let stream = futures::stream::once(async move {
                 let uri = dataset_path.to_string_lossy().to_string();
                 let dataset = Dataset::open(&uri).await.map_err(|e| {
@@ -369,10 +384,28 @@ impl ExecutionPlan for NodeScanExec {
                 scanner.project(&projected_columns).map_err(|e| {
                     DataFusionError::Execution(format!("lance projection pushdown error: {}", e))
                 })?;
+                let mut text_query_applied = false;
+                if let Some(query) = text_query {
+                    match scanner.full_text_search(query) {
+                        Ok(_) => {
+                            text_query_applied = true;
+                        }
+                        Err(e) => {
+                            debug!(
+                                dataset_uri = %uri,
+                                error = %e,
+                                "lance full-text pushdown unavailable, falling back to post-scan evaluation"
+                            );
+                        }
+                    }
+                }
                 if let Some(expr) = filter_sql.as_deref() {
                     scanner.filter(expr).map_err(|e| {
                         DataFusionError::Execution(format!("lance predicate pushdown error: {}", e))
                     })?;
+                    if text_query_applied {
+                        scanner.prefilter(true);
+                    }
                 }
                 if let Some(lim) = pushdown_limit {
                     scanner.limit(Some(lim), None).map_err(|e| {
@@ -432,7 +465,7 @@ impl ExecutionPlan for NodeScanExec {
                     filtered
                 };
 
-                NodeScanExec::wrap_struct_batch_for_schema(&output_schema, &filtered)
+                NodeScanExec::materialize_batch_for_schema(&output_schema, &filtered)
             });
 
             debug!(
@@ -441,6 +474,7 @@ impl ExecutionPlan for NodeScanExec {
                 limit = ?self.limit,
                 dataset_version = ?dataset_version,
                 index_eligible = self.has_index_eligible_pushdown(),
+                text_pushdown = self.text_filter.is_some(),
                 apply_filters_after_scan,
                 "using Lance-native node scan pushdown path"
             );
@@ -464,10 +498,11 @@ impl ExecutionPlan for NodeScanExec {
 #[cfg(test)]
 mod tests {
     use super::NodeScanExec;
+    use crate::plan::bindings::flat_binding_col;
     use crate::query::ast::Literal;
     use arrow_array::builder::{FixedSizeListBuilder, Float32Builder};
     use arrow_array::{ArrayRef, RecordBatch};
-    use arrow_schema::{DataType, Field, Fields, Schema};
+    use arrow_schema::{DataType, Field, Schema};
     use std::sync::Arc;
 
     #[test]
@@ -495,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn wrap_struct_batch_normalizes_fixed_size_list_child_nullability() {
+    fn materialize_batch_normalizes_fixed_size_list_child_nullability() {
         let mut emb_builder = FixedSizeListBuilder::new(Float32Builder::new(), 2);
         emb_builder.values().append_value(1.0);
         emb_builder.values().append_value(0.0);
@@ -512,23 +547,18 @@ mod tests {
         )]));
         let input_batch = RecordBatch::try_new(input_schema, vec![embedding]).unwrap();
 
-        let output_struct_fields = Fields::from(vec![Arc::new(Field::new(
-            "embedding",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2),
-            false,
-        ))]);
         let output_schema = Arc::new(Schema::new(vec![Field::new(
-            "n",
-            DataType::Struct(output_struct_fields.clone()),
+            &flat_binding_col("n", "embedding"),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2),
             false,
         )]));
 
-        let wrapped = NodeScanExec::wrap_struct_batch_for_schema(&output_schema, &input_batch)
+        let wrapped = NodeScanExec::materialize_batch_for_schema(&output_schema, &input_batch)
             .expect("expected schema alignment to succeed");
         assert_eq!(wrapped.num_rows(), 2);
         assert_eq!(
             wrapped.schema().field(0).data_type(),
-            &DataType::Struct(output_struct_fields)
+            &DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, false)), 2)
         );
     }
 }

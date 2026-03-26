@@ -25,6 +25,8 @@ datafusion-physical-plan = "52"
 datafusion-physical-expr = "52"
 datafusion-execution = "52"
 datafusion-common = "52"
+datafusion-expr = "52"
+datafusion-functions-aggregate = "52"
 
 # Lance (local-only — no cloud backends)
 lance = { version = "3.0", default-features = false }

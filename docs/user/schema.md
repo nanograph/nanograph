@@ -116,12 +116,13 @@ title: String @description("Short human-readable label")
 | `@key` | Primary key for merge/upsert. One per node type. Auto-indexed. Required for edge endpoint resolution via `from`/`to` in JSONL data. |
 | `@unique` | Uniqueness constraint enforced on load/upsert. Multiple per type. Nullable unique allows multiple nulls. |
 | `@index` | Creates an index for the property: scalar index for scalar fields, vector index for `Vector(dim)` fields. |
-| `@embed(source_prop)` | Auto-generates embeddings from a String property when the vector field is missing/null during load/mutation processing. Target must be `Vector(dim)`. See [search.md](search.md#embedding-workflow) for details. |
+| `@embed(source_prop)` | Auto-generates embeddings when the vector field is missing/null during load or backfill. Text sources use text embeddings. `@media_uri(...)` sources use multimodal embeddings. Target must be `Vector(dim)`. See [search.md](search.md#embedding-workflow) and [blobs.md](blobs.md). |
+| `@media_uri(mime_prop)` | Marks a `String` property as an external media URI and points to the sibling mime property. Use this for image, document, audio, or video asset nodes. See [blobs.md](blobs.md). |
 | `@rename_from("old")` | Tracks property/type renames for schema migration. |
 | `@description("...")` | Optional semantic description for node types, edge types, and properties. Intended for `describe --format json`, SDK introspection, and agent context. |
 | `@instruction("...")` | Optional agent-facing guidance for node and edge types. Advisory only; it does not change query execution semantics. |
 
-**Restrictions**: List properties cannot have `@key`, `@unique`, `@index`, or `@embed`. `@instruction` is only valid on node and edge types, not on properties.
+**Restrictions**: List properties cannot have `@key`, `@unique`, `@index`, `@embed`, or `@media_uri`. `@instruction` is only valid on node and edge types, not on properties. `@media_uri(...)` is only valid on `String` or `String?` and must reference a sibling `String` mime field.
 
 These annotations are metadata, not behavior:
 

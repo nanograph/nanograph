@@ -263,6 +263,68 @@ fn validate_string_annotation(
     Ok(())
 }
 
+fn validate_media_uri_annotation(
+    node_name: &str,
+    prop: &crate::schema::ast::PropDecl,
+    all_props: &[crate::schema::ast::PropDecl],
+) -> Result<()> {
+    let mut seen = false;
+    for ann in &prop.annotations {
+        if ann.name != "media_uri" {
+            continue;
+        }
+        if seen {
+            return Err(NanoError::Parse(format!(
+                "property {}.{} declares @media_uri multiple times",
+                node_name, prop.name
+            )));
+        }
+        seen = true;
+
+        if prop.prop_type.list || prop.prop_type.scalar != ScalarType::String {
+            return Err(NanoError::Parse(format!(
+                "@media_uri is only supported on String properties ({}.{})",
+                node_name, prop.name
+            )));
+        }
+
+        let mime_prop = ann.value.as_deref().ok_or_else(|| {
+            NanoError::Parse(format!(
+                "@media_uri on {}.{} requires a mime property name",
+                node_name, prop.name
+            ))
+        })?;
+        if mime_prop.trim().is_empty() {
+            return Err(NanoError::Parse(format!(
+                "@media_uri on {}.{} requires a non-empty mime property name",
+                node_name, prop.name
+            )));
+        }
+        if mime_prop == prop.name {
+            return Err(NanoError::Parse(format!(
+                "@media_uri on {}.{} must reference a sibling mime property, not itself",
+                node_name, prop.name
+            )));
+        }
+        let mime_decl = all_props
+            .iter()
+            .find(|candidate| candidate.name == mime_prop)
+            .ok_or_else(|| {
+                NanoError::Parse(format!(
+                    "@media_uri on {}.{} references unknown mime property {}",
+                    node_name, prop.name, mime_prop
+                ))
+            })?;
+        if mime_decl.prop_type.list || mime_decl.prop_type.scalar != ScalarType::String {
+            return Err(NanoError::Parse(format!(
+                "@media_uri mime property {}.{} must be String",
+                node_name, mime_prop
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
     for decl in &schema.declarations {
         match decl {
@@ -272,6 +334,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                         || ann.name == "unique"
                         || ann.name == "index"
                         || ann.name == "embed"
+                        || ann.name == "media_uri"
                     {
                         return Err(NanoError::Parse(format!(
                             "@{} is only supported on node properties (node {})",
@@ -307,7 +370,8 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                             && (ann.name == "key"
                                 || ann.name == "unique"
                                 || ann.name == "index"
-                                || ann.name == "embed")
+                                || ann.name == "embed"
+                                || ann.name == "media_uri")
                         {
                             return Err(NanoError::Parse(format!(
                                 "@{} is not supported on list property {}.{}",
@@ -418,6 +482,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                             }
                         }
                     }
+                    validate_media_uri_annotation(&node.name, prop, &node.properties)?;
                 }
 
                 if key_count > 1 {
@@ -433,6 +498,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                         || ann.name == "unique"
                         || ann.name == "index"
                         || ann.name == "embed"
+                        || ann.name == "media_uri"
                     {
                         return Err(NanoError::Parse(format!(
                             "@{} is not supported on edges (edge {})",
@@ -462,6 +528,7 @@ fn validate_schema_annotations(schema: &SchemaFile) -> Result<()> {
                             || ann.name == "unique"
                             || ann.name == "index"
                             || ann.name == "embed"
+                            || ann.name == "media_uri"
                         {
                             return Err(NanoError::Parse(format!(
                                 "@{} is not supported on edge properties (edge {}.{})",
@@ -940,6 +1007,57 @@ node Ticket {
 "#;
         let err = parse_schema(input).unwrap_err();
         assert!(err.to_string().contains("list property"));
+    }
+
+    #[test]
+    fn test_parse_media_uri_annotation() {
+        let input = r#"
+node Photo {
+    uri: String @media_uri(mime)
+    mime: String?
+}
+"#;
+        let schema = parse_schema(input).unwrap();
+        match &schema.declarations[0] {
+            SchemaDecl::Node(node) => {
+                let uri_prop = &node.properties[0];
+                assert_eq!(
+                    uri_prop
+                        .annotations
+                        .iter()
+                        .find(|ann| ann.name == "media_uri")
+                        .and_then(|ann| ann.value.as_deref()),
+                    Some("mime")
+                );
+            }
+            _ => panic!("expected node"),
+        }
+    }
+
+    #[test]
+    fn test_reject_media_uri_without_mime_sibling() {
+        let input = r#"
+node Photo {
+    uri: String @media_uri(mime)
+}
+"#;
+        let err = parse_schema(input).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("references unknown mime property mime")
+        );
+    }
+
+    #[test]
+    fn test_allow_embed_from_media_uri_property() {
+        let input = r#"
+node Photo {
+    uri: String @media_uri(mime)
+    mime: String?
+    embedding: Vector(3) @embed(uri)
+}
+"#;
+        assert!(parse_schema(input).is_ok());
     }
 
     #[test]

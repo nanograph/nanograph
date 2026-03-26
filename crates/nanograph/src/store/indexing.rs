@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 use lance::Dataset;
 use lance::index::vector::VectorIndexParams;
 use lance_index::scalar::ScalarIndexParams;
+use lance_index::scalar::inverted::InvertedIndexParams;
 use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 use tokio::sync::Mutex;
@@ -14,6 +15,7 @@ use crate::error::{NanoError, Result};
 use crate::types::ScalarType;
 
 const SCALAR_INDEX_SUFFIX: &str = "_btree_idx";
+const TEXT_INDEX_SUFFIX: &str = "_fts_idx";
 const VECTOR_INDEX_SUFFIX: &str = "_ivfpq_idx";
 const VECTOR_INDEX_MAX_PARTITIONS: usize = 256;
 const VECTOR_INDEX_PQ_BITS: u8 = 8;
@@ -28,6 +30,10 @@ pub fn scalar_index_name(type_id: u32, property: &str) -> String {
 
 pub fn vector_index_name(type_id: u32, property: &str) -> String {
     format!("nano_{:08x}_{}{}", type_id, property, VECTOR_INDEX_SUFFIX)
+}
+
+pub fn text_index_name(type_id: u32, property: &str) -> String {
+    format!("nano_{:08x}_{}{}", type_id, property, TEXT_INDEX_SUFFIX)
 }
 
 pub(crate) async fn rebuild_node_scalar_indexes(
@@ -85,6 +91,67 @@ pub(crate) async fn rebuild_node_scalar_indexes(
             property = %prop,
             index_name = %index_name,
             "created/replaced scalar index"
+        );
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn rebuild_node_text_indexes(
+    dataset_path: &Path,
+    node_def: &NodeTypeDef,
+) -> Result<()> {
+    let indexed_props: Vec<&str> = node_def
+        .properties
+        .iter()
+        .filter(|prop| prop.index && !prop.list)
+        .filter_map(|prop| match ScalarType::from_str_name(&prop.scalar_type) {
+            Some(ScalarType::String) => Some(prop.name.as_str()),
+            _ => None,
+        })
+        .collect();
+    if indexed_props.is_empty() {
+        return Ok(());
+    }
+
+    let build_lock = SCALAR_INDEX_BUILD_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = build_lock.lock().await;
+
+    let uri = dataset_path.to_string_lossy().to_string();
+    let mut dataset = Dataset::open(&uri)
+        .await
+        .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
+
+    let index_params = InvertedIndexParams::default()
+        .with_position(true)
+        .stem(false)
+        .remove_stop_words(false)
+        .ascii_folding(false);
+    for prop in indexed_props {
+        let index_name = text_index_name(node_def.type_id, prop);
+        dataset
+            .create_index(
+                &[prop],
+                IndexType::Inverted,
+                Some(index_name.clone()),
+                &index_params,
+                true,
+            )
+            .await
+            .map_err(|e| {
+                NanoError::Lance(format!(
+                    "create text index `{}` on {}.{} failed: {}",
+                    index_name, node_def.name, prop, e
+                ))
+            })?;
+        debug!(
+            node_type = %node_def.name,
+            property = %prop,
+            index_name = %index_name,
+            with_position = true,
+            stem = false,
+            remove_stop_words = false,
+            "created/replaced text index"
         );
     }
 

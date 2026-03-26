@@ -15,7 +15,7 @@ Use this for:
 - embedding defaults
 - CLI output defaults
 
-Use `.env.nano` for local secrets like `OPENAI_API_KEY`.
+Use `.env.nano` for local secrets like `OPENAI_API_KEY` or `GEMINI_API_KEY`.
 
 ## Files
 
@@ -67,6 +67,8 @@ Local-only secrets and machine-specific overrides. Do not commit this file.
 
 ```bash
 OPENAI_API_KEY=sk-...
+# or
+GEMINI_API_KEY=...
 ```
 
 You can also put non-secret local overrides here, but the intended use is secrets.
@@ -100,7 +102,7 @@ For command settings like DB path, query path, alias name, and output format:
 
 ### Embedding env and secrets
 
-For embedding-related env like `OPENAI_API_KEY`:
+For embedding-related env like `OPENAI_API_KEY` or `GEMINI_API_KEY`:
 
 1. existing process environment
 2. `.env.nano`
@@ -110,7 +112,7 @@ For embedding-related env like `OPENAI_API_KEY`:
 
 This is why the recommended setup is:
 
-- keep `OPENAI_API_KEY` in `.env.nano`
+- keep provider secrets like `OPENAI_API_KEY` or `GEMINI_API_KEY` in `.env.nano`
 - keep shared embedding defaults like `provider` and `model` in `nanograph.toml`
 
 ## Supported sections
@@ -171,7 +173,7 @@ Shared embedding defaults.
 
 ```toml
 [embedding]
-provider = "openai"   # or "mock"
+provider = "openai"   # or "gemini" / "mock"
 model = "text-embedding-3-small"
 base_url = "https://api.openai.com/v1"
 batch_size = 64
@@ -182,7 +184,7 @@ api_key_env = "OPENAI_API_KEY"
 
 Supported fields:
 
-- `provider` — `openai` or `mock`
+- `provider` — `openai`, `gemini`, or `mock`
 - `model`
 - `base_url`
 - `mock`

@@ -18,6 +18,7 @@
     "install": "node scripts/install.cjs",
     "build": "napi build --platform --js index.js --release",
     "build:debug": "napi build --platform --js index.js",
+    "pretest": "npm run build",
     "test": "node --test __test__/index.spec.mjs"
   },
   "dependencies": {

@@ -8,6 +8,22 @@ export type JsonPrimitive = string | number | boolean | null
 export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue }
 export type QueryParams = Record<string, JsonValue>
 export type QueryRow = Record<string, JsonValue>
+export type MediaFileRef = { file: string; mimeType?: string }
+export type MediaBase64Ref = { base64: string; mimeType?: string }
+export type MediaUriRef = { uri: string; mimeType?: string }
+export type MediaRef = MediaFileRef | MediaBase64Ref | MediaUriRef
+export type LoadValue = JsonValue | MediaRef
+export interface NodeLoadRow {
+  type: string
+  data: Record<string, LoadValue>
+}
+export interface EdgeLoadRow {
+  edge: string
+  from: string
+  to: string
+  data?: Record<string, LoadValue>
+}
+export type LoadRow = NodeLoadRow | EdgeLoadRow
 
 export interface MutationResult {
   affectedNodes: number
@@ -33,6 +49,7 @@ export interface PropDescription {
   index?: true
   enumValues?: string[]
   embedSource?: string
+  mediaMimeProp?: string
 }
 
 export interface EdgeEndpointSummary {
@@ -103,6 +120,24 @@ export interface CleanupResult {
   datasetBytesRemoved: number
 }
 
+export interface EmbedOptions {
+  typeName?: string
+  property?: string
+  onlyNull?: boolean
+  limit?: number
+  reindex?: boolean
+  dryRun?: boolean
+}
+
+export interface EmbedResult {
+  nodeTypesConsidered: number
+  propertiesSelected: number
+  rowsSelected: number
+  embeddingsGenerated: number
+  reindexedTypes: number
+  dryRun: boolean
+}
+
 export interface DoctorReport {
   healthy: boolean
   issues: string[]
@@ -120,6 +155,7 @@ export declare class Database {
 
   load(dataSource: string, mode: LoadMode): Promise<void>
   loadFile(dataPath: string, mode: LoadMode): Promise<void>
+  loadRows(rows: LoadRow[], mode: LoadMode): Promise<void>
 
   run<T extends QueryRow = QueryRow>(
     querySource: string,
@@ -129,6 +165,7 @@ export declare class Database {
   runArrow(querySource: string, queryName: string, params?: QueryParams | null): Promise<Buffer>
   check(querySource: string): Promise<QueryCheckResult[]>
   describe(): Promise<SchemaDescription>
+  embed(options?: EmbedOptions | null): Promise<EmbedResult>
   compact(options?: CompactOptions | null): Promise<CompactResult>
   cleanup(options?: CleanupOptions | null): Promise<CleanupResult>
   doctor(): Promise<DoctorReport>
@@ -137,3 +174,6 @@ export declare class Database {
 }
 
 export declare function decodeArrow(buffer: Buffer | Uint8Array): Table<any>
+export declare function mediaFile(file: string, mimeType?: string): MediaFileRef
+export declare function mediaBase64(base64: string, mimeType?: string): MediaBase64Ref
+export declare function mediaUri(uri: string, mimeType?: string): MediaUriRef

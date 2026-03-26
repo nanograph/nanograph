@@ -1630,6 +1630,8 @@ async fn test_migration_rebuilds_scalar_indexes_for_indexed_properties() {
         .find(|n| n.name == "Person")
         .expect("person node type");
     let expected_index_name = crate::store::indexing::scalar_index_name(person.type_id, "handle");
+    let expected_text_index_name =
+        crate::store::indexing::text_index_name(person.type_id, "handle");
     let dataset_path = path.join("nodes").join(SchemaIR::dir_name(person.type_id));
 
     let uri = dataset_path.to_string_lossy().to_string();
@@ -1645,6 +1647,11 @@ async fn test_migration_rebuilds_scalar_indexes_for_indexed_properties() {
         index_names.contains(&expected_index_name),
         "expected scalar index {} after migration",
         expected_index_name
+    );
+    assert!(
+        index_names.contains(&expected_text_index_name),
+        "expected text index {} after migration",
+        expected_text_index_name
     );
 }
 

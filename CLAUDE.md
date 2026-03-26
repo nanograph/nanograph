@@ -62,17 +62,21 @@ The system supports two execution modes that affect many code paths:
          → execute_query() → Vec<RecordBatch>
 ```
 
-### Vector Search & Embeddings
+### Search & Embeddings
 
-Semantic search is built on `Vector(dim)` properties and Lance's exact KNN. Two workflows:
+Three search subsystems:
+
+**Full-text search** — `@index` on String properties creates Lance inverted indexes (built automatically during load/mutation via `rebuild_node_text_indexes`). Text predicates: `search(string_prop, query)` for token-based keyword match, `fuzzy(string_prop, query[, max_edits])` for approximate match, `match_text(string_prop, query)` for contiguous phrase match. Ordering/ranking: `bm25(string_prop, query)` for lexical relevance. Results are cached per session via `TextSearchCache` in `store/runtime.rs` (keyed by type, property, query, kind, dataset version).
+
+**Vector search** — `Vector(dim)` properties with Lance exact KNN. Two workflows:
 - **Manual vectors**: Put vectors directly in JSONL data, query with `nearest(prop, $param)` ordering.
 - **Auto-embedding**: Annotate a `Vector(dim)` property with `@embed(source_prop)` — embeddings are generated from the source String property at load time via OpenAI API.
 
-Query predicates: `search(string_prop, query)` for token-based keyword match, `fuzzy(string_prop, query[, max_edits])` for approximate match, `match_text(string_prop, query)` for contiguous phrase match. Ordering/ranking: `nearest(vector_prop, query)` for cosine distance, `bm25(string_prop, query)` for lexical relevance, `rrf(nearest(...), bm25(...))` for hybrid fusion. `nearest` and `rrf` require a `limit` clause.
+**Hybrid** — `rrf(nearest(...), bm25(...))` for reciprocal rank fusion. `nearest` and `rrf` require a `limit` clause.
 
 Embedding cache: `_embedding_cache.jsonl` in the DB directory caches content-hashed embeddings to avoid re-embedding unchanged data. Large text (>1500 chars by default) is chunked with overlap and averaged.
 
-Key modules: `embedding.rs` (OpenAI client, retry, mock mode), `store/loader/embeddings.rs` (load-time materialization, caching, chunking).
+Key modules: `embedding.rs` (OpenAI client, retry, mock mode), `store/loader/embeddings.rs` (load-time materialization, caching, chunking), `store/runtime.rs` (TextSearchKind, TextSearchCache, native Lance FTS execution), `store/indexing.rs` (scalar, vector, and FTS index lifecycle).
 
 ### Module Map (`crates/nanograph/src/`)
 
@@ -82,14 +86,15 @@ Key modules: `embedding.rs` (OpenAI client, retry, mock mode), `store/loader/emb
 | `query/` | `query.pest` grammar + parser → query AST; `typecheck.rs` validates against catalog |
 | `catalog/` | `schema_ir.rs` — compiled schema representation used at runtime |
 | `ir/` | `lower.rs` — lowers typed AST into flat IR operators (NodeScan, Expand, Filter, AntiJoin, mutations) |
-| `plan/planner.rs` | Converts IR to DataFusion physical plans |
-| `plan/node_scan.rs` | Custom NodeScanExec with Lance filter pushdown |
-| `plan/physical.rs` | Custom ExpandExec, CrossJoinExec, AntiJoinExec, mutation execution |
+| `plan/bindings.rs` | Flat binding column utilities (`variable::property` naming, struct reconstruction) |
+| `plan/planner.rs` | Converts IR to DataFusion physical plans; TailStrategy analysis for DataFusion delegation |
+| `plan/node_scan.rs` | Custom NodeScanExec with Lance filter pushdown and text search tracking |
+| `plan/physical.rs` | Custom ExpandExec, CrossJoinExec, AntiJoinExec, ScoreExec, mutation execution |
 | `store/database.rs` | Lance-backed persistence, delete API, load modes, compact/cleanup/doctor |
 | `store/graph.rs` | In-memory GraphStorage with CSR/CSC indices |
 | `store/csr.rs` | CSR/CSC adjacency structure — core graph index for traversal |
 | `store/loader/` | Load orchestration: `jsonl.rs` (parsing + Arrow builders), `constraints.rs`, `merge.rs`, `embeddings.rs` (load-time embedding materialization) |
-| `store/indexing.rs` | Lance scalar index lifecycle |
+| `store/indexing.rs` | Lance scalar, vector, and FTS index lifecycle |
 | `store/migration.rs` | Schema evolution engine |
 | `store/manifest.rs` | Dataset inventory (`graph.manifest.json`) — tracks which node/edge types have Lance datasets |
 | `store/txlog.rs` | Transaction catalog + CDC log (`_tx_catalog.jsonl`, `_cdc_log.jsonl`) |
@@ -123,9 +128,9 @@ All library errors go through `NanoError` (in `error.rs`). Variants: `Parse`, `C
 
 ### Key Design Details
 
-- **Variables are Arrow Struct columns**: `$p: Person` becomes `Struct<id: U64, name: Utf8, age: Int32?>`. Property access is struct field access.
+- **Flat binding columns**: During execution, variables are materialized as flat columns named `variable::property` (e.g. `p::name`, `p::age`). The `plan/bindings.rs` module provides utilities to create, split, and access these columns. Struct columns are reconstructed on demand for the return path. This aligns with DataFusion's columnar model.
 - **Edge traversal is a Datalog predicate**: `$p knows $f` — no arrows, no Cypher syntax. Direction inferred from schema endpoint types.
-- **Custom ExecutionPlans**: NodeScanExec, ExpandExec (CSR/CSC traversal), CrossJoinExec, AntiJoinExec. Stock DataFusion operators used for filter, sort, limit, aggregation.
+- **Custom ExecutionPlans**: NodeScanExec, ExpandExec (CSR/CSC traversal), CrossJoinExec, AntiJoinExec, ScoreExec (text search scoring). The planner analyzes tail operations via `TailStrategy` — sorting, filtering, and aggregation are delegated to DataFusion when possible, falling back to legacy post-processing for search-dependent tails.
 - **Reverse traversal**: When source is unbound and destination is bound, the planner swaps direction and uses CSC instead of CSR.
 - **Negation**: `not {}` compiles to AntiJoinExec. The inner pipeline must be seeded with the outer plan's input.
 - **Bounded expansion**: `knows{1,3}` compiles to a finite union of 1-hop, 2-hop, 3-hop — no recursion.
@@ -211,19 +216,18 @@ See `.env.example` for reference.
 
 ## Version Constraints
 
-Arrow 57, DataFusion 52, Lance 2.0 + lance-index 2.0 — these must stay compatible with each other. Pest 2 for both grammars. napi/napi-derive 2 for TS SDK. Dependencies use sub-crates, not monolithic packages: `arrow-array`, `arrow-schema`, `arrow-select`, `arrow-cast`, `arrow-ord` (not `arrow`); `datafusion-physical-plan`, `datafusion-physical-expr`, `datafusion-execution`, `datafusion-common` (not `datafusion`). Import accordingly. All dependency versions are centralized in the root `Cargo.toml` under `[workspace.dependencies]` — add or update versions there, then reference with `dep.workspace = true` in crate-level Cargo.toml files.
+Arrow 57, DataFusion 52, Lance 3.0 + lance-index 3.0 — these must stay compatible with each other. Pest 2 for both grammars. napi/napi-derive 2 for TS SDK. Dependencies use sub-crates, not monolithic packages: `arrow-array`, `arrow-schema`, `arrow-select`, `arrow-cast`, `arrow-ord` (not `arrow`); `datafusion-physical-plan`, `datafusion-physical-expr`, `datafusion-execution`, `datafusion-common`, `datafusion-expr`, `datafusion-functions-aggregate` (not `datafusion`). Import accordingly. All dependency versions are centralized in the root `Cargo.toml` under `[workspace.dependencies]` — add or update versions there, then reference with `dep.workspace = true` in crate-level Cargo.toml files.
 
 ## Design Documents
 
 - `grammar.ebnf` — formal grammar for both DSLs, includes type rules (T1-T21; T10-T14 cover mutations, T15-T21 cover search/ordering)
-- `docs/dev/backlog.md` — current backlog and priorities
-- `docs/dev/search.md` — search feature design (vector, text, hybrid)
-- `docs/dev/typescript-sdk.md` — TypeScript SDK implementation details (lock semantics, type conversion, build)
-- `docs/dev/swift-sdk.md` — Swift SDK implementation details (C ABI, Swift Package wrapper)
 - `docs/dev/release-checklist.md` — release process steps
-- `docs/dev/embeddable-api.md` — embeddable API, streaming ingest, SDK status
-- `docs/dev/benchmarking.md` — criterion benchmark suite and how to run it
-- `docs/dev/benchmark-host.md` — recommended AWS benchmark host spec and provisioning
+- `docs/dev/fixes.md` — architectural issues and solutions map
+- `docs/dev/cdc-wal-proposal.md` — WAL-first CDC architecture proposal
+- `docs/dev/storage-modes.md` — full graph in memory vs on-demand analysis
+- `docs/dev/dataset-sharding.md` — per-type dataset justification
+- `docs/dev/distributed-architecture.md` — scaling from embedded to distributed
+- `docs/dev/nano-omni.md` — product roadmap (NanoGraph embedded vs Omnigraph repo-native)
 
 User-facing docs live in `docs/user/` — schema, queries, search, config, CLI reference, worked examples, and `best-practices.md` (agent anti-patterns and operational guidelines).
 
@@ -235,7 +239,7 @@ Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test
 
 CLI integration tests (Rust) in `crates/nanograph-cli/tests/` with shared helpers in `common/mod.rs`. Test files: `bootstrap_and_env`, `bug_regressions`, `config_and_aliases`, `config_failures`, `display_formats`, `docs_and_output`, `load_modes_and_export`, `revops_admin_and_cdc`, `revops_workflows`, `schema_analysis`, `starwars_export_roundtrip`, `starwars_workflows`.
 
-Criterion benchmarks in `crates/nanograph/benches/`: `query_lookup`, `traversal`, `load`, `search`, `result_transport`, `migration`. Shared setup in `benches/common/mod.rs`. Uses synthetic data and checked-in examples (starwars, revops). Legacy perf tests (`tests/*_perf.rs`, run with `--ignored`) are frozen — new benchmark work goes in `benches/`.
+Criterion benchmarks in `crates/nanograph/benches/`: `query_lookup`, `traversal`, `search`, `result_transport`. Shared setup in `benches/common/mod.rs`. Uses synthetic data and checked-in examples (starwars, revops). Legacy perf tests (`tests/*_perf.rs`, run with `--ignored`) are frozen — new benchmark work goes in `benches/`.
 
 ## Not Yet Implemented
 

@@ -44,6 +44,7 @@ char *nanograph_db_check(NanoGraphHandle *handle, const char *query_source);
 char *nanograph_db_describe(NanoGraphHandle *handle);
 char *nanograph_db_compact(NanoGraphHandle *handle, const char *options_json);
 char *nanograph_db_cleanup(NanoGraphHandle *handle, const char *options_json);
+char *nanograph_db_embed(NanoGraphHandle *handle, const char *options_json);
 char *nanograph_db_doctor(NanoGraphHandle *handle);
 int32_t nanograph_db_is_in_memory(NanoGraphHandle *handle);
 

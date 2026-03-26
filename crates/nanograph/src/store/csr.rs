@@ -31,10 +31,7 @@ impl CsrIndex {
             offsets[i] += offsets[i - 1];
         }
 
-        CsrIndex {
-            offsets,
-            neighbors,
-        }
+        CsrIndex { offsets, neighbors }
     }
 
     /// Get the neighbor node IDs for a given source node.

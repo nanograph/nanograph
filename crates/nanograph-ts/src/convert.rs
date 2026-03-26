@@ -1,5 +1,5 @@
 use nanograph::query::ast::Param;
-use nanograph::store::database::{CleanupOptions, CompactOptions, LoadMode};
+use nanograph::store::database::{CleanupOptions, CompactOptions, EmbedOptions, LoadMode};
 use nanograph::{JsonParamMode, ParamMap, json_params_to_param_map};
 
 pub fn js_object_to_param_map(
@@ -122,5 +122,81 @@ pub fn parse_cleanup_options(opts: Option<&serde_json::Value>) -> napi::Result<C
             napi::Error::from_reason("retainDatasetVersions is too large for this platform")
         })?;
     }
+    Ok(result)
+}
+
+pub fn parse_embed_options(opts: Option<&serde_json::Value>) -> napi::Result<EmbedOptions> {
+    let mut result = EmbedOptions::default();
+    let obj = match opts {
+        Some(serde_json::Value::Object(obj)) => obj,
+        Some(serde_json::Value::Null) | None => return Ok(result),
+        Some(_) => return Err(napi::Error::from_reason("embed options must be an object")),
+    };
+
+    for key in obj.keys() {
+        match key.as_str() {
+            "typeName" | "property" | "onlyNull" | "limit" | "reindex" | "dryRun" => {}
+            _ => {
+                return Err(napi::Error::from_reason(format!(
+                    "unknown embed option '{}'",
+                    key
+                )));
+            }
+        }
+    }
+
+    if let Some(v) = obj.get("typeName") {
+        let type_name = v
+            .as_str()
+            .ok_or_else(|| napi::Error::from_reason("typeName must be a string"))?
+            .trim();
+        if type_name.is_empty() {
+            return Err(napi::Error::from_reason("typeName must not be empty"));
+        }
+        result.type_name = Some(type_name.to_string());
+    }
+
+    if let Some(v) = obj.get("property") {
+        let property = v
+            .as_str()
+            .ok_or_else(|| napi::Error::from_reason("property must be a string"))?
+            .trim();
+        if property.is_empty() {
+            return Err(napi::Error::from_reason("property must not be empty"));
+        }
+        result.property = Some(property.to_string());
+    }
+
+    if let Some(v) = obj.get("onlyNull") {
+        result.only_null = v
+            .as_bool()
+            .ok_or_else(|| napi::Error::from_reason("onlyNull must be a boolean"))?;
+    }
+
+    if let Some(v) = obj.get("limit") {
+        let limit = v
+            .as_u64()
+            .ok_or_else(|| napi::Error::from_reason("limit must be a positive integer"))?;
+        if limit == 0 {
+            return Err(napi::Error::from_reason("limit must be a positive integer"));
+        }
+        result.limit = Some(
+            usize::try_from(limit)
+                .map_err(|_| napi::Error::from_reason("limit is too large for this platform"))?,
+        );
+    }
+
+    if let Some(v) = obj.get("reindex") {
+        result.reindex = v
+            .as_bool()
+            .ok_or_else(|| napi::Error::from_reason("reindex must be a boolean"))?;
+    }
+
+    if let Some(v) = obj.get("dryRun") {
+        result.dry_run = v
+            .as_bool()
+            .ok_or_else(|| napi::Error::from_reason("dryRun must be a boolean"))?;
+    }
+
     Ok(result)
 }

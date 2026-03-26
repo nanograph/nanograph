@@ -3456,9 +3456,12 @@ dependencies = [
  "arrow-schema",
  "arrow-select",
  "async-trait",
+ "base64",
  "criterion",
  "datafusion-common",
  "datafusion-execution",
+ "datafusion-expr",
+ "datafusion-functions-aggregate",
  "datafusion-physical-expr",
  "datafusion-physical-plan",
  "futures",
@@ -3471,10 +3474,12 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

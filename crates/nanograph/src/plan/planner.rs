@@ -1,35 +1,993 @@
+use std::any::Any;
 use std::collections::HashSet;
+use std::fmt;
+use std::hash::Hash;
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
 use arrow_array::{
     Array, BooleanArray, FixedSizeListArray, Float32Array, Float64Array, RecordBatch, StringArray,
-    StructArray,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion_common::Result as DFResult;
+use datafusion_common::{Result as DFResult, ScalarValue};
 use datafusion_execution::TaskContext;
-use datafusion_physical_expr::EquivalenceProperties;
+use datafusion_expr::{ColumnarValue, Operator};
+use datafusion_functions_aggregate::{
+    average::avg_udaf,
+    count::count_udaf,
+    min_max::{max_udaf, min_udaf},
+    sum::sum_udaf,
+};
+use datafusion_physical_expr::aggregate::AggregateExprBuilder;
+use datafusion_physical_expr::expressions::{Literal as PhysicalLiteral, binary, col, try_cast};
+use datafusion_physical_expr::{
+    EquivalenceProperties, LexOrdering, PhysicalExpr, PhysicalSortExpr,
+};
 use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
+    aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
+    filter::FilterExec,
+    limit::GlobalLimitExec,
+    projection::{ProjectionExec, ProjectionExpr},
+    sorts::sort::SortExec,
 };
 use lance::Dataset;
 use lance_index::DatasetIndexExt;
 
-use crate::embedding::EmbeddingClient;
+use crate::embedding::{EmbedRole, EmbeddingClient};
 use crate::error::{NanoError, Result};
 use crate::ir::*;
+use crate::plan::bindings::{
+    binding_data_type, binding_property_array, binding_struct_array, flat_binding_col,
+};
 use crate::query::ast::{AggFunc, CompOp, Literal, NOW_PARAM_NAME};
 use crate::store::lance_io::logical_node_field_to_lance;
-use crate::store::runtime::DatabaseRuntime;
+use crate::store::loader::{parse_date32_literal, parse_date64_literal};
+use crate::store::runtime::{DatabaseRuntime, TextSearchKind};
 use crate::types::ScalarType;
 use tracing::{debug, info, instrument};
 
 use super::literal_utils;
-use super::node_scan::{NodeScanExec, NodeScanPredicate};
+use super::node_scan::{NodeScanExec, NodeScanPredicate, NodeScanTextFilter};
 use super::physical::{ExpandExec, ExpandSpec};
 
 type ScanProjectionMap = AHashMap<String, Option<AHashSet<String>>>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TailStrategy {
+    Legacy,
+    DataFusionNonAggregate {
+        alias_ordering: bool,
+        final_variable_projection: bool,
+    },
+    DataFusionAggregate,
+}
+
+struct TailPlan {
+    plan: Arc<dyn ExecutionPlan>,
+    final_manual_projection: bool,
+}
+
+#[derive(Debug, Clone)]
+struct DerivedTailExpr {
+    column_name: String,
+    expr: IRExpr,
+    data_type: DataType,
+    nullable: bool,
+}
+
+fn analyze_tail_strategy(ir: &QueryIR) -> TailStrategy {
+    let has_aggregation = ir
+        .return_exprs
+        .iter()
+        .any(|projection| matches!(projection.expr, IRExpr::Aggregate { .. }));
+    let has_alias_ordering = ir
+        .order_by
+        .iter()
+        .any(|ordering| matches!(ordering.expr, IRExpr::AliasRef(_)));
+    let has_variable_projection = ir
+        .return_exprs
+        .iter()
+        .any(|projection| matches!(projection.expr, IRExpr::Variable(_)));
+
+    if !remaining_runtime_filters(&ir.pipeline, &ParamMap::new())
+        .iter()
+        .all(is_supported_tail_filter)
+    {
+        return TailStrategy::Legacy;
+    }
+
+    if has_aggregation {
+        if !ir
+            .return_exprs
+            .iter()
+            .all(is_supported_aggregate_projection)
+        {
+            return TailStrategy::Legacy;
+        }
+        if !ir
+            .order_by
+            .iter()
+            .all(|ordering| matches!(ordering.expr, IRExpr::AliasRef(_)))
+        {
+            return TailStrategy::Legacy;
+        }
+        return TailStrategy::DataFusionAggregate;
+    }
+
+    if !ir
+        .return_exprs
+        .iter()
+        .all(is_supported_non_aggregate_projection)
+    {
+        return TailStrategy::Legacy;
+    }
+
+    if has_alias_ordering && has_variable_projection {
+        return TailStrategy::Legacy;
+    }
+
+    if has_alias_ordering
+        && !ir
+            .order_by
+            .iter()
+            .all(|ordering| matches!(ordering.expr, IRExpr::AliasRef(_)))
+    {
+        return TailStrategy::Legacy;
+    }
+
+    if !ir
+        .order_by
+        .iter()
+        .all(|ordering| is_supported_non_aggregate_tail_expr(&ordering.expr))
+    {
+        return TailStrategy::Legacy;
+    }
+
+    TailStrategy::DataFusionNonAggregate {
+        alias_ordering: has_alias_ordering,
+        final_variable_projection: has_variable_projection,
+    }
+}
+
+fn is_supported_tail_filter(filter: &IRFilter) -> bool {
+    is_supported_non_aggregate_tail_expr(&filter.left)
+        && is_supported_non_aggregate_tail_expr(&filter.right)
+}
+
+fn is_supported_non_aggregate_projection(projection: &IRProjection) -> bool {
+    matches!(projection.expr, IRExpr::Variable(_))
+        || is_supported_non_aggregate_tail_expr(&projection.expr)
+}
+
+fn is_supported_aggregate_projection(projection: &IRProjection) -> bool {
+    match &projection.expr {
+        IRExpr::Aggregate { func, arg } => {
+            matches!(
+                func,
+                AggFunc::Count | AggFunc::Sum | AggFunc::Avg | AggFunc::Min | AggFunc::Max
+            ) && is_supported_aggregate_arg(arg)
+        }
+        expr => is_supported_group_expr(expr),
+    }
+}
+
+fn is_supported_group_expr(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::PropAccess { .. } | IRExpr::Literal(_) | IRExpr::Param(_)
+    )
+}
+
+fn is_supported_aggregate_arg(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::PropAccess { .. } | IRExpr::Literal(_) | IRExpr::Param(_) | IRExpr::Variable(_)
+    )
+}
+
+fn is_supported_non_aggregate_tail_expr(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::PropAccess { .. }
+            | IRExpr::Literal(_)
+            | IRExpr::Param(_)
+            | IRExpr::AliasRef(_)
+            | IRExpr::Search { .. }
+            | IRExpr::Fuzzy { .. }
+            | IRExpr::MatchText { .. }
+            | IRExpr::Bm25 { .. }
+            | IRExpr::Rrf { .. }
+    )
+}
+
+fn is_derived_tail_expr(expr: &IRExpr) -> bool {
+    matches!(
+        expr,
+        IRExpr::Search { .. }
+            | IRExpr::Fuzzy { .. }
+            | IRExpr::MatchText { .. }
+            | IRExpr::Bm25 { .. }
+            | IRExpr::Rrf { .. }
+    )
+}
+
+fn derived_tail_expr_type(expr: &IRExpr) -> Option<(DataType, bool)> {
+    match expr {
+        IRExpr::Search { .. } | IRExpr::Fuzzy { .. } | IRExpr::MatchText { .. } => {
+            Some((DataType::Boolean, false))
+        }
+        IRExpr::Bm25 { .. } | IRExpr::Rrf { .. } => Some((DataType::Float64, false)),
+        _ => None,
+    }
+}
+
+fn derived_tail_expr_key(expr: &IRExpr) -> String {
+    format!("{expr:?}")
+}
+
+fn collect_tail_derived_exprs(ir: &QueryIR, params: &ParamMap) -> Vec<DerivedTailExpr> {
+    let mut seen = AHashSet::new();
+    let mut derived = Vec::new();
+
+    let mut push_expr = |expr: &IRExpr| {
+        if !is_derived_tail_expr(expr) {
+            return;
+        }
+        let key = derived_tail_expr_key(expr);
+        if !seen.insert(key) {
+            return;
+        }
+        if let Some((data_type, nullable)) = derived_tail_expr_type(expr) {
+            let column_name = format!("__ng_score_{}", derived.len());
+            derived.push(DerivedTailExpr {
+                column_name,
+                expr: expr.clone(),
+                data_type,
+                nullable,
+            });
+        }
+    };
+
+    for filter in remaining_runtime_filters(&ir.pipeline, params) {
+        push_expr(&filter.left);
+        push_expr(&filter.right);
+    }
+    for projection in &ir.return_exprs {
+        push_expr(&projection.expr);
+    }
+    for ordering in &ir.order_by {
+        push_expr(&ordering.expr);
+    }
+
+    derived
+}
+
+fn derived_tail_expr_columns(derived_exprs: &[DerivedTailExpr]) -> AHashMap<String, String> {
+    derived_exprs
+        .iter()
+        .map(|expr| (derived_tail_expr_key(&expr.expr), expr.column_name.clone()))
+        .collect()
+}
+
+fn projection_output_name(projection: &IRProjection) -> String {
+    projection
+        .alias
+        .clone()
+        .unwrap_or_else(|| default_expr_name(&projection.expr))
+}
+
+fn default_expr_name(expr: &IRExpr) -> String {
+    match expr {
+        IRExpr::PropAccess { property, .. } => property.clone(),
+        IRExpr::Variable(name) => name.clone(),
+        IRExpr::Param(name) => {
+            if name == NOW_PARAM_NAME {
+                "now".to_string()
+            } else {
+                name.clone()
+            }
+        }
+        IRExpr::Literal(_) => "literal".to_string(),
+        IRExpr::AliasRef(name) => name.clone(),
+        IRExpr::Aggregate { func, .. } => func.to_string(),
+        IRExpr::Nearest { .. } => "nearest".to_string(),
+        IRExpr::Search { .. } => "search".to_string(),
+        IRExpr::Fuzzy { .. } => "fuzzy".to_string(),
+        IRExpr::MatchText { .. } => "match_text".to_string(),
+        IRExpr::Bm25 { .. } => "bm25".to_string(),
+        IRExpr::Rrf { .. } => "rrf".to_string(),
+    }
+}
+
+fn remaining_runtime_filters(pipeline: &[IROp], params: &ParamMap) -> Vec<IRFilter> {
+    let scan_variables = pipeline_scan_variables(pipeline);
+    let mut filters = Vec::new();
+
+    for op in pipeline {
+        match op {
+            IROp::Filter(filter) => {
+                if !is_explicit_filter_pushed_down(&scan_variables, filter, params) {
+                    filters.push(filter.clone());
+                }
+            }
+            IROp::NodeScan {
+                variable,
+                filters: scan_filters,
+                ..
+            } => {
+                for filter in scan_filters {
+                    if pushdown_scan_filter(variable, filter, params).is_none() {
+                        filters.push(filter.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    filters
+}
+
+fn literal_to_scalar_value(
+    literal: &Literal,
+    target_type: Option<&DataType>,
+) -> Result<ScalarValue> {
+    let scalar = match (literal, target_type) {
+        (Literal::String(value), _) => ScalarValue::Utf8(Some(value.clone())),
+        (Literal::Integer(value), Some(DataType::Int32)) => ScalarValue::Int32(Some(*value as i32)),
+        (Literal::Integer(value), Some(DataType::Int64)) => ScalarValue::Int64(Some(*value)),
+        (Literal::Integer(value), Some(DataType::UInt32)) => {
+            ScalarValue::UInt32(Some(*value as u32))
+        }
+        (Literal::Integer(value), Some(DataType::UInt64)) => {
+            ScalarValue::UInt64(Some(*value as u64))
+        }
+        (Literal::Integer(value), Some(DataType::Float32)) => {
+            ScalarValue::Float32(Some(*value as f32))
+        }
+        (Literal::Integer(value), Some(DataType::Float64)) => {
+            ScalarValue::Float64(Some(*value as f64))
+        }
+        (Literal::Integer(value), _) => ScalarValue::Int64(Some(*value)),
+        (Literal::Float(value), Some(DataType::Float32)) => {
+            ScalarValue::Float32(Some(*value as f32))
+        }
+        (Literal::Float(value), Some(DataType::Float64)) => ScalarValue::Float64(Some(*value)),
+        (Literal::Float(value), Some(DataType::Int32)) => ScalarValue::Int32(Some(*value as i32)),
+        (Literal::Float(value), Some(DataType::Int64)) => ScalarValue::Int64(Some(*value as i64)),
+        (Literal::Float(value), _) => ScalarValue::Float64(Some(*value)),
+        (Literal::Bool(value), _) => ScalarValue::Boolean(Some(*value)),
+        (Literal::Date(value), _) => ScalarValue::Date32(Some(parse_date32_literal(value)?)),
+        (Literal::DateTime(value), _) => ScalarValue::Date64(Some(parse_date64_literal(value)?)),
+        (Literal::List(_), _) => {
+            return Err(NanoError::Execution(
+                "list literals are not supported in the DataFusion tail".to_string(),
+            ));
+        }
+    };
+    Ok(scalar)
+}
+
+fn lower_tail_value_expr(
+    expr: &IRExpr,
+    input_schema: &SchemaRef,
+    params: &ParamMap,
+    derived_cols: &AHashMap<String, String>,
+) -> Result<Arc<dyn datafusion_physical_expr::PhysicalExpr>> {
+    match expr {
+        IRExpr::PropAccess { variable, property } => {
+            let name = flat_binding_col(variable, property);
+            col(&name, input_schema.as_ref()).map_err(|e| NanoError::Execution(e.to_string()))
+        }
+        IRExpr::Literal(literal) => Ok(Arc::new(PhysicalLiteral::new(literal_to_scalar_value(
+            literal, None,
+        )?))),
+        IRExpr::Param(name) => {
+            let literal = params
+                .get(name)
+                .ok_or_else(|| NanoError::Execution(format!("parameter ${} not provided", name)))?;
+            Ok(Arc::new(PhysicalLiteral::new(literal_to_scalar_value(
+                literal, None,
+            )?)))
+        }
+        IRExpr::AliasRef(name) => {
+            col(name, input_schema.as_ref()).map_err(|e| NanoError::Execution(e.to_string()))
+        }
+        expr if is_derived_tail_expr(expr) => {
+            let key = derived_tail_expr_key(expr);
+            let name = derived_cols.get(&key).ok_or_else(|| {
+                NanoError::Execution(format!(
+                    "derived tail column missing for expression {:?}",
+                    expr
+                ))
+            })?;
+            col(name, input_schema.as_ref()).map_err(|e| NanoError::Execution(e.to_string()))
+        }
+        _ => Err(NanoError::Execution(
+            "expression is not supported in the DataFusion tail".to_string(),
+        )),
+    }
+}
+
+fn lower_tail_filter_expr(
+    filter: &IRFilter,
+    input_schema: &SchemaRef,
+    params: &ParamMap,
+    derived_cols: &AHashMap<String, String>,
+) -> Result<Arc<dyn datafusion_physical_expr::PhysicalExpr>> {
+    let left = lower_tail_value_expr(&filter.left, input_schema, params, derived_cols)?;
+    let mut right = lower_tail_value_expr(&filter.right, input_schema, params, derived_cols)?;
+    if filter.op == CompOp::Contains {
+        return Ok(Arc::new(ListContainsExpr::new(left, right)));
+    }
+
+    let left_type = left
+        .data_type(input_schema.as_ref())
+        .map_err(|e| NanoError::Execution(e.to_string()))?;
+    let right_type = right
+        .data_type(input_schema.as_ref())
+        .map_err(|e| NanoError::Execution(e.to_string()))?;
+    if left_type != right_type {
+        right = try_cast(right, input_schema.as_ref(), left_type)
+            .map_err(|e| NanoError::Execution(e.to_string()))?;
+    }
+
+    let op = match filter.op {
+        CompOp::Eq => Operator::Eq,
+        CompOp::Ne => Operator::NotEq,
+        CompOp::Gt => Operator::Gt,
+        CompOp::Lt => Operator::Lt,
+        CompOp::Ge => Operator::GtEq,
+        CompOp::Le => Operator::LtEq,
+        CompOp::Contains => unreachable!("handled above"),
+    };
+    binary(left, op, right, input_schema.as_ref()).map_err(|e| NanoError::Execution(e.to_string()))
+}
+
+fn lower_projection_expr(
+    projection: &IRProjection,
+    input_schema: &SchemaRef,
+    params: &ParamMap,
+    derived_cols: &AHashMap<String, String>,
+) -> Result<ProjectionExpr> {
+    Ok(ProjectionExpr {
+        expr: lower_tail_value_expr(&projection.expr, input_schema, params, derived_cols)?,
+        alias: projection_output_name(projection),
+    })
+}
+
+fn lower_sort_exprs(
+    order_by: &[IROrdering],
+    input_schema: &SchemaRef,
+    params: &ParamMap,
+    derived_cols: &AHashMap<String, String>,
+) -> Result<LexOrdering> {
+    let sort_exprs = order_by
+        .iter()
+        .map(|ordering| {
+            let expr = lower_tail_value_expr(&ordering.expr, input_schema, params, derived_cols)?;
+            Ok(PhysicalSortExpr::new(
+                expr,
+                arrow_ord::sort::SortOptions {
+                    descending: ordering.descending,
+                    nulls_first: false,
+                },
+            ))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    LexOrdering::new(sort_exprs).ok_or_else(|| {
+        NanoError::Execution("expected at least one ordering expression".to_string())
+    })
+}
+
+fn lower_aggregate_arg_expr(
+    expr: &IRExpr,
+    input_schema: &SchemaRef,
+    params: &ParamMap,
+    derived_cols: &AHashMap<String, String>,
+    func: &AggFunc,
+) -> Result<Arc<dyn datafusion_physical_expr::PhysicalExpr>> {
+    let lowered = match expr {
+        IRExpr::Variable(variable) if matches!(func, AggFunc::Count) => {
+            col(&flat_binding_col(variable, "id"), input_schema.as_ref())
+                .map_err(|e| NanoError::Execution(e.to_string()))
+        }
+        _ => lower_tail_value_expr(expr, input_schema, params, derived_cols),
+    }?;
+
+    if matches!(func, AggFunc::Avg) {
+        let data_type = lowered
+            .data_type(input_schema.as_ref())
+            .map_err(|e| NanoError::Execution(e.to_string()))?;
+        if matches!(
+            data_type,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+                | DataType::Float16
+                | DataType::Float32
+        ) {
+            return try_cast(lowered, input_schema.as_ref(), DataType::Float64)
+                .map_err(|e| NanoError::Execution(e.to_string()));
+        }
+    }
+
+    Ok(lowered)
+}
+
+#[derive(Debug, Eq)]
+struct ListContainsExpr {
+    left: Arc<dyn PhysicalExpr>,
+    right: Arc<dyn PhysicalExpr>,
+}
+
+impl PartialEq for ListContainsExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.left.eq(&other.left) && self.right.eq(&other.right)
+    }
+}
+
+impl Hash for ListContainsExpr {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.left.hash(state);
+        self.right.hash(state);
+    }
+}
+
+impl ListContainsExpr {
+    fn new(left: Arc<dyn PhysicalExpr>, right: Arc<dyn PhysicalExpr>) -> Self {
+        Self { left, right }
+    }
+}
+
+impl fmt::Display for ListContainsExpr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} contains {}", self.left, self.right)
+    }
+}
+
+impl PhysicalExpr for ListContainsExpr {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn data_type(&self, _input_schema: &Schema) -> DFResult<DataType> {
+        Ok(DataType::Boolean)
+    }
+
+    fn nullable(&self, _input_schema: &Schema) -> DFResult<bool> {
+        Ok(false)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
+        let left = self.left.evaluate(batch)?.into_array(batch.num_rows())?;
+        let right = self.right.evaluate(batch)?.into_array(batch.num_rows())?;
+        let result = literal_utils::compare_list_membership(&left, &right)
+            .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))?;
+        Ok(ColumnarValue::Array(Arc::new(result)))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        vec![&self.left, &self.right]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> DFResult<Arc<dyn PhysicalExpr>> {
+        Ok(Arc::new(Self::new(
+            Arc::clone(&children[0]),
+            Arc::clone(&children[1]),
+        )))
+    }
+
+    fn fmt_sql(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+#[derive(Debug)]
+struct ScoreExec {
+    input: Arc<dyn ExecutionPlan>,
+    derived_exprs: Arc<Vec<DerivedTailExpr>>,
+    params: ParamMap,
+    runtime: Arc<DatabaseRuntime>,
+    variable_types: Arc<AHashMap<String, String>>,
+    output_schema: SchemaRef,
+    properties: PlanProperties,
+}
+
+impl ScoreExec {
+    fn new(
+        input: Arc<dyn ExecutionPlan>,
+        derived_exprs: Vec<DerivedTailExpr>,
+        params: ParamMap,
+        runtime: Arc<DatabaseRuntime>,
+        variable_types: AHashMap<String, String>,
+    ) -> Self {
+        let mut output_fields: Vec<Field> = input
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.as_ref().clone())
+            .collect();
+        output_fields.extend(
+            derived_exprs
+                .iter()
+                .map(|expr| Field::new(&expr.column_name, expr.data_type.clone(), expr.nullable)),
+        );
+        let output_schema = Arc::new(Schema::new(output_fields));
+        let properties = PlanProperties::new(
+            EquivalenceProperties::new(output_schema.clone()),
+            datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
+            datafusion_physical_plan::execution_plan::EmissionType::Incremental,
+            datafusion_physical_plan::execution_plan::Boundedness::Bounded,
+        );
+
+        Self {
+            input,
+            derived_exprs: Arc::new(derived_exprs),
+            params,
+            runtime,
+            variable_types: Arc::new(variable_types),
+            output_schema,
+            properties,
+        }
+    }
+}
+
+impl DisplayAs for ScoreExec {
+    fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ScoreExec")
+    }
+}
+
+impl ExecutionPlan for ScoreExec {
+    fn name(&self) -> &str {
+        "ScoreExec"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn schema(&self) -> SchemaRef {
+        self.output_schema.clone()
+    }
+
+    fn properties(&self) -> &PlanProperties {
+        &self.properties
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+        vec![&self.input]
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        Ok(Arc::new(ScoreExec::new(
+            children[0].clone(),
+            self.derived_exprs.as_ref().clone(),
+            self.params.clone(),
+            self.runtime.clone(),
+            self.variable_types.as_ref().clone(),
+        )))
+    }
+
+    fn execute(
+        &self,
+        partition: usize,
+        context: Arc<TaskContext>,
+    ) -> DFResult<SendableRecordBatchStream> {
+        let input = self.input.clone();
+        let derived_exprs = self.derived_exprs.clone();
+        let params = self.params.clone();
+        let runtime = self.runtime.clone();
+        let variable_types = self.variable_types.clone();
+        let output_schema = self.output_schema.clone();
+
+        let stream = futures::stream::once(async move {
+            use datafusion_physical_plan::common::collect;
+
+            let batches = collect(input.execute(partition, context)?).await?;
+            if batches.is_empty() {
+                return Ok(RecordBatch::new_empty(output_schema));
+            }
+
+            let input_schema = batches[0].schema();
+            let combined = if batches.len() == 1 {
+                batches[0].clone()
+            } else {
+                arrow_select::concat::concat_batches(&input_schema, &batches)
+                    .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))?
+            };
+
+            if combined.num_rows() == 0 {
+                return Ok(RecordBatch::new_empty(output_schema));
+            }
+
+            let mut columns = combined.columns().to_vec();
+            for derived in derived_exprs.iter() {
+                let array = eval_derived_expr_native_aware(
+                    &derived.expr,
+                    &combined,
+                    &params,
+                    runtime.clone(),
+                    variable_types.as_ref(),
+                )
+                .await
+                .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))?;
+                columns.push(array);
+            }
+
+            RecordBatch::try_new(output_schema, columns)
+                .map_err(|e| datafusion_common::DataFusionError::ArrowError(Box::new(e), None))
+        });
+
+        Ok(Box::pin(
+            datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
+                self.output_schema.clone(),
+                stream,
+            ),
+        ))
+    }
+}
+
+fn build_datafusion_tail_plan(
+    ir: &QueryIR,
+    input_plan: Arc<dyn ExecutionPlan>,
+    params: &ParamMap,
+    runtime: Arc<DatabaseRuntime>,
+    variable_types: &AHashMap<String, String>,
+) -> Result<Option<TailPlan>> {
+    let derived_exprs = collect_tail_derived_exprs(ir, params);
+    let derived_cols = derived_tail_expr_columns(&derived_exprs);
+    match analyze_tail_strategy(ir) {
+        TailStrategy::Legacy => Ok(None),
+        TailStrategy::DataFusionNonAggregate {
+            alias_ordering,
+            final_variable_projection,
+        } => {
+            let mut plan = input_plan;
+            if !derived_exprs.is_empty() {
+                plan = Arc::new(ScoreExec::new(
+                    plan,
+                    derived_exprs.clone(),
+                    params.clone(),
+                    runtime.clone(),
+                    variable_types.clone(),
+                ));
+            }
+            for filter in remaining_runtime_filters(&ir.pipeline, params) {
+                let predicate =
+                    lower_tail_filter_expr(&filter, &plan.schema(), params, &derived_cols)?;
+                plan = Arc::new(
+                    FilterExec::try_new(predicate, plan)
+                        .map_err(|e| NanoError::Execution(e.to_string()))?,
+                );
+            }
+
+            if alias_ordering {
+                let projection_exprs = ir
+                    .return_exprs
+                    .iter()
+                    .map(|projection| {
+                        lower_projection_expr(projection, &plan.schema(), params, &derived_cols)
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                plan = Arc::new(
+                    ProjectionExec::try_new(projection_exprs, plan)
+                        .map_err(|e| NanoError::Execution(e.to_string()))?,
+                );
+
+                if !ir.order_by.is_empty() {
+                    let sort_exprs =
+                        lower_sort_exprs(&ir.order_by, &plan.schema(), params, &derived_cols)?;
+                    let sort = SortExec::new(sort_exprs, plan)
+                        .with_fetch(ir.limit.map(|limit| limit as usize));
+                    plan = Arc::new(sort);
+                }
+                if let Some(limit) = ir.limit {
+                    plan = Arc::new(GlobalLimitExec::new(plan, 0, Some(limit as usize)));
+                }
+            } else {
+                if !ir.order_by.is_empty() {
+                    let sort_exprs =
+                        lower_sort_exprs(&ir.order_by, &plan.schema(), params, &derived_cols)?;
+                    let sort = SortExec::new(sort_exprs, plan)
+                        .with_fetch(ir.limit.map(|limit| limit as usize));
+                    plan = Arc::new(sort);
+                }
+                if let Some(limit) = ir.limit {
+                    plan = Arc::new(GlobalLimitExec::new(plan, 0, Some(limit as usize)));
+                }
+
+                if !final_variable_projection {
+                    let projection_exprs = ir
+                        .return_exprs
+                        .iter()
+                        .map(|projection| {
+                            lower_projection_expr(projection, &plan.schema(), params, &derived_cols)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    plan = Arc::new(
+                        ProjectionExec::try_new(projection_exprs, plan)
+                            .map_err(|e| NanoError::Execution(e.to_string()))?,
+                    );
+                }
+            }
+
+            Ok(Some(TailPlan {
+                plan,
+                final_manual_projection: final_variable_projection,
+            }))
+        }
+        TailStrategy::DataFusionAggregate => {
+            let mut plan = input_plan;
+            if !derived_exprs.is_empty() {
+                plan = Arc::new(ScoreExec::new(
+                    plan,
+                    derived_exprs.clone(),
+                    params.clone(),
+                    runtime.clone(),
+                    variable_types.clone(),
+                ));
+            }
+            for filter in remaining_runtime_filters(&ir.pipeline, params) {
+                let predicate =
+                    lower_tail_filter_expr(&filter, &plan.schema(), params, &derived_cols)?;
+                plan = Arc::new(
+                    FilterExec::try_new(predicate, plan)
+                        .map_err(|e| NanoError::Execution(e.to_string()))?,
+                );
+            }
+
+            let mut input_schema = plan.schema();
+            let avg_cast_columns = ir
+                .return_exprs
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, projection)| match &projection.expr {
+                    IRExpr::Aggregate {
+                        func: AggFunc::Avg,
+                        arg,
+                    } => Some((idx, arg.as_ref())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+
+            if !avg_cast_columns.is_empty() {
+                let mut projection_exprs = input_schema
+                    .fields()
+                    .iter()
+                    .map(|field| {
+                        Ok((
+                            col(field.name(), input_schema.as_ref())
+                                .map_err(|e| NanoError::Execution(e.to_string()))?,
+                            field.name().clone(),
+                        ))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                for (idx, expr) in &avg_cast_columns {
+                    let casted = try_cast(
+                        lower_tail_value_expr(expr, &input_schema, params, &derived_cols)?,
+                        input_schema.as_ref(),
+                        DataType::Float64,
+                    )
+                    .map_err(|e| NanoError::Execution(e.to_string()))?;
+                    projection_exprs.push((casted, format!("__ng_avg_arg_{}", idx)));
+                }
+
+                plan = Arc::new(
+                    ProjectionExec::try_new(projection_exprs, plan)
+                        .map_err(|e| NanoError::Execution(e.to_string()))?,
+                );
+                input_schema = plan.schema();
+            }
+
+            let mut group_exprs = Vec::new();
+            let mut aggr_exprs = Vec::new();
+
+            for (idx, projection) in ir.return_exprs.iter().enumerate() {
+                match &projection.expr {
+                    IRExpr::Aggregate { func, arg } => {
+                        let arg_expr = if matches!(func, AggFunc::Avg) {
+                            col(&format!("__ng_avg_arg_{}", idx), input_schema.as_ref())
+                                .map_err(|e| NanoError::Execution(e.to_string()))?
+                        } else {
+                            lower_aggregate_arg_expr(
+                                arg,
+                                &input_schema,
+                                params,
+                                &derived_cols,
+                                func,
+                            )?
+                        };
+                        let udaf = match func {
+                            AggFunc::Count => count_udaf(),
+                            AggFunc::Sum => sum_udaf(),
+                            AggFunc::Avg => avg_udaf(),
+                            AggFunc::Min => min_udaf(),
+                            AggFunc::Max => max_udaf(),
+                        };
+                        let aggregate_expr = AggregateExprBuilder::new(udaf, vec![arg_expr])
+                            .alias(projection_output_name(projection))
+                            .schema(input_schema.clone())
+                            .build()
+                            .map_err(|e| NanoError::Execution(e.to_string()))?;
+                        aggr_exprs.push(Arc::new(aggregate_expr));
+                    }
+                    expr => {
+                        group_exprs.push((
+                            lower_tail_value_expr(expr, &input_schema, params, &derived_cols)?,
+                            projection_output_name(projection),
+                        ));
+                    }
+                }
+            }
+
+            let group_by = if group_exprs.is_empty() {
+                PhysicalGroupBy::new(vec![], vec![], vec![], false)
+            } else {
+                PhysicalGroupBy::new_single(group_exprs)
+            };
+            let filter_expr = vec![None; aggr_exprs.len()];
+            plan = Arc::new(
+                AggregateExec::try_new(
+                    AggregateMode::Single,
+                    group_by,
+                    aggr_exprs,
+                    filter_expr,
+                    plan,
+                    input_schema,
+                )
+                .map_err(|e| NanoError::Execution(e.to_string()))?,
+            );
+
+            if !ir.order_by.is_empty() {
+                let sort_exprs =
+                    lower_sort_exprs(&ir.order_by, &plan.schema(), params, &derived_cols)?;
+                let sort = SortExec::new(sort_exprs, plan)
+                    .with_fetch(ir.limit.map(|limit| limit as usize));
+                plan = Arc::new(sort);
+            }
+            if let Some(limit) = ir.limit {
+                plan = Arc::new(GlobalLimitExec::new(plan, 0, Some(limit as usize)));
+            }
+
+            Ok(Some(TailPlan {
+                plan,
+                final_manual_projection: false,
+            }))
+        }
+    }
+}
+
+async fn collect_plan_batches(plan: Arc<dyn ExecutionPlan>) -> Result<Vec<RecordBatch>> {
+    let task_ctx = Arc::new(TaskContext::default());
+    let mut stream = plan
+        .execute(0, task_ctx)
+        .map_err(|e| NanoError::Execution(e.to_string()))?;
+    let mut batches = Vec::new();
+    use futures::StreamExt;
+    while let Some(batch) = stream.next().await {
+        let batch = batch.map_err(|e| NanoError::Execution(e.to_string()))?;
+        if batch.num_rows() > 0 {
+            batches.push(batch);
+        }
+    }
+    Ok(batches)
+}
 
 #[instrument(skip(ir, runtime, params), fields(query = %ir.name, pipeline_len = ir.pipeline.len()))]
 pub(crate) async fn execute_query_with_runtime(
@@ -38,6 +996,8 @@ pub(crate) async fn execute_query_with_runtime(
     params: &ParamMap,
 ) -> Result<Vec<RecordBatch>> {
     let resolved_ir = resolve_nearest_query_embeddings(ir, runtime.as_ref(), params).await?;
+    let mut variable_types = AHashMap::<String, String>::new();
+    collect_variable_types_from_ops(&resolved_ir.pipeline, &mut variable_types);
     info!("executing query");
     let has_aggregation = resolved_ir
         .return_exprs
@@ -83,6 +1043,21 @@ pub(crate) async fn execute_query_with_runtime(
         scan_limit_pushdown,
         &scan_projections,
     )?;
+
+    if let Some(tail_plan) = build_datafusion_tail_plan(
+        &resolved_ir,
+        plan.clone(),
+        params,
+        runtime.clone(),
+        &variable_types,
+    )? {
+        let mut batches = collect_plan_batches(tail_plan.plan).await?;
+        if tail_plan.final_manual_projection {
+            batches = apply_projection(&resolved_ir.return_exprs, &batches, params)?;
+        }
+        info!(result_batches = batches.len(), "query execution complete");
+        return Ok(batches);
+    }
 
     // Execute the plan to get intermediate results
     let task_ctx = Arc::new(TaskContext::default());
@@ -257,7 +1232,14 @@ async fn resolve_nearest_query_embeddings(
     let client = EmbeddingClient::from_env()?;
     let mut resolved_vectors = AHashMap::<(String, usize), Vec<f32>>::new();
     for (text, dim) in requests {
-        let vector = client.embed_text(&text, dim).await?;
+        let vector = client
+            .embed_texts_with_role(&[text.clone()], dim, EmbedRole::Query)
+            .await?
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                NanoError::Execution("embedding provider returned no vector".to_string())
+            })?;
         resolved_vectors.insert((text, dim), vector);
     }
 
@@ -1019,7 +2001,7 @@ fn wrap_projected_node_batch(
     batch: &RecordBatch,
 ) -> Result<RecordBatch> {
     let mut runtime_fields = Vec::with_capacity(struct_fields.len());
-    let mut struct_columns = Vec::with_capacity(struct_fields.len());
+    let mut output_columns = Vec::with_capacity(struct_fields.len());
     for expected in struct_fields {
         let col = batch
             .column_by_name(expected.name())
@@ -1036,18 +2018,17 @@ fn wrap_projected_node_batch(
             col.data_type().clone(),
             expected.is_nullable() || col.null_count() > 0,
         );
-        runtime_fields.push(field);
-        struct_columns.push(col);
+        runtime_fields.push(Field::new(
+            &flat_binding_col(variable, expected.name()),
+            field.data_type().clone(),
+            field.is_nullable(),
+        ));
+        output_columns.push(col);
     }
 
-    let struct_array = StructArray::new(runtime_fields.clone().into(), struct_columns, None);
-    let output_schema = Arc::new(Schema::new(vec![Field::new(
-        variable,
-        DataType::Struct(runtime_fields.into()),
-        false,
-    )]));
+    let output_schema = Arc::new(Schema::new(runtime_fields));
 
-    RecordBatch::try_new(output_schema, vec![Arc::new(struct_array)])
+    RecordBatch::try_new(output_schema, output_columns)
         .map_err(|e| NanoError::Execution(e.to_string()))
 }
 
@@ -1072,14 +2053,21 @@ fn build_physical_plan(
                         NanoError::Plan(format!("unknown node type: {}", type_name))
                     })?;
 
-                // Build struct output schema, pruning to required fields when possible.
-                let struct_fields = select_scan_struct_fields(
+                let selected_fields = select_scan_struct_fields(
                     variable,
                     &node_schema.arrow_schema,
                     scan_projections,
                 );
-                let struct_field =
-                    Field::new(variable, DataType::Struct(struct_fields.into()), false);
+                let scan_fields = selected_fields
+                    .into_iter()
+                    .map(|field| {
+                        Field::new(
+                            &flat_binding_col(variable, field.name()),
+                            field.data_type().clone(),
+                            field.is_nullable(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
 
                 let output_schema = if let Some(ref plan) = current_plan {
                     // Append to existing schema
@@ -1089,10 +2077,10 @@ fn build_physical_plan(
                         .iter()
                         .map(|f| f.as_ref().clone())
                         .collect();
-                    fields.push(struct_field);
+                    fields.extend(scan_fields.clone());
                     Arc::new(Schema::new(fields))
                 } else {
-                    Arc::new(Schema::new(vec![struct_field]))
+                    Arc::new(Schema::new(scan_fields.clone()))
                 };
 
                 let indexed_props = &node_schema.indexed_properties;
@@ -1104,17 +2092,20 @@ fn build_physical_plan(
                     params,
                     Some(indexed_props),
                 ));
+                let text_filter = build_scan_text_pushdown_filter(
+                    variable,
+                    filters,
+                    pipeline,
+                    params,
+                    Some(indexed_props),
+                );
 
                 let scan = NodeScanExec::new(
                     type_name.clone(),
                     variable.clone(),
-                    Arc::new(Schema::new(vec![
-                        output_schema
-                            .field(output_schema.fields().len() - 1)
-                            .as_ref()
-                            .clone(),
-                    ])),
+                    Arc::new(Schema::new(scan_fields)),
                     pushdown_filters,
+                    text_filter,
                     if current_plan.is_none() {
                         scan_limit_pushdown
                     } else {
@@ -1214,13 +2205,21 @@ fn build_physical_plan_with_input(
                         NanoError::Plan(format!("unknown node type: {}", type_name))
                     })?;
 
-                let struct_fields = select_scan_struct_fields(
+                let selected_fields = select_scan_struct_fields(
                     variable,
                     &node_schema.arrow_schema,
                     scan_projections,
                 );
-                let struct_field =
-                    Field::new(variable, DataType::Struct(struct_fields.into()), false);
+                let scan_fields = selected_fields
+                    .into_iter()
+                    .map(|field| {
+                        Field::new(
+                            &flat_binding_col(variable, field.name()),
+                            field.data_type().clone(),
+                            field.is_nullable(),
+                        )
+                    })
+                    .collect::<Vec<_>>();
 
                 let output_schema = if let Some(ref plan) = current_plan {
                     let mut fields: Vec<Field> = plan
@@ -1229,10 +2228,10 @@ fn build_physical_plan_with_input(
                         .iter()
                         .map(|f| f.as_ref().clone())
                         .collect();
-                    fields.push(struct_field);
+                    fields.extend(scan_fields.clone());
                     Arc::new(Schema::new(fields))
                 } else {
-                    Arc::new(Schema::new(vec![struct_field]))
+                    Arc::new(Schema::new(scan_fields.clone()))
                 };
 
                 let indexed_props = &node_schema.indexed_properties;
@@ -1244,17 +2243,20 @@ fn build_physical_plan_with_input(
                     params,
                     Some(indexed_props),
                 ));
+                let text_filter = build_scan_text_pushdown_filter(
+                    variable,
+                    filters,
+                    pipeline,
+                    params,
+                    Some(indexed_props),
+                );
 
                 let scan = NodeScanExec::new(
                     type_name.clone(),
                     variable.clone(),
-                    Arc::new(Schema::new(vec![
-                        output_schema
-                            .field(output_schema.fields().len() - 1)
-                            .as_ref()
-                            .clone(),
-                    ])),
+                    Arc::new(Schema::new(scan_fields)),
                     pushdown_filters,
+                    text_filter,
                     None,
                     runtime.clone(),
                 );
@@ -1351,6 +2353,37 @@ fn build_explicit_pushdown_filters(
             _ => None,
         })
         .collect()
+}
+
+fn build_scan_text_pushdown_filter(
+    variable: &str,
+    scan_filters: &[IRFilter],
+    pipeline: &[IROp],
+    params: &ParamMap,
+    indexed_props: Option<&HashSet<String>>,
+) -> Option<NodeScanTextFilter> {
+    let mut matches = AHashSet::new();
+    for filter in scan_filters {
+        if let Some(text_filter) =
+            pushdown_text_scan_filter(variable, filter, params, indexed_props)
+        {
+            matches.insert(text_filter);
+        }
+    }
+    for op in pipeline {
+        if let IROp::Filter(filter) = op
+            && let Some(text_filter) =
+                pushdown_text_scan_filter(variable, filter, params, indexed_props)
+        {
+            matches.insert(text_filter);
+        }
+    }
+
+    if matches.len() == 1 {
+        matches.into_iter().next()
+    } else {
+        None
+    }
 }
 
 fn with_index_eligibility(
@@ -1614,6 +2647,9 @@ fn pushdown_scan_filter(
     filter: &IRFilter,
     params: &ParamMap,
 ) -> Option<NodeScanPredicate> {
+    if filter.op == CompOp::Contains {
+        return None;
+    }
     match (&filter.left, &filter.right) {
         (
             IRExpr::PropAccess {
@@ -1639,6 +2675,140 @@ fn pushdown_scan_filter(
             literal,
             index_eligible: false,
         }),
+        _ => None,
+    }
+}
+
+fn pushdown_text_scan_filter(
+    variable: &str,
+    filter: &IRFilter,
+    params: &ParamMap,
+    indexed_props: Option<&HashSet<String>>,
+) -> Option<NodeScanTextFilter> {
+    match filter.op {
+        CompOp::Eq => {
+            if bool_literal_for_pushdown(&filter.right, params) == Some(true) {
+                return native_text_filter_from_expr(variable, &filter.left, params, indexed_props);
+            }
+            if bool_literal_for_pushdown(&filter.left, params) == Some(true) {
+                return native_text_filter_from_expr(
+                    variable,
+                    &filter.right,
+                    params,
+                    indexed_props,
+                );
+            }
+            None
+        }
+        CompOp::Ne => {
+            if bool_literal_for_pushdown(&filter.right, params) == Some(false) {
+                return native_text_filter_from_expr(variable, &filter.left, params, indexed_props);
+            }
+            if bool_literal_for_pushdown(&filter.left, params) == Some(false) {
+                return native_text_filter_from_expr(
+                    variable,
+                    &filter.right,
+                    params,
+                    indexed_props,
+                );
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn native_text_filter_from_expr(
+    variable: &str,
+    expr: &IRExpr,
+    params: &ParamMap,
+    indexed_props: Option<&HashSet<String>>,
+) -> Option<NodeScanTextFilter> {
+    match expr {
+        IRExpr::Search { field, query } => {
+            let (property, query) =
+                native_text_field_and_query(variable, field, query, params, indexed_props)?;
+            Some(NodeScanTextFilter {
+                property,
+                query,
+                kind: TextSearchKind::Search,
+            })
+        }
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            let (property, query) =
+                native_text_field_and_query(variable, field, query, params, indexed_props)?;
+            let max_edits = match max_edits.as_deref() {
+                Some(expr) => nonnegative_int_literal_for_pushdown(expr, params).map(Some),
+                None => inferred_native_fuzzy_max_edits(&query),
+            }?;
+            Some(NodeScanTextFilter {
+                property,
+                query,
+                kind: TextSearchKind::Fuzzy { max_edits },
+            })
+        }
+        IRExpr::MatchText { field, query } => {
+            native_text_field_and_query(variable, field, query, params, indexed_props).map(
+                |(property, query)| NodeScanTextFilter {
+                    property,
+                    query,
+                    kind: TextSearchKind::MatchText,
+                },
+            )
+        }
+        _ => None,
+    }
+}
+
+fn native_text_field_and_query(
+    variable: &str,
+    field: &IRExpr,
+    query: &IRExpr,
+    params: &ParamMap,
+    indexed_props: Option<&HashSet<String>>,
+) -> Option<(String, String)> {
+    let IRExpr::PropAccess {
+        variable: expr_var,
+        property,
+    } = field
+    else {
+        return None;
+    };
+    if expr_var != variable {
+        return None;
+    }
+    let query = string_literal_for_pushdown(query, params)?;
+    if !indexed_props
+        .map(|props| props.contains(property))
+        .unwrap_or(false)
+        || tokenize_search_terms(&query).is_empty()
+    {
+        return None;
+    }
+    Some((property.clone(), query))
+}
+
+fn bool_literal_for_pushdown(expr: &IRExpr, params: &ParamMap) -> Option<bool> {
+    match pushdown_literal(expr, params)? {
+        Literal::Bool(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn string_literal_for_pushdown(expr: &IRExpr, params: &ParamMap) -> Option<String> {
+    match pushdown_literal(expr, params)? {
+        Literal::String(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn nonnegative_int_literal_for_pushdown(expr: &IRExpr, params: &ParamMap) -> Option<u32> {
+    match pushdown_literal(expr, params)? {
+        Literal::Integer(value) if value >= 0 => u32::try_from(value).ok(),
         _ => None,
     }
 }
@@ -1754,6 +2924,175 @@ fn apply_single_filter(
     Ok(result)
 }
 
+fn inferred_native_fuzzy_max_edits(query: &str) -> Option<Option<u32>> {
+    let mut defaults = tokenize_search_terms(query)
+        .into_iter()
+        .map(|term| u32::try_from(default_fuzzy_max_edits(&term)).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if defaults.is_empty() {
+        return None;
+    }
+    let first = defaults.swap_remove(0);
+    if defaults.iter().all(|value| *value == first) {
+        Some(Some(first))
+    } else {
+        None
+    }
+}
+
+fn native_text_expr_request(
+    expr: &IRExpr,
+    params: &ParamMap,
+    runtime: &DatabaseRuntime,
+    variable_types: &AHashMap<String, String>,
+) -> Option<(String, String, String, String, TextSearchKind)> {
+    let (field, query_expr, kind) = match expr {
+        IRExpr::Search { field, query } => (field.as_ref(), query.as_ref(), TextSearchKind::Search),
+        IRExpr::Fuzzy {
+            field,
+            query,
+            max_edits,
+        } => {
+            let max_edits = match max_edits.as_deref() {
+                Some(expr) => nonnegative_int_literal_for_pushdown(expr, params).map(Some),
+                None => {
+                    inferred_native_fuzzy_max_edits(&string_literal_for_pushdown(query, params)?)
+                }
+            }?;
+            (
+                field.as_ref(),
+                query.as_ref(),
+                TextSearchKind::Fuzzy { max_edits },
+            )
+        }
+        IRExpr::MatchText { field, query } => {
+            (field.as_ref(), query.as_ref(), TextSearchKind::MatchText)
+        }
+        IRExpr::Bm25 { field, query } => (field.as_ref(), query.as_ref(), TextSearchKind::Bm25),
+        _ => return None,
+    };
+
+    let IRExpr::PropAccess { variable, property } = field else {
+        return None;
+    };
+    let query = string_literal_for_pushdown(query_expr, params)?;
+    if tokenize_search_terms(&query).is_empty() {
+        return None;
+    }
+
+    let type_name = variable_types.get(variable)?.clone();
+    let node_type = runtime.catalog().node_types.get(&type_name)?;
+    if !node_type.indexed_properties.contains(property) {
+        return None;
+    }
+
+    Some((variable.clone(), type_name, property.clone(), query, kind))
+}
+
+async fn try_eval_native_text_expr(
+    expr: &IRExpr,
+    batch: &RecordBatch,
+    params: &ParamMap,
+    runtime: Arc<DatabaseRuntime>,
+    variable_types: &AHashMap<String, String>,
+) -> Result<Option<arrow_array::ArrayRef>> {
+    let Some((variable, type_name, property, query, kind)) =
+        native_text_expr_request(expr, params, runtime.as_ref(), variable_types)
+    else {
+        return Ok(None);
+    };
+
+    let scores = match runtime
+        .native_text_scores(&type_name, &property, &query, kind.clone())
+        .await
+    {
+        Ok(scores) => scores,
+        Err(error) => {
+            debug!(
+                node_type = %type_name,
+                property = %property,
+                query = %query,
+                error = %error,
+                "native text search unavailable, falling back to in-process evaluation"
+            );
+            return Ok(None);
+        }
+    };
+
+    let ids = batch
+        .column_by_name(&flat_binding_col(&variable, "id"))
+        .and_then(|column| column.as_any().downcast_ref::<UInt64Array>())
+        .ok_or_else(|| {
+            NanoError::Execution(format!(
+                "missing flat id column for binding `{}` while evaluating native text expression",
+                variable
+            ))
+        })?;
+
+    match kind {
+        TextSearchKind::Search | TextSearchKind::Fuzzy { .. } | TextSearchKind::MatchText => {
+            let values = (0..batch.num_rows())
+                .map(|row| !ids.is_null(row) && scores.contains_key(&ids.value(row)))
+                .collect::<Vec<_>>();
+            Ok(Some(Arc::new(BooleanArray::from(values))))
+        }
+        TextSearchKind::Bm25 => {
+            let values = (0..batch.num_rows())
+                .map(|row| {
+                    if ids.is_null(row) {
+                        0.0
+                    } else {
+                        scores.get(&ids.value(row)).copied().unwrap_or(0.0)
+                    }
+                })
+                .collect::<Vec<_>>();
+            Ok(Some(Arc::new(Float64Array::from(values))))
+        }
+    }
+}
+
+fn eval_derived_expr_native_aware<'a>(
+    expr: &'a IRExpr,
+    batch: &'a RecordBatch,
+    params: &'a ParamMap,
+    runtime: Arc<DatabaseRuntime>,
+    variable_types: &'a AHashMap<String, String>,
+) -> futures::future::BoxFuture<'a, Result<arrow_array::ArrayRef>> {
+    Box::pin(async move {
+        match expr {
+            IRExpr::Search { .. }
+            | IRExpr::Fuzzy { .. }
+            | IRExpr::MatchText { .. }
+            | IRExpr::Bm25 { .. } => {
+                if let Some(array) =
+                    try_eval_native_text_expr(expr, batch, params, runtime, variable_types).await?
+                {
+                    Ok(array)
+                } else {
+                    eval_ir_expr(expr, batch, params)
+                }
+            }
+            IRExpr::Rrf {
+                primary,
+                secondary,
+                k,
+            } => {
+                evaluate_rrf_score_array_native_aware(
+                    primary,
+                    secondary,
+                    k.as_deref(),
+                    batch,
+                    params,
+                    runtime,
+                    variable_types,
+                )
+                .await
+            }
+            _ => eval_ir_expr(expr, batch, params),
+        }
+    })
+}
+
 fn eval_ir_expr(
     expr: &IRExpr,
     batch: &RecordBatch,
@@ -1761,28 +3100,17 @@ fn eval_ir_expr(
 ) -> Result<arrow_array::ArrayRef> {
     match expr {
         IRExpr::PropAccess { variable, property } => {
-            let col_idx = batch.schema().index_of(variable).map_err(|e| {
-                NanoError::Execution(format!("column {} not found: {}", variable, e))
-            })?;
-            let col = batch.column(col_idx);
-            let struct_arr = col.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-                NanoError::Execution(format!("column {} is not a struct", variable))
-            })?;
-            let prop_col = struct_arr.column_by_name(property).ok_or_else(|| {
-                NanoError::Execution(format!("struct {} has no field {}", variable, property))
-            })?;
-            Ok(prop_col.clone())
+            binding_property_array(batch, variable, property)
         }
         IRExpr::Literal(lit) => {
             let num_rows = batch.num_rows();
             literal_to_array(lit, num_rows)
         }
         IRExpr::Variable(name) => {
-            let col_idx = batch
-                .schema()
-                .index_of(name)
-                .map_err(|e| NanoError::Execution(format!("variable {} not found: {}", name, e)))?;
-            Ok(batch.column(col_idx).clone())
+            if let Ok(col_idx) = batch.schema().index_of(name) {
+                return Ok(batch.column(col_idx).clone());
+            }
+            binding_struct_array(batch, name)
         }
         IRExpr::Param(name) => {
             let lit = params
@@ -2132,11 +3460,62 @@ fn evaluate_rrf_score_array(
     batch: &RecordBatch,
     params: &ParamMap,
 ) -> Result<arrow_array::ArrayRef> {
-    const DEFAULT_RRF_K: usize = 60;
-
     let primary_scores = eval_ir_expr(primary_expr, batch, params)?;
     let secondary_scores = eval_ir_expr(secondary_expr, batch, params)?;
+    let k_arr = k_expr
+        .map(|expr| eval_ir_expr(expr, batch, params))
+        .transpose()?;
 
+    evaluate_rrf_score_array_from_inputs(
+        primary_expr,
+        secondary_expr,
+        &primary_scores,
+        &secondary_scores,
+        k_arr.as_ref(),
+    )
+}
+
+async fn evaluate_rrf_score_array_native_aware(
+    primary_expr: &IRExpr,
+    secondary_expr: &IRExpr,
+    k_expr: Option<&IRExpr>,
+    batch: &RecordBatch,
+    params: &ParamMap,
+    runtime: Arc<DatabaseRuntime>,
+    variable_types: &AHashMap<String, String>,
+) -> Result<arrow_array::ArrayRef> {
+    let primary_scores = eval_derived_expr_native_aware(
+        primary_expr,
+        batch,
+        params,
+        runtime.clone(),
+        variable_types,
+    )
+    .await?;
+    let secondary_scores =
+        eval_derived_expr_native_aware(secondary_expr, batch, params, runtime, variable_types)
+            .await?;
+    let k_arr = k_expr
+        .map(|expr| eval_ir_expr(expr, batch, params))
+        .transpose()?;
+
+    evaluate_rrf_score_array_from_inputs(
+        primary_expr,
+        secondary_expr,
+        &primary_scores,
+        &secondary_scores,
+        k_arr.as_ref(),
+    )
+}
+
+fn evaluate_rrf_score_array_from_inputs(
+    primary_expr: &IRExpr,
+    secondary_expr: &IRExpr,
+    primary_scores: &arrow_array::ArrayRef,
+    secondary_scores: &arrow_array::ArrayRef,
+    k_arr: Option<&arrow_array::ArrayRef>,
+) -> Result<arrow_array::ArrayRef> {
+    const DEFAULT_RRF_K: usize = 60;
     if primary_scores.len() != secondary_scores.len() {
         return Err(NanoError::Execution(format!(
             "rrf() rank input length mismatch: primary has {}, secondary has {}",
@@ -2157,8 +3536,7 @@ fn evaluate_rrf_score_array(
         matches!(secondary_expr, IRExpr::Bm25 { .. } | IRExpr::Rrf { .. }),
     );
 
-    let k_values = if let Some(expr) = k_expr {
-        let k_arr = eval_ir_expr(expr, batch, params)?;
+    let k_values = if let Some(k_arr) = k_arr {
         let mut per_row = Vec::with_capacity(k_arr.len());
         for row in 0..k_arr.len() {
             let k = array_value_to_optional_positive_usize(&k_arr, row)?.unwrap_or(DEFAULT_RRF_K);
@@ -2468,20 +3846,12 @@ fn infer_projection_field(
 ) -> Result<(String, DataType, bool)> {
     match expr {
         IRExpr::PropAccess { variable, property } => {
-            let col_idx = batch
-                .schema()
-                .index_of(variable)
+            let field_name = flat_binding_col(variable, property);
+            let batch_schema = batch.schema();
+            let field = batch_schema
+                .field_with_name(&field_name)
+                .or_else(|_| batch_schema.field_with_name(property))
                 .map_err(|e| NanoError::Execution(e.to_string()))?;
-            let col = batch.column(col_idx);
-            let struct_arr = col
-                .as_any()
-                .downcast_ref::<StructArray>()
-                .ok_or_else(|| NanoError::Execution("not a struct".to_string()))?;
-            let field = struct_arr
-                .fields()
-                .iter()
-                .find(|f| f.name() == property)
-                .ok_or_else(|| NanoError::Execution(format!("field {} not found", property)))?;
             let name = alias.unwrap_or(property).to_string();
             Ok((name, field.data_type().clone(), field.is_nullable()))
         }
@@ -2500,7 +3870,12 @@ fn infer_projection_field(
         }
         IRExpr::Variable(v) => {
             let name = alias.unwrap_or(v).to_string();
-            Ok((name, DataType::Utf8, true))
+            let dt = binding_data_type(batch, v)?;
+            let nullable = match &dt {
+                DataType::Struct(fields) => fields.iter().any(|field| field.is_nullable()),
+                _ => true,
+            };
+            Ok((name, dt, nullable))
         }
         IRExpr::Param(p) => {
             let (name, data_type, nullable) = if p == NOW_PARAM_NAME {
@@ -2895,12 +4270,8 @@ fn sort_column_from_prop_or_flat(
     variable: &str,
     property: &str,
 ) -> Option<arrow_array::ArrayRef> {
-    let col_idx = batch.schema().index_of(variable).ok();
-    if let Some(idx) = col_idx {
-        let struct_arr = batch.column(idx).as_any().downcast_ref::<StructArray>();
-        if let Some(col) = struct_arr.and_then(|s| s.column_by_name(property).cloned()) {
-            return Some(col);
-        }
+    if let Ok(col) = binding_property_array(batch, variable, property) {
+        return Some(col);
     }
     batch
         .schema()
@@ -2916,28 +4287,7 @@ fn compute_nearest_distance_column(
     query_expr: &IRExpr,
     params: &ParamMap,
 ) -> Result<arrow_array::ArrayRef> {
-    let struct_idx = batch.schema().index_of(variable).map_err(|e| {
-        NanoError::Execution(format!(
-            "nearest() variable `{}` not found in batch schema: {}",
-            variable, e
-        ))
-    })?;
-    let struct_arr = batch
-        .column(struct_idx)
-        .as_any()
-        .downcast_ref::<StructArray>()
-        .ok_or_else(|| {
-            NanoError::Execution(format!(
-                "nearest() target `{}` is not a struct column",
-                variable
-            ))
-        })?;
-    let vector_col = struct_arr.column_by_name(property).ok_or_else(|| {
-        NanoError::Execution(format!(
-            "nearest() property `{}` not found on `{}`",
-            property, variable
-        ))
-    })?;
+    let vector_col = binding_property_array(batch, variable, property)?;
     let vector_arr = vector_col
         .as_any()
         .downcast_ref::<FixedSizeListArray>()
@@ -3428,19 +4778,13 @@ impl ExecutionPlan for AntiJoinExec {
                                 )?;
 
                             for filtered in filtered_batches {
-                                if let Ok(col_idx) = filtered.schema().index_of(&join_var) {
-                                    let col = filtered.column(col_idx);
-                                    if let Some(struct_arr) =
-                                        col.as_any().downcast_ref::<StructArray>()
-                                        && let Some(id_col) = struct_arr.column_by_name("id")
-                                        && let Some(id_arr) = id_col
-                                            .as_any()
-                                            .downcast_ref::<arrow_array::UInt64Array>(
-                                        )
-                                    {
-                                        for i in 0..id_arr.len() {
-                                            inner_ids.insert(id_arr.value(i));
-                                        }
+                                if let Ok(id_col) =
+                                    binding_property_array(&filtered, &join_var, "id")
+                                    && let Some(id_arr) =
+                                        id_col.as_any().downcast_ref::<arrow_array::UInt64Array>()
+                                {
+                                    for i in 0..id_arr.len() {
+                                        inner_ids.insert(id_arr.value(i));
                                     }
                                 }
                             }
@@ -3459,27 +4803,16 @@ impl ExecutionPlan for AntiJoinExec {
                     } => {
                         while let Some(batch) = outer_stream.next().await {
                             let batch = batch?;
-                            let col_idx = batch.schema().index_of(&join_var)?;
-                            let col = batch.column(col_idx);
-                            let struct_arr =
-                                col.as_any().downcast_ref::<StructArray>().ok_or_else(|| {
-                                    datafusion_common::DataFusionError::Execution(format!(
-                                        "column {} is not a struct",
-                                        join_var
-                                    ))
+                            let id_col =
+                                binding_property_array(&batch, &join_var, "id").map_err(|e| {
+                                    datafusion_common::DataFusionError::Execution(e.to_string())
                                 })?;
-                            let id_col = struct_arr.column_by_name("id").ok_or_else(|| {
-                                datafusion_common::DataFusionError::Execution(format!(
-                                    "struct {} has no id field",
-                                    join_var
-                                ))
-                            })?;
                             let id_arr = id_col
                                 .as_any()
                                 .downcast_ref::<arrow_array::UInt64Array>()
                                 .ok_or_else(|| {
                                     datafusion_common::DataFusionError::Execution(format!(
-                                        "struct {} id field is not UInt64",
+                                        "{} id field is not UInt64",
                                         join_var
                                     ))
                                 })?;
@@ -3875,8 +5208,11 @@ mod tests {
                 true,
             )),
         ]);
-        let node_struct =
-            Arc::new(StructArray::new(node_fields, vec![ids, embeddings], None)) as ArrayRef;
+        let node_struct = Arc::new(arrow_array::StructArray::new(
+            node_fields,
+            vec![ids, embeddings],
+            None,
+        )) as ArrayRef;
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "n",
@@ -3901,7 +5237,7 @@ mod tests {
         let struct_arr = out[0]
             .column(0)
             .as_any()
-            .downcast_ref::<StructArray>()
+            .downcast_ref::<arrow_array::StructArray>()
             .unwrap();
         let out_ids = struct_arr
             .column_by_name("id")
@@ -3937,8 +5273,11 @@ mod tests {
                 true,
             )),
         ]);
-        let node_struct =
-            Arc::new(StructArray::new(node_fields, vec![ids, embeddings], None)) as ArrayRef;
+        let node_struct = Arc::new(arrow_array::StructArray::new(
+            node_fields,
+            vec![ids, embeddings],
+            None,
+        )) as ArrayRef;
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "n",
@@ -3962,5 +5301,318 @@ mod tests {
         let distances = distances.as_any().downcast_ref::<Float64Array>().unwrap();
         assert!(distances.is_null(0));
         assert!((distances.value(1) - 0.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn analyze_tail_strategy_supports_simple_relational_tail() {
+        let ir = QueryIR {
+            name: "q".to_string(),
+            params: vec![],
+            pipeline: vec![IROp::NodeScan {
+                variable: "p".to_string(),
+                type_name: "Person".to_string(),
+                filters: vec![IRFilter {
+                    left: IRExpr::PropAccess {
+                        variable: "p".to_string(),
+                        property: "age".to_string(),
+                    },
+                    op: CompOp::Gt,
+                    right: IRExpr::Literal(Literal::Integer(30)),
+                }],
+            }],
+            return_exprs: vec![IRProjection {
+                expr: IRExpr::PropAccess {
+                    variable: "p".to_string(),
+                    property: "name".to_string(),
+                },
+                alias: None,
+            }],
+            order_by: vec![IROrdering {
+                expr: IRExpr::PropAccess {
+                    variable: "p".to_string(),
+                    property: "name".to_string(),
+                },
+                descending: false,
+            }],
+            limit: Some(10),
+        };
+
+        assert_eq!(
+            analyze_tail_strategy(&ir),
+            TailStrategy::DataFusionNonAggregate {
+                alias_ordering: false,
+                final_variable_projection: false,
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_tail_strategy_supports_variable_projection_with_final_materialization() {
+        let ir = QueryIR {
+            name: "q".to_string(),
+            params: vec![],
+            pipeline: vec![IROp::NodeScan {
+                variable: "p".to_string(),
+                type_name: "Person".to_string(),
+                filters: vec![],
+            }],
+            return_exprs: vec![IRProjection {
+                expr: IRExpr::Variable("p".to_string()),
+                alias: None,
+            }],
+            order_by: vec![IROrdering {
+                expr: IRExpr::PropAccess {
+                    variable: "p".to_string(),
+                    property: "name".to_string(),
+                },
+                descending: false,
+            }],
+            limit: Some(10),
+        };
+
+        assert_eq!(
+            analyze_tail_strategy(&ir),
+            TailStrategy::DataFusionNonAggregate {
+                alias_ordering: false,
+                final_variable_projection: true,
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_tail_strategy_supports_aggregate_alias_ordering() {
+        let ir = QueryIR {
+            name: "q".to_string(),
+            params: vec![],
+            pipeline: vec![IROp::NodeScan {
+                variable: "p".to_string(),
+                type_name: "Person".to_string(),
+                filters: vec![],
+            }],
+            return_exprs: vec![
+                IRProjection {
+                    expr: IRExpr::PropAccess {
+                        variable: "p".to_string(),
+                        property: "name".to_string(),
+                    },
+                    alias: None,
+                },
+                IRProjection {
+                    expr: IRExpr::Aggregate {
+                        func: AggFunc::Count,
+                        arg: Box::new(IRExpr::Variable("p".to_string())),
+                    },
+                    alias: Some("friends".to_string()),
+                },
+            ],
+            order_by: vec![IROrdering {
+                expr: IRExpr::AliasRef("friends".to_string()),
+                descending: true,
+            }],
+            limit: Some(5),
+        };
+
+        assert_eq!(
+            analyze_tail_strategy(&ir),
+            TailStrategy::DataFusionAggregate
+        );
+    }
+
+    #[test]
+    fn analyze_tail_strategy_falls_back_for_nearest() {
+        let ir = QueryIR {
+            name: "q".to_string(),
+            params: vec![],
+            pipeline: vec![IROp::NodeScan {
+                variable: "p".to_string(),
+                type_name: "Person".to_string(),
+                filters: vec![],
+            }],
+            return_exprs: vec![IRProjection {
+                expr: IRExpr::PropAccess {
+                    variable: "p".to_string(),
+                    property: "name".to_string(),
+                },
+                alias: None,
+            }],
+            order_by: vec![IROrdering {
+                expr: IRExpr::Nearest {
+                    variable: "p".to_string(),
+                    property: "embedding".to_string(),
+                    query: Box::new(IRExpr::Literal(Literal::List(vec![
+                        Literal::Float(1.0),
+                        Literal::Float(0.0),
+                    ]))),
+                },
+                descending: false,
+            }],
+            limit: Some(5),
+        };
+
+        assert_eq!(analyze_tail_strategy(&ir), TailStrategy::Legacy);
+    }
+
+    #[test]
+    fn analyze_tail_strategy_supports_contains_filter() {
+        let ir = QueryIR {
+            name: "q".to_string(),
+            params: vec![],
+            pipeline: vec![
+                IROp::NodeScan {
+                    variable: "p".to_string(),
+                    type_name: "Person".to_string(),
+                    filters: vec![],
+                },
+                IROp::Filter(IRFilter {
+                    left: IRExpr::PropAccess {
+                        variable: "p".to_string(),
+                        property: "tags".to_string(),
+                    },
+                    op: CompOp::Contains,
+                    right: IRExpr::Literal(Literal::String("graph".to_string())),
+                }),
+            ],
+            return_exprs: vec![IRProjection {
+                expr: IRExpr::PropAccess {
+                    variable: "p".to_string(),
+                    property: "name".to_string(),
+                },
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+
+        assert_eq!(
+            analyze_tail_strategy(&ir),
+            TailStrategy::DataFusionNonAggregate {
+                alias_ordering: false,
+                final_variable_projection: false,
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_tail_strategy_supports_bm25_alias_ordering() {
+        let ir = QueryIR {
+            name: "q".to_string(),
+            params: vec![],
+            pipeline: vec![IROp::NodeScan {
+                variable: "p".to_string(),
+                type_name: "Person".to_string(),
+                filters: vec![],
+            }],
+            return_exprs: vec![
+                IRProjection {
+                    expr: IRExpr::PropAccess {
+                        variable: "p".to_string(),
+                        property: "name".to_string(),
+                    },
+                    alias: None,
+                },
+                IRProjection {
+                    expr: IRExpr::Bm25 {
+                        field: Box::new(IRExpr::PropAccess {
+                            variable: "p".to_string(),
+                            property: "name".to_string(),
+                        }),
+                        query: Box::new(IRExpr::Literal(Literal::String("alice".to_string()))),
+                    },
+                    alias: Some("score".to_string()),
+                },
+            ],
+            order_by: vec![IROrdering {
+                expr: IRExpr::AliasRef("score".to_string()),
+                descending: true,
+            }],
+            limit: Some(5),
+        };
+
+        assert_eq!(
+            analyze_tail_strategy(&ir),
+            TailStrategy::DataFusionNonAggregate {
+                alias_ordering: true,
+                final_variable_projection: false,
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_tail_strategy_supports_search_filter() {
+        let ir = QueryIR {
+            name: "q".to_string(),
+            params: vec![],
+            pipeline: vec![
+                IROp::NodeScan {
+                    variable: "p".to_string(),
+                    type_name: "Person".to_string(),
+                    filters: vec![],
+                },
+                IROp::Filter(IRFilter {
+                    left: IRExpr::Search {
+                        field: Box::new(IRExpr::PropAccess {
+                            variable: "p".to_string(),
+                            property: "name".to_string(),
+                        }),
+                        query: Box::new(IRExpr::Literal(Literal::String("alice".to_string()))),
+                    },
+                    op: CompOp::Eq,
+                    right: IRExpr::Literal(Literal::Bool(true)),
+                }),
+            ],
+            return_exprs: vec![IRProjection {
+                expr: IRExpr::PropAccess {
+                    variable: "p".to_string(),
+                    property: "name".to_string(),
+                },
+                alias: None,
+            }],
+            order_by: vec![],
+            limit: None,
+        };
+
+        assert_eq!(
+            analyze_tail_strategy(&ir),
+            TailStrategy::DataFusionNonAggregate {
+                alias_ordering: false,
+                final_variable_projection: false,
+            }
+        );
+    }
+
+    #[test]
+    fn analyze_tail_strategy_supports_match_text_alias_ordering() {
+        let ir = QueryIR {
+            name: "q".to_string(),
+            params: vec![],
+            pipeline: vec![IROp::NodeScan {
+                variable: "p".to_string(),
+                type_name: "Person".to_string(),
+                filters: vec![],
+            }],
+            return_exprs: vec![IRProjection {
+                expr: IRExpr::MatchText {
+                    field: Box::new(IRExpr::PropAccess {
+                        variable: "p".to_string(),
+                        property: "name".to_string(),
+                    }),
+                    query: Box::new(IRExpr::Literal(Literal::String("alice".to_string()))),
+                },
+                alias: Some("matched".to_string()),
+            }],
+            order_by: vec![IROrdering {
+                expr: IRExpr::AliasRef("matched".to_string()),
+                descending: true,
+            }],
+            limit: Some(5),
+        };
+
+        assert_eq!(
+            analyze_tail_strategy(&ir),
+            TailStrategy::DataFusionNonAggregate {
+                alias_ordering: true,
+                final_variable_projection: false,
+            }
+        );
     }
 }

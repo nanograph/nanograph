@@ -8,6 +8,7 @@
 | [config.md](user/config.md) | `nanograph.toml`, `.env.nano`, defaults, aliases, and precedence |
 | [cli-reference.md](user/cli-reference.md) | All commands, options, and data formats |
 | [schema.md](user/schema.md) | Schema language reference — types, annotations, naming |
+| [blobs.md](user/blobs.md) | External media nodes, media URIs, and multimodal embeddings |
 | [queries.md](user/queries.md) | Query language reference — match, return, traversal, mutations |
 | [search.md](user/search.md) | Text search, vector search, hybrid fusion |
 | [starwars-example.md](user/starwars-example.md) | Star Wars worked example with search |

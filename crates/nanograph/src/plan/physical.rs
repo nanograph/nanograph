@@ -6,8 +6,8 @@ use std::sync::Arc;
 use ahash::AHashSet;
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Date32Array, Date64Array, FixedSizeListArray, Float32Array,
-    Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, StructArray,
-    UInt32Array, UInt64Array,
+    Float64Array, Int32Array, Int64Array, ListArray, RecordBatch, StringArray, UInt32Array,
+    UInt64Array,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use datafusion_common::Result as DFResult;
@@ -19,6 +19,7 @@ use datafusion_physical_plan::{
 
 use crate::error::{NanoError, Result};
 use crate::ir::{IRAssignment, IRExpr, IRMutationPredicate, MutationIR, MutationOpIR, ParamMap};
+use crate::plan::bindings::{binding_property_array, flat_binding_col, split_flat_binding_col};
 use crate::query::ast::{CompOp, Literal};
 use crate::store::csr::CsrIndex;
 use crate::store::database::persist::{read_sparse_node_batch, resolve_sparse_node_id_by_name};
@@ -28,7 +29,7 @@ use crate::store::runtime::{DatabaseRuntime, EdgeIndexPair, NodeLookup};
 use crate::types::Direction;
 
 /// Physical execution plan that expands from source nodes along an edge type,
-/// producing new destination struct columns.
+/// producing new destination flat binding columns.
 #[derive(Debug)]
 pub(crate) struct ExpandExec {
     input: Arc<dyn ExecutionPlan>,
@@ -72,22 +73,28 @@ impl ExpandExec {
             max_hops,
         } = spec;
 
-        // Build output schema: input fields + new struct column for dst
+        // Build output schema: input fields + new flat columns for dst
         let dst_node_type = &runtime.catalog().node_types[&dst_type];
-        let dst_struct_fields: Vec<Field> = dst_node_type
+        let dst_fields: Vec<Field> = dst_node_type
             .arrow_schema
             .fields()
             .iter()
-            .map(|f| f.as_ref().clone())
+            .map(|f| {
+                let field = f.as_ref();
+                Field::new(
+                    &flat_binding_col(&dst_var, field.name()),
+                    field.data_type().clone(),
+                    field.is_nullable(),
+                )
+            })
             .collect();
-        let dst_field = Field::new(&dst_var, DataType::Struct(dst_struct_fields.into()), false);
 
         let mut output_fields: Vec<Field> = input_schema
             .fields()
             .iter()
             .map(|f| f.as_ref().clone())
             .collect();
-        output_fields.push(dst_field);
+        output_fields.extend(dst_fields);
         let output_schema = Arc::new(Schema::new(output_fields));
 
         let properties = PlanProperties::new(
@@ -285,24 +292,17 @@ impl ExpandExec {
             .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))
     }
 
-    fn output_struct_fields(output_schema: &SchemaRef, struct_name: &str) -> DFResult<Vec<Field>> {
-        let struct_idx = output_schema.index_of(struct_name).map_err(|e| {
-            datafusion_common::DataFusionError::Execution(format!(
-                "expand output schema missing destination field '{}': {}",
-                struct_name, e
-            ))
-        })?;
-        let struct_field = output_schema.field(struct_idx);
-        match struct_field.data_type() {
-            DataType::Struct(fields) => Ok(fields
-                .iter()
-                .map(|f| f.as_ref().clone())
-                .collect::<Vec<Field>>()),
-            other => Err(datafusion_common::DataFusionError::Execution(format!(
-                "expand destination field '{}' expected Struct, found {other:?}",
-                struct_name
-            ))),
-        }
+    fn output_binding_fields(output_schema: &SchemaRef, variable: &str) -> Vec<Field> {
+        output_schema
+            .fields()
+            .iter()
+            .filter(|field| {
+                split_flat_binding_col(field.name())
+                    .map(|(candidate, _)| candidate == variable)
+                    .unwrap_or(false)
+            })
+            .map(|field| field.as_ref().clone())
+            .collect()
     }
 
     fn align_column_to_field(col: &ArrayRef, field: &Field) -> DFResult<ArrayRef> {
@@ -363,28 +363,9 @@ impl ExpandExec {
             Direction::Out => edge_indices.csr.as_ref(),
             Direction::In => edge_indices.csc.as_ref(),
         };
-        // Find the src struct column
-        let src_col_idx = input
-            .schema()
-            .index_of(&self.src_var)
+        let src_id_col = binding_property_array(input, &self.src_var, "id")
             .map_err(|e| datafusion_common::DataFusionError::Execution(e.to_string()))?;
-        let src_struct = input
-            .column(src_col_idx)
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .ok_or_else(|| {
-                datafusion_common::DataFusionError::Execution(
-                    "source column is not a struct".to_string(),
-                )
-            })?;
-
-        // Get the id field from the struct
-        let id_col = src_struct.column_by_name("id").ok_or_else(|| {
-            datafusion_common::DataFusionError::Execution(
-                "no id field in source struct".to_string(),
-            )
-        })?;
-        let id_array = id_col
+        let id_array = src_id_col
             .as_any()
             .downcast_ref::<UInt64Array>()
             .ok_or_else(|| {
@@ -442,29 +423,35 @@ impl ExpandExec {
             output_columns.push(taken);
         }
 
-        // Build destination struct column
         let dst_schema = dst_batch.schema();
-        let dst_struct_fields = Self::output_struct_fields(&self.output_schema, &self.dst_var)?;
-        let mut dst_field_arrays: Vec<ArrayRef> = Vec::with_capacity(dst_struct_fields.len());
+        let dst_output_fields = Self::output_binding_fields(&self.output_schema, &self.dst_var);
 
         let dst_row_indices: Vec<usize> = valid_indices.iter().map(|(_, dr)| *dr).collect();
-        for field in &dst_struct_fields {
-            let field_idx = dst_schema.index_of(field.name()).map_err(|e| {
-                datafusion_common::DataFusionError::Execution(format!(
-                    "destination column '{}' missing in type '{}': {}",
-                    field.name(),
-                    self.dst_type,
-                    e
-                ))
-            })?;
+        for field in &dst_output_fields {
+            let property = split_flat_binding_col(field.name())
+                .map(|(_, property)| property)
+                .unwrap_or_else(|| field.name());
+            let field_idx = dst_schema
+                .index_of(field.name())
+                .map_err(|e| {
+                    datafusion_common::DataFusionError::Execution(format!(
+                        "destination column '{}' missing in type '{}': {}",
+                        property, self.dst_type, e
+                    ))
+                })
+                .or_else(|_| {
+                    dst_schema.index_of(property).map_err(|e| {
+                        datafusion_common::DataFusionError::Execution(format!(
+                            "destination column '{}' missing in type '{}': {}",
+                            property, self.dst_type, e
+                        ))
+                    })
+                })?;
             let dst_col = dst_batch.column(field_idx);
             let taken = take_rows(dst_col, &dst_row_indices)?;
             let aligned = Self::align_column_to_field(&taken, field)?;
-            dst_field_arrays.push(aligned);
+            output_columns.push(aligned);
         }
-
-        let dst_struct_array = StructArray::new(dst_struct_fields.into(), dst_field_arrays, None);
-        output_columns.push(Arc::new(dst_struct_array));
 
         RecordBatch::try_new(self.output_schema.clone(), output_columns)
             .map_err(|e| datafusion_common::DataFusionError::ArrowError(Box::new(e), None))

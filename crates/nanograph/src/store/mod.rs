@@ -7,9 +7,10 @@ pub mod migration;
 pub(crate) mod runtime;
 pub mod txlog;
 
-pub use indexing::{scalar_index_name, vector_index_name};
+pub use indexing::{scalar_index_name, text_index_name, vector_index_name};
 
 pub(crate) mod csr;
 pub(crate) mod graph;
 pub(crate) mod indexing;
 pub(crate) mod loader;
+pub(crate) mod media;

@@ -14,8 +14,10 @@ backlog/
 .env
 .env.nano
 search-test/
+.agents
 
 # SDK build artifacts
 crates/nanograph-ffi/swift/.build/
+crates/nanograph-ts/*.tgz
 node_modules/
 *.node

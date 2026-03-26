@@ -72,6 +72,8 @@ pub struct PropDef {
     #[serde(default)]
     pub embed_source: Option<String>,
     #[serde(default)]
+    pub media_mime_prop: Option<String>,
+    #[serde(default)]
     pub description: Option<String>,
 }
 
@@ -150,6 +152,8 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                                 || has_annotation(&p.annotations, "index"),
                             embed_source: annotation_value(&p.annotations, "embed")
                                 .map(str::to_string),
+                            media_mime_prop: annotation_value(&p.annotations, "media_uri")
+                                .map(str::to_string),
                             description: annotation_value(&p.annotations, "description")
                                 .map(str::to_string),
                         })
@@ -212,6 +216,7 @@ pub fn build_schema_ir(schema: &SchemaFile) -> Result<SchemaIR> {
                             unique: false,
                             index: false,
                             embed_source: None,
+                            media_mime_prop: None,
                             description: annotation_value(&p.annotations, "description")
                                 .map(str::to_string),
                         })
@@ -254,6 +259,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
             TypeDef::Node(n) => {
                 let mut properties = HashMap::new();
                 let mut embed_sources = HashMap::new();
+                let mut media_uri_props = HashMap::new();
                 let mut indexed_properties = HashSet::new();
                 let mut fields = vec![Field::new("id", arrow_schema::DataType::UInt64, false)];
 
@@ -275,6 +281,9 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                     if let Some(source_prop) = &prop.embed_source {
                         embed_sources.insert(prop.name.clone(), source_prop.clone());
                     }
+                    if let Some(mime_prop) = &prop.media_mime_prop {
+                        media_uri_props.insert(prop.name.clone(), mime_prop.clone());
+                    }
                     if prop.index && !prop.list && !matches!(scalar, ScalarType::Vector(_)) {
                         indexed_properties.insert(prop.name.clone());
                     }
@@ -287,6 +296,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                         name: n.name.clone(),
                         properties,
                         embed_sources,
+                        media_uri_props,
                         indexed_properties,
                         arrow_schema: Arc::new(Schema::new(fields)),
                     },

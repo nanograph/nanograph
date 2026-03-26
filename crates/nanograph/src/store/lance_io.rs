@@ -249,6 +249,17 @@ pub(crate) async fn run_lance_delete_by_ids(
     Ok(dataset.version().version)
 }
 
+pub(crate) async fn latest_lance_dataset_version(path: &Path) -> Result<u64> {
+    let uri = path.to_string_lossy().to_string();
+    let dataset = Dataset::open(&uri)
+        .await
+        .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
+    dataset
+        .latest_version_id()
+        .await
+        .map_err(|e| NanoError::Lance(format!("latest version error: {}", e)))
+}
+
 pub(crate) async fn read_lance_batches(path: &Path, version: u64) -> Result<Vec<RecordBatch>> {
     info!(
         dataset_path = %path.display(),

@@ -40,6 +40,7 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 const { Database, decodeArrow } = require("nanograph-db");
+const cliDbPath = process.argv[2];
 
 const schema = `
 node Person {
@@ -49,6 +50,14 @@ node Person {
 `;
 
 const queries = `
+query allPeople() {
+  match { $p: Person }
+  return { $p.name as name, $p.age as age }
+  order { $p.name asc }
+}
+`;
+
+const cliQueries = `
 query allPeople() {
   match { $p: Person }
   return { $p.name as name, $p.age as age }
@@ -86,6 +95,17 @@ async function main() {
     await db.close();
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
+
+  const cliDb = await Database.open(cliDbPath);
+  try {
+    const rows = await cliDb.run(cliQueries, "allPeople");
+    assert.deepEqual(rows, [
+      { name: "Alice", age: 30 },
+      { name: "Bob", age: 25 }
+    ]);
+  } finally {
+    await cliDb.close();
+  }
 }
 
 main().catch((err) => {
@@ -104,10 +124,30 @@ echo "Installing nanograph-db into temp consumer"
     "${TARBALL}" >/dev/null
 )
 
+CLI_DB_DIR="${DATA_DIR}/cli-db"
+CLI_DB_PATH="${CLI_DB_DIR}/test.nano"
+mkdir -p "${CLI_DB_DIR}"
+
+cat > "${CLI_DB_DIR}/schema.pg" <<'EOF'
+node Person {
+  name: String @key
+  age: I32?
+}
+EOF
+
+cat > "${CLI_DB_DIR}/seed.jsonl" <<'EOF'
+{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+EOF
+
+echo "Creating CLI database for SDK interoperability check"
+cargo run --quiet -p nanograph-cli -- init --db "${CLI_DB_PATH}" --schema "${CLI_DB_DIR}/schema.pg" >/dev/null
+cargo run --quiet -p nanograph-cli -- load --db "${CLI_DB_PATH}" --data "${CLI_DB_DIR}/seed.jsonl" --mode overwrite >/dev/null
+
 echo "Running consumer smoke test"
 (
   cd "${CONSUMER_DIR}"
-  node smoke.cjs
+  node smoke.cjs "${CLI_DB_PATH}"
 )
 
 echo "TS consumer smoke test passed"

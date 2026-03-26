@@ -4,11 +4,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 use crate::catalog::schema_ir::{PropDef, SchemaIR};
-use crate::embedding::EmbeddingClient;
+use crate::embedding::{EmbedRole, EmbeddingClient, MediaSource};
 use crate::error::{NanoError, Result};
 use crate::store::manifest::hash_string;
+use crate::store::media::resolve_media_value;
 use crate::types::ScalarType;
 
 const EMBEDDING_CACHE_FILENAME: &str = "_embedding_cache.jsonl";
@@ -24,13 +26,47 @@ const EMBEDDING_CACHE_LOCK_RETRY_DELAY_MS: u64 = 10;
 pub(crate) struct EmbedSpec {
     pub target_prop: String,
     pub source_prop: String,
+    pub source_kind: EmbedSourceKind,
     pub dim: usize,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct EmbedValueRequest {
-    pub source_text: String,
+    pub input: EmbedInput,
     pub dim: usize,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum EmbedSourceKind {
+    Text,
+    Media { mime_prop: String },
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum EmbedInput {
+    Text(String),
+    Media { uri: String, mime_type: String },
+}
+
+impl EmbedValueRequest {
+    fn cache_key(&self, model: &str, chunking: EmbedChunkingConfig) -> CacheKey {
+        match &self.input {
+            EmbedInput::Text(source_text) => CacheKey {
+                model: model.to_string(),
+                dim: self.dim,
+                content_hash: hash_string(source_text),
+                chunk_chars: chunking.chunk_chars,
+                chunk_overlap_chars: chunking.chunk_overlap_chars,
+            },
+            EmbedInput::Media { uri, mime_type } => CacheKey {
+                model: model.to_string(),
+                dim: self.dim,
+                content_hash: hash_string(&format!("media:{}:{}", mime_type, uri)),
+                chunk_chars: 0,
+                chunk_overlap_chars: 0,
+            },
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -38,9 +74,7 @@ pub(crate) struct EmbedValueRequest {
 struct PendingAssignment {
     line_index: usize,
     target_prop: String,
-    source_text: String,
-    dim: usize,
-    content_hash: String,
+    request: EmbedValueRequest,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -79,20 +113,20 @@ struct StreamPendingLine {
 struct StreamPendingAssignment {
     line_id: usize,
     target_prop: String,
-    source_text: String,
-    dim: usize,
-    content_hash: String,
+    request: EmbedValueRequest,
 }
 
 impl StreamPendingAssignment {
     fn cache_key(&self, model: &str, chunking: EmbedChunkingConfig) -> CacheKey {
-        CacheKey {
-            model: model.to_string(),
-            dim: self.dim,
-            content_hash: self.content_hash.clone(),
-            chunk_chars: chunking.chunk_chars,
-            chunk_overlap_chars: chunking.chunk_overlap_chars,
-        }
+        self.request.cache_key(model, chunking)
+    }
+
+    fn queue_key(&self) -> (usize, u8) {
+        let kind = match self.request.input {
+            EmbedInput::Text(_) => 0u8,
+            EmbedInput::Media { .. } => 1u8,
+        };
+        (self.request.dim, kind)
     }
 }
 
@@ -132,21 +166,24 @@ impl EmbedChunkingConfig {
 #[allow(dead_code)]
 pub(crate) async fn materialize_embeddings_for_load(
     db_path: &Path,
+    source_base: Option<&Path>,
     schema_ir: &SchemaIR,
     data_source: &str,
 ) -> Result<String> {
-    materialize_embeddings_for_load_inner(db_path, schema_ir, data_source, None).await
+    materialize_embeddings_for_load_inner(db_path, source_base, schema_ir, data_source, None).await
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 async fn materialize_embeddings_for_load_inner(
     db_path: &Path,
+    source_base: Option<&Path>,
     schema_ir: &SchemaIR,
     data_source: &str,
     client_override: Option<&EmbeddingClient>,
 ) -> Result<String> {
     materialize_embeddings_for_load_inner_with_chunking(
         db_path,
+        source_base,
         schema_ir,
         data_source,
         client_override,
@@ -165,10 +202,12 @@ pub(crate) fn has_embedding_specs(schema_ir: &SchemaIR) -> bool {
 
 pub(crate) async fn materialize_embeddings_for_load_to_tempfile<R: BufRead>(
     db_path: &Path,
+    source_base: Option<&Path>,
     schema_ir: &SchemaIR,
     reader: R,
 ) -> Result<PathBuf> {
-    materialize_embeddings_for_load_to_tempfile_inner(db_path, schema_ir, reader, None).await
+    materialize_embeddings_for_load_to_tempfile_inner(db_path, source_base, schema_ir, reader, None)
+        .await
 }
 
 pub(crate) async fn resolve_embedding_requests(
@@ -181,12 +220,14 @@ pub(crate) async fn resolve_embedding_requests(
 
 async fn materialize_embeddings_for_load_to_tempfile_inner<R: BufRead>(
     db_path: &Path,
+    source_base: Option<&Path>,
     schema_ir: &SchemaIR,
     reader: R,
     client_override: Option<&EmbeddingClient>,
 ) -> Result<PathBuf> {
     materialize_embeddings_for_load_to_tempfile_inner_with_chunking(
         db_path,
+        source_base,
         schema_ir,
         reader,
         client_override,
@@ -212,7 +253,8 @@ async fn resolve_embedding_requests_with_chunking(
     let batch_size = parse_env_usize("NANOGRAPH_EMBED_BATCH_SIZE", DEFAULT_EMBED_BATCH_SIZE);
 
     let mut results: Vec<Option<Vec<f32>>> = vec![None; requests.len()];
-    let mut missing_by_dim: BTreeMap<usize, Vec<(CacheKey, String)>> = BTreeMap::new();
+    let mut missing_text_by_dim: BTreeMap<usize, Vec<(CacheKey, String)>> = BTreeMap::new();
+    let mut missing_media_by_dim: BTreeMap<usize, Vec<(CacheKey, MediaSource)>> = BTreeMap::new();
     let mut missing_indices: HashMap<CacheKey, Vec<usize>> = HashMap::new();
 
     for (idx, request) in requests.iter().enumerate() {
@@ -222,13 +264,7 @@ async fn resolve_embedding_requests_with_chunking(
             ));
         }
 
-        let key = CacheKey {
-            model: model.clone(),
-            dim: request.dim,
-            content_hash: hash_string(&request.source_text),
-            chunk_chars: chunking.chunk_chars,
-            chunk_overlap_chars: chunking.chunk_overlap_chars,
-        };
+        let key = request.cache_key(&model, chunking);
 
         if let Some(vector) = cache.get(&key) {
             results[idx] = Some(vector.clone());
@@ -236,14 +272,25 @@ async fn resolve_embedding_requests_with_chunking(
         }
 
         missing_indices.entry(key.clone()).or_default().push(idx);
-        let entries = missing_by_dim.entry(request.dim).or_default();
-        if !entries.iter().any(|(existing, _)| existing == &key) {
-            entries.push((key, request.source_text.clone()));
+        match &request.input {
+            EmbedInput::Text(source_text) => {
+                let entries = missing_text_by_dim.entry(request.dim).or_default();
+                if !entries.iter().any(|(existing, _)| existing == &key) {
+                    entries.push((key, source_text.clone()));
+                }
+            }
+            EmbedInput::Media { uri, mime_type } => {
+                let media = media_source_from_uri(uri, mime_type)?;
+                let entries = missing_media_by_dim.entry(request.dim).or_default();
+                if !entries.iter().any(|(existing, _)| existing == &key) {
+                    entries.push((key, media));
+                }
+            }
         }
     }
 
     let mut new_cache_records = Vec::new();
-    for (dim, entries) in missing_by_dim {
+    for (dim, entries) in missing_text_by_dim {
         if chunking.is_enabled() {
             for (key, text) in entries {
                 let vector =
@@ -305,6 +352,44 @@ async fn resolve_embedding_requests_with_chunking(
         }
     }
 
+    for (dim, entries) in missing_media_by_dim {
+        for chunk in entries.chunks(batch_size.max(1)) {
+            let media_sources: Vec<MediaSource> =
+                chunk.iter().map(|(_, media)| media.clone()).collect();
+            let vectors = client
+                .embed_media_many(&media_sources, dim, EmbedRole::Document)
+                .await
+                .map_err(|err| NanoError::Storage(format!("embedding request failed: {}", err)))?;
+            if vectors.len() != chunk.len() {
+                return Err(NanoError::Storage(format!(
+                    "embedding response size mismatch: expected {}, got {}",
+                    chunk.len(),
+                    vectors.len()
+                )));
+            }
+            for ((key, media), vector) in chunk.iter().zip(vectors.into_iter()) {
+                if vector.len() != dim {
+                    return Err(NanoError::Storage(format!(
+                        "embedding dimension mismatch for {} ({}): expected {}, got {}",
+                        key.content_hash,
+                        media.mime_type(),
+                        dim,
+                        vector.len()
+                    )));
+                }
+                cache.insert(key.clone(), vector.clone());
+                new_cache_records.push(CacheRecord {
+                    model: key.model.clone(),
+                    dim: key.dim,
+                    content_hash: key.content_hash.clone(),
+                    vector,
+                    chunk_chars: key.chunk_chars,
+                    chunk_overlap_chars: key.chunk_overlap_chars,
+                });
+            }
+        }
+    }
+
     append_embedding_cache(&cache_path, &new_cache_records)?;
 
     for (key, indices) in missing_indices {
@@ -335,6 +420,7 @@ async fn resolve_embedding_requests_with_chunking(
 
 async fn materialize_embeddings_for_load_to_tempfile_inner_with_chunking<R: BufRead>(
     db_path: &Path,
+    source_base: Option<&Path>,
     schema_ir: &SchemaIR,
     reader: R,
     client_override: Option<&EmbeddingClient>,
@@ -365,7 +451,8 @@ async fn materialize_embeddings_for_load_to_tempfile_inner_with_chunking<R: BufR
     let batch_size = parse_env_usize("NANOGRAPH_EMBED_BATCH_SIZE", DEFAULT_EMBED_BATCH_SIZE);
     let mut writer = BufWriter::new(std::fs::File::create(&output_path)?);
     let mut pending_lines: VecDeque<StreamPendingLine> = VecDeque::new();
-    let mut pending_by_dim: BTreeMap<usize, VecDeque<StreamPendingAssignment>> = BTreeMap::new();
+    let mut pending_by_dim: BTreeMap<(usize, u8), VecDeque<StreamPendingAssignment>> =
+        BTreeMap::new();
     let mut new_cache_records = Vec::new();
     let mut next_line_id = 0usize;
 
@@ -408,38 +495,22 @@ async fn materialize_embeddings_for_load_to_tempfile_inner_with_chunking<R: BufR
             let mut mutated = false;
 
             for spec in specs {
-                let needs_embedding = match data_obj.get(&spec.target_prop) {
-                    Some(value) => value.is_null(),
-                    None => true,
-                };
-                if !needs_embedding {
+                let Some(request) = build_embed_request_for_data_obj(
+                    db_path,
+                    source_base,
+                    &type_name,
+                    line_no + 1,
+                    data_obj,
+                    spec,
+                )?
+                else {
                     continue;
-                }
-
-                let source_value = data_obj.get(&spec.source_prop).ok_or_else(|| {
-                    NanoError::Storage(format!(
-                        "node {} line {} missing @embed source property `{}` for `{}`",
-                        type_name,
-                        line_no + 1,
-                        spec.source_prop,
-                        spec.target_prop
-                    ))
-                })?;
-                let source_text = source_value.as_str().ok_or_else(|| {
-                    NanoError::Storage(format!(
-                        "node {} line {} @embed source property `{}` must be String",
-                        type_name,
-                        line_no + 1,
-                        spec.source_prop
-                    ))
-                })?;
+                };
 
                 let assignment = StreamPendingAssignment {
                     line_id: next_line_id,
                     target_prop: spec.target_prop.clone(),
-                    source_text: source_text.to_string(),
-                    dim: spec.dim,
-                    content_hash: hash_string(source_text),
+                    request,
                 };
                 let cache_key = assignment.cache_key(&model, chunking);
                 if let Some(vector) = cache.get(&cache_key) {
@@ -452,7 +523,7 @@ async fn materialize_embeddings_for_load_to_tempfile_inner_with_chunking<R: BufR
                 } else {
                     missing_assignments += 1;
                     pending_by_dim
-                        .entry(spec.dim)
+                        .entry(assignment.queue_key())
                         .or_default()
                         .push_back(assignment);
                 }
@@ -515,6 +586,7 @@ async fn materialize_embeddings_for_load_to_tempfile_inner_with_chunking<R: BufR
 #[cfg_attr(not(test), allow(dead_code))]
 async fn materialize_embeddings_for_load_inner_with_chunking(
     db_path: &Path,
+    source_base: Option<&Path>,
     schema_ir: &SchemaIR,
     data_source: &str,
     client_override: Option<&EmbeddingClient>,
@@ -527,7 +599,14 @@ async fn materialize_embeddings_for_load_inner_with_chunking(
 
     let mut lines = Vec::new();
     let mut pending = Vec::new();
-    parse_input_lines(data_source, &embed_specs, &mut lines, &mut pending)?;
+    parse_input_lines(
+        db_path,
+        source_base,
+        data_source,
+        &embed_specs,
+        &mut lines,
+        &mut pending,
+    )?;
     if pending.is_empty() {
         return Ok(data_source.to_string());
     }
@@ -546,27 +625,37 @@ async fn materialize_embeddings_for_load_inner_with_chunking(
     };
     let model = client.model().to_string();
 
-    let mut missing_by_dim: BTreeMap<usize, Vec<(CacheKey, String)>> = BTreeMap::new();
+    let mut missing_text_by_dim: BTreeMap<usize, Vec<(CacheKey, String)>> = BTreeMap::new();
+    let mut missing_media_by_dim: BTreeMap<usize, Vec<(CacheKey, MediaSource)>> = BTreeMap::new();
     for assignment in &pending {
-        let key = CacheKey {
-            model: model.clone(),
-            dim: assignment.dim,
-            content_hash: assignment.content_hash.clone(),
-            chunk_chars: chunking.chunk_chars,
-            chunk_overlap_chars: chunking.chunk_overlap_chars,
-        };
+        let key = assignment.request.cache_key(&model, chunking);
         if cache.contains_key(&key) {
             continue;
         }
-        let entries = missing_by_dim.entry(assignment.dim).or_default();
-        if !entries.iter().any(|(existing, _)| existing == &key) {
-            entries.push((key, assignment.source_text.clone()));
+        match &assignment.request.input {
+            EmbedInput::Text(source_text) => {
+                let entries = missing_text_by_dim
+                    .entry(assignment.request.dim)
+                    .or_default();
+                if !entries.iter().any(|(existing, _)| existing == &key) {
+                    entries.push((key, source_text.clone()));
+                }
+            }
+            EmbedInput::Media { uri, mime_type } => {
+                let media = media_source_from_uri(uri, mime_type)?;
+                let entries = missing_media_by_dim
+                    .entry(assignment.request.dim)
+                    .or_default();
+                if !entries.iter().any(|(existing, _)| existing == &key) {
+                    entries.push((key, media));
+                }
+            }
         }
     }
 
     let batch_size = parse_env_usize("NANOGRAPH_EMBED_BATCH_SIZE", DEFAULT_EMBED_BATCH_SIZE);
     let mut new_cache_records = Vec::new();
-    for (dim, entries) in missing_by_dim {
+    for (dim, entries) in missing_text_by_dim {
         if chunking.is_enabled() {
             for (key, text) in entries {
                 let vector =
@@ -626,6 +715,43 @@ async fn materialize_embeddings_for_load_inner_with_chunking(
             }
         }
     }
+
+    for (dim, entries) in missing_media_by_dim {
+        for chunk in entries.chunks(batch_size.max(1)) {
+            let sources: Vec<MediaSource> = chunk.iter().map(|(_, media)| media.clone()).collect();
+            let vectors = client
+                .embed_media_many(&sources, dim, EmbedRole::Document)
+                .await
+                .map_err(|err| NanoError::Storage(format!("embedding request failed: {}", err)))?;
+            if vectors.len() != chunk.len() {
+                return Err(NanoError::Storage(format!(
+                    "embedding response size mismatch: expected {}, got {}",
+                    chunk.len(),
+                    vectors.len()
+                )));
+            }
+            for ((key, media), vector) in chunk.iter().zip(vectors.into_iter()) {
+                if vector.len() != dim {
+                    return Err(NanoError::Storage(format!(
+                        "embedding dimension mismatch for {} ({}): expected {}, got {}",
+                        key.content_hash,
+                        media.mime_type(),
+                        dim,
+                        vector.len()
+                    )));
+                }
+                cache.insert(key.clone(), vector.clone());
+                new_cache_records.push(CacheRecord {
+                    model: key.model.clone(),
+                    dim: key.dim,
+                    content_hash: key.content_hash.clone(),
+                    vector,
+                    chunk_chars: key.chunk_chars,
+                    chunk_overlap_chars: key.chunk_overlap_chars,
+                });
+            }
+        }
+    }
     append_embedding_cache(&cache_path, &new_cache_records)?;
 
     apply_embeddings_to_lines(&mut lines, &pending, &cache, &model, chunking)?;
@@ -634,6 +760,8 @@ async fn materialize_embeddings_for_load_inner_with_chunking(
 
 #[cfg_attr(not(test), allow(dead_code))]
 fn parse_input_lines(
+    db_path: &Path,
+    source_base: Option<&Path>,
     data_source: &str,
     embed_specs: &HashMap<String, Vec<EmbedSpec>>,
     lines: &mut Vec<ParsedLine>,
@@ -669,38 +797,22 @@ fn parse_input_lines(
             let line_index = lines.len();
 
             for spec in specs {
-                let needs_embedding = match data_obj.get(&spec.target_prop) {
-                    Some(value) => value.is_null(),
-                    None => true,
-                };
-                if !needs_embedding {
+                let Some(request) = build_embed_request_for_data_obj(
+                    db_path,
+                    source_base,
+                    &type_name,
+                    line_no + 1,
+                    data_obj,
+                    spec,
+                )?
+                else {
                     continue;
-                }
-
-                let source_value = data_obj.get(&spec.source_prop).ok_or_else(|| {
-                    NanoError::Storage(format!(
-                        "node {} line {} missing @embed source property `{}` for `{}`",
-                        type_name,
-                        line_no + 1,
-                        spec.source_prop,
-                        spec.target_prop
-                    ))
-                })?;
-                let source_text = source_value.as_str().ok_or_else(|| {
-                    NanoError::Storage(format!(
-                        "node {} line {} @embed source property `{}` must be String",
-                        type_name,
-                        line_no + 1,
-                        spec.source_prop
-                    ))
-                })?;
+                };
 
                 pending.push(PendingAssignment {
                     line_index,
                     target_prop: spec.target_prop.clone(),
-                    source_text: source_text.to_string(),
-                    dim: spec.dim,
-                    content_hash: hash_string(source_text),
+                    request,
                 });
             }
         }
@@ -719,17 +831,11 @@ fn apply_embeddings_to_lines(
     chunking: EmbedChunkingConfig,
 ) -> Result<()> {
     for assignment in pending {
-        let key = CacheKey {
-            model: model.to_string(),
-            dim: assignment.dim,
-            content_hash: assignment.content_hash.clone(),
-            chunk_chars: chunking.chunk_chars,
-            chunk_overlap_chars: chunking.chunk_overlap_chars,
-        };
+        let key = assignment.request.cache_key(model, chunking);
         let vector = cache.get(&key).ok_or_else(|| {
             NanoError::Storage(format!(
                 "embedding cache miss for content hash {}",
-                assignment.content_hash
+                key.content_hash
             ))
         })?;
         let line = lines.get_mut(assignment.line_index).ok_or_else(|| {
@@ -782,8 +888,103 @@ fn render_output_lines(original: &str, lines: Vec<ParsedLine>) -> Result<String>
     Ok(out)
 }
 
+fn build_embed_request_for_data_obj(
+    db_path: &Path,
+    source_base: Option<&Path>,
+    type_name: &str,
+    line_no: usize,
+    data_obj: &mut serde_json::Map<String, serde_json::Value>,
+    spec: &EmbedSpec,
+) -> Result<Option<EmbedValueRequest>> {
+    let needs_embedding = match data_obj.get(&spec.target_prop) {
+        Some(value) => value.is_null(),
+        None => true,
+    };
+    if !needs_embedding {
+        return Ok(None);
+    }
+
+    let source_value = data_obj.get(&spec.source_prop).ok_or_else(|| {
+        NanoError::Storage(format!(
+            "node {} line {} missing @embed source property `{}` for `{}`",
+            type_name, line_no, spec.source_prop, spec.target_prop
+        ))
+    })?;
+    let source_str = source_value.as_str().ok_or_else(|| {
+        NanoError::Storage(format!(
+            "node {} line {} @embed source property `{}` must be String",
+            type_name, line_no, spec.source_prop
+        ))
+    })?;
+
+    match &spec.source_kind {
+        EmbedSourceKind::Text => Ok(Some(EmbedValueRequest {
+            input: EmbedInput::Text(source_str.to_string()),
+            dim: spec.dim,
+        })),
+        EmbedSourceKind::Media { mime_prop } => {
+            let mime_hint = match data_obj.get(mime_prop) {
+                Some(serde_json::Value::Null) | None => None,
+                Some(serde_json::Value::String(value)) => Some(value.as_str()),
+                Some(_) => {
+                    return Err(NanoError::Storage(format!(
+                        "node {} line {} media mime property `{}` must be String",
+                        type_name, line_no, mime_prop
+                    )));
+                }
+            };
+            let resolved = resolve_media_value(
+                db_path,
+                source_base,
+                type_name,
+                &spec.source_prop,
+                source_str,
+                mime_hint,
+            )?;
+            data_obj.insert(
+                spec.source_prop.clone(),
+                serde_json::Value::String(format!("@uri:{}", resolved.uri)),
+            );
+            data_obj.insert(
+                mime_prop.clone(),
+                serde_json::Value::String(resolved.mime_type.clone()),
+            );
+            Ok(Some(EmbedValueRequest {
+                input: EmbedInput::Media {
+                    uri: resolved.uri,
+                    mime_type: resolved.mime_type,
+                },
+                dim: spec.dim,
+            }))
+        }
+    }
+}
+
+fn media_source_from_uri(uri: &str, mime_type: &str) -> Result<MediaSource> {
+    let parsed = Url::parse(uri)
+        .map_err(|err| NanoError::Storage(format!("invalid media URI '{}': {}", uri, err)))?;
+    if parsed.scheme() == "file" {
+        let path = parsed
+            .to_file_path()
+            .map_err(|_| NanoError::Storage(format!("invalid file URI '{}'", uri)))?;
+        let metadata = std::fs::metadata(&path).map_err(|err| {
+            NanoError::Storage(format!("failed to stat {}: {}", path.display(), err))
+        })?;
+        return Ok(MediaSource::LocalFile {
+            path,
+            mime_type: mime_type.to_string(),
+            size_bytes: metadata.len(),
+        });
+    }
+
+    Ok(MediaSource::RemoteUri {
+        uri: uri.to_string(),
+        mime_type: mime_type.to_string(),
+    })
+}
+
 async fn resolve_pending_stream_batches(
-    pending_by_dim: &mut BTreeMap<usize, VecDeque<StreamPendingAssignment>>,
+    pending_by_dim: &mut BTreeMap<(usize, u8), VecDeque<StreamPendingAssignment>>,
     pending_lines: &mut VecDeque<StreamPendingLine>,
     runtime: &mut StreamEmbedRuntime<'_>,
     flush_all: bool,
@@ -804,7 +1005,7 @@ async fn resolve_pending_stream_batches(
         };
 
         let queue = pending_by_dim.get_mut(&dim).ok_or_else(|| {
-            NanoError::Storage(format!("missing pending embedding queue for dim {}", dim))
+            NanoError::Storage(format!("missing pending embedding queue for dim {:?}", dim))
         })?;
         resolve_pending_stream_batch(queue, pending_lines, runtime).await?;
         if queue.is_empty() {
@@ -822,26 +1023,32 @@ async fn resolve_pending_stream_batch(
 ) -> Result<()> {
     let batch_size = runtime.batch_size.max(1);
     let mut assignments = Vec::new();
-    let mut unique_entries = Vec::new();
+    let mut unique_text_entries = Vec::new();
+    let mut unique_media_entries = Vec::new();
     let mut seen_keys = HashSet::new();
 
     while let Some(assignment) = queue.pop_front() {
         let cache_key = assignment.cache_key(runtime.model, runtime.chunking);
         if seen_keys.insert(cache_key.clone()) {
-            unique_entries.push((cache_key, assignment.source_text.clone()));
+            match &assignment.request.input {
+                EmbedInput::Text(text) => unique_text_entries.push((cache_key, text.clone())),
+                EmbedInput::Media { uri, mime_type } => {
+                    unique_media_entries.push((cache_key, media_source_from_uri(uri, mime_type)?))
+                }
+            }
         }
         assignments.push(assignment);
-        if unique_entries.len() >= batch_size {
+        if unique_text_entries.len() + unique_media_entries.len() >= batch_size {
             break;
         }
     }
 
-    if unique_entries.is_empty() {
+    if unique_text_entries.is_empty() && unique_media_entries.is_empty() {
         return Ok(());
     }
 
-    if runtime.chunking.is_enabled() {
-        for (cache_key, text) in &unique_entries {
+    if !unique_text_entries.is_empty() && runtime.chunking.is_enabled() {
+        for (cache_key, text) in &unique_text_entries {
             let vector = embed_text_with_chunking(
                 runtime.client,
                 text,
@@ -868,30 +1075,71 @@ async fn resolve_pending_stream_batch(
                 chunk_overlap_chars: cache_key.chunk_overlap_chars,
             });
         }
-    } else {
-        let texts: Vec<String> = unique_entries
+    } else if !unique_text_entries.is_empty() {
+        let texts: Vec<String> = unique_text_entries
             .iter()
             .map(|(_, text)| text.clone())
             .collect();
-        let dim = unique_entries[0].0.dim;
+        let dim = unique_text_entries[0].0.dim;
         let vectors = runtime
             .client
             .embed_texts(&texts, dim)
             .await
             .map_err(|err| NanoError::Storage(format!("embedding request failed: {}", err)))?;
-        if vectors.len() != unique_entries.len() {
+        if vectors.len() != unique_text_entries.len() {
             return Err(NanoError::Storage(format!(
                 "embedding response size mismatch: expected {}, got {}",
-                unique_entries.len(),
+                unique_text_entries.len(),
                 vectors.len()
             )));
         }
 
-        for ((cache_key, _), vector) in unique_entries.iter().zip(vectors.into_iter()) {
+        for ((cache_key, _), vector) in unique_text_entries.iter().zip(vectors.into_iter()) {
             if vector.len() != cache_key.dim {
                 return Err(NanoError::Storage(format!(
                     "embedding dimension mismatch for {}: expected {}, got {}",
                     cache_key.content_hash,
+                    cache_key.dim,
+                    vector.len()
+                )));
+            }
+            runtime.cache.insert(cache_key.clone(), vector.clone());
+            runtime.new_cache_records.push(CacheRecord {
+                model: cache_key.model.clone(),
+                dim: cache_key.dim,
+                content_hash: cache_key.content_hash.clone(),
+                vector,
+                chunk_chars: cache_key.chunk_chars,
+                chunk_overlap_chars: cache_key.chunk_overlap_chars,
+            });
+        }
+    }
+
+    if !unique_media_entries.is_empty() {
+        let dim = unique_media_entries[0].0.dim;
+        let sources: Vec<MediaSource> = unique_media_entries
+            .iter()
+            .map(|(_, media)| media.clone())
+            .collect();
+        let vectors = runtime
+            .client
+            .embed_media_many(&sources, dim, EmbedRole::Document)
+            .await
+            .map_err(|err| NanoError::Storage(format!("embedding request failed: {}", err)))?;
+        if vectors.len() != unique_media_entries.len() {
+            return Err(NanoError::Storage(format!(
+                "embedding response size mismatch: expected {}, got {}",
+                unique_media_entries.len(),
+                vectors.len()
+            )));
+        }
+
+        for ((cache_key, media), vector) in unique_media_entries.iter().zip(vectors.into_iter()) {
+            if vector.len() != cache_key.dim {
+                return Err(NanoError::Storage(format!(
+                    "embedding dimension mismatch for {} ({}): expected {}, got {}",
+                    cache_key.content_hash,
+                    media.mime_type(),
                     cache_key.dim,
                     vector.len()
                 )));
@@ -941,7 +1189,7 @@ fn apply_stream_assignment(
     let vector = cache.get(&cache_key).ok_or_else(|| {
         NanoError::Storage(format!(
             "embedding cache miss for content hash {}",
-            assignment.content_hash
+            cache_key.content_hash
         ))
     })?;
     let line = pending_lines
@@ -1199,10 +1447,17 @@ pub(crate) fn collect_embed_specs(schema_ir: &SchemaIR) -> Result<HashMap<String
                     node.name, source_prop
                 )));
             }
+            let source_kind = match &source_def.media_mime_prop {
+                Some(mime_prop) => EmbedSourceKind::Media {
+                    mime_prop: mime_prop.clone(),
+                },
+                None => EmbedSourceKind::Text,
+            };
 
             node_specs.push(EmbedSpec {
                 target_prop: prop.name.clone(),
                 source_prop: source_prop.clone(),
+                source_kind,
                 dim,
             });
         }
@@ -1473,9 +1728,10 @@ node Doc {
 "#;
         let temp = TempDir::new().unwrap();
         let client = EmbeddingClient::mock_for_tests();
-        let out = materialize_embeddings_for_load_inner(temp.path(), &ir, data, Some(&client))
-            .await
-            .unwrap();
+        let out =
+            materialize_embeddings_for_load_inner(temp.path(), None, &ir, data, Some(&client))
+                .await
+                .unwrap();
         assert!(out.contains("\"embedding\""));
         assert!(temp.path().join(EMBEDDING_CACHE_FILENAME).exists());
     }
@@ -1498,6 +1754,7 @@ node Doc {
         let temp = TempDir::new().unwrap();
         let out = materialize_embeddings_for_load_inner(
             temp.path(),
+            None,
             &ir,
             data,
             Some(&EmbeddingClient::mock_for_tests()),
@@ -1528,11 +1785,12 @@ node Doc {
         let client = EmbeddingClient::mock_for_tests();
 
         let string_out =
-            materialize_embeddings_for_load_inner(temp.path(), &ir, data, Some(&client))
+            materialize_embeddings_for_load_inner(temp.path(), None, &ir, data, Some(&client))
                 .await
                 .unwrap();
         let tempfile_out = materialize_embeddings_for_load_to_tempfile_inner(
             temp.path(),
+            None,
             &ir,
             Cursor::new(data.as_bytes()),
             Some(&client),
@@ -1549,6 +1807,39 @@ node Doc {
         };
 
         assert_eq!(parse_rows(&string_out), parse_rows(&stream_out));
+    }
+
+    #[tokio::test]
+    async fn materialize_embeddings_populates_media_vectors_and_normalizes_uri() {
+        let schema = parse_schema(
+            r#"
+node PhotoAsset {
+    slug: String @key
+    uri: String @media_uri(mime)
+    mime: String?
+    embedding: Vector(6) @embed(uri)
+}
+"#,
+        )
+        .unwrap();
+        let ir = build_schema_ir(&schema).unwrap();
+        let data = r#"{"type":"PhotoAsset","data":{"slug":"hero","uri":"@base64:iVBORw0KGgpmYWtlLXBuZw=="}}"#;
+        let temp = TempDir::new().unwrap();
+        let client = EmbeddingClient::mock_for_tests();
+
+        let out =
+            materialize_embeddings_for_load_inner(temp.path(), None, &ir, data, Some(&client))
+                .await
+                .unwrap();
+        let json: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(json["data"]["mime"].as_str(), Some("image/png"));
+        assert!(
+            json["data"]["uri"]
+                .as_str()
+                .unwrap()
+                .starts_with("@uri:file://")
+        );
+        assert!(json["data"]["embedding"].is_array());
     }
 
     #[test]
@@ -1687,6 +1978,7 @@ node Doc {
         let chunking = EmbedChunkingConfig::new(12, 3);
         let out = materialize_embeddings_for_load_inner_with_chunking(
             temp.path(),
+            None,
             &ir,
             data,
             Some(&client),

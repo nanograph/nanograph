@@ -20,6 +20,8 @@ datafusion-physical-plan = { workspace = true }
 datafusion-physical-expr = { workspace = true }
 datafusion-execution = { workspace = true }
 datafusion-common = { workspace = true }
+datafusion-expr = { workspace = true }
+datafusion-functions-aggregate = { workspace = true }
 lance = { workspace = true }
 lance-file = { workspace = true }
 lance-index = { workspace = true }
@@ -36,6 +38,9 @@ tracing = { workspace = true }
 ahash = { workspace = true }
 reqwest = { workspace = true }
 tempfile = { workspace = true }
+base64 = "0.22"
+sha2 = "0.10"
+url = "2"
 
 [dev-dependencies]
 tokio = { workspace = true }

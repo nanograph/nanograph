@@ -887,7 +887,12 @@ fn mock_media_embedding(input: &MediaSource, role: EmbedRole, dim: usize) -> Vec
     mock_semantic_embedding(&semantic_key, role, "media", dim)
 }
 
-fn mock_semantic_embedding(semantic_key: &str, role: EmbedRole, modality: &str, dim: usize) -> Vec<f32> {
+fn mock_semantic_embedding(
+    semantic_key: &str,
+    role: EmbedRole,
+    modality: &str,
+    dim: usize,
+) -> Vec<f32> {
     let mut base = mock_embedding_from_seed(&format!("semantic:{}", semantic_key), dim);
     let role_vec = mock_embedding_from_seed(
         &format!(

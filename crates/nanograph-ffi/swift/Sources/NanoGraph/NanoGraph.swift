@@ -37,6 +37,102 @@ public enum LoadMode: String {
     case merge
 }
 
+public struct EmbedOptions {
+    public var typeName: String?
+    public var property: String?
+    public var onlyNull: Bool
+    public var limit: Int?
+    public var reindex: Bool
+    public var dryRun: Bool
+
+    public init(
+        typeName: String? = nil,
+        property: String? = nil,
+        onlyNull: Bool = false,
+        limit: Int? = nil,
+        reindex: Bool = false,
+        dryRun: Bool = false
+    ) {
+        self.typeName = typeName
+        self.property = property
+        self.onlyNull = onlyNull
+        self.limit = limit
+        self.reindex = reindex
+        self.dryRun = dryRun
+    }
+
+    fileprivate func jsonObject() -> [String: Any] {
+        var object: [String: Any] = [
+            "onlyNull": onlyNull,
+            "reindex": reindex,
+            "dryRun": dryRun,
+        ]
+        if let typeName {
+            object["typeName"] = typeName
+        }
+        if let property {
+            object["property"] = property
+        }
+        if let limit {
+            object["limit"] = limit
+        }
+        return object
+    }
+}
+
+public struct EmbedResult: Decodable {
+    public let nodeTypesConsidered: Int
+    public let propertiesSelected: Int
+    public let rowsSelected: Int
+    public let embeddingsGenerated: Int
+    public let reindexedTypes: Int
+    public let dryRun: Bool
+}
+
+public enum MediaRef {
+    case file(String, mimeType: String? = nil)
+    case base64(String, mimeType: String? = nil)
+    case uri(String, mimeType: String? = nil)
+
+    fileprivate var mimeType: String? {
+        switch self {
+        case .file(_, let mimeType), .base64(_, let mimeType), .uri(_, let mimeType):
+            return mimeType
+        }
+    }
+
+    fileprivate func encodedValue() -> String {
+        switch self {
+        case .file(let path, _):
+            return "@file:\(absoluteFilePath(path))"
+        case .base64(let data, _):
+            return "@base64:\(data)"
+        case .uri(let uri, _):
+            return "@uri:\(uri)"
+        }
+    }
+}
+
+public enum LoadRow {
+    case node(type: String, data: [String: Any])
+    case edge(type: String, from: String, to: String, data: [String: Any] = [:])
+}
+
+private struct SchemaDescribeMetadata: Decodable {
+    struct TypeDef: Decodable {
+        let name: String
+        let properties: [Property]
+    }
+
+    struct Property: Decodable {
+        let name: String
+        let mediaMimeProp: String?
+    }
+
+    let nodeTypes: [TypeDef]
+    let edgeTypes: [TypeDef]
+}
+
 public final class Database {
     // Serializes handle lifecycle/use to avoid close-vs-operation races.
     private let lock = NSLock()
@@ -129,6 +225,12 @@ public final class Database {
         }
     }
 
+    public func loadRows(_ rows: [LoadRow], mode: LoadMode) throws {
+        let schema = try describe(SchemaDescribeMetadata.self)
+        let jsonl = try encodeLoadRows(rows, schema: schema)
+        try load(dataSource: jsonl, mode: mode)
+    }
+
     public func run(
         querySource: String,
         queryName: String,
@@ -187,6 +289,21 @@ public final class Database {
         try lock.withLock {
             let handle = try requireHandleLocked()
             let ptr = nanograph_db_describe(handle)
+            return try decodeOwnedJSONString(ptr)
+        }
+    }
+
+    public func embed(options: EmbedOptions? = nil) throws -> Any {
+        let optionsJSON = try encodeJSON(options?.jsonObject())
+        return try lock.withLock {
+            let handle = try requireHandleLocked()
+            let ptr = if let optionsJSON {
+                optionsJSON.withCString { optionsPtr in
+                    nanograph_db_embed(handle, optionsPtr)
+                }
+            } else {
+                nanograph_db_embed(handle, nil)
+            }
             return try decodeOwnedJSONString(ptr)
         }
     }
@@ -257,6 +374,11 @@ public final class Database {
 
     public func describe<T: Decodable>(_ type: T.Type) throws -> T {
         let raw = try describe()
+        return try decodeValue(type, from: raw)
+    }
+
+    public func embed<T: Decodable>(_ type: T.Type, options: EmbedOptions? = nil) throws -> T {
+        let raw = try embed(options: options)
         return try decodeValue(type, from: raw)
     }
 
@@ -336,4 +458,119 @@ private func lastErrorMessage() -> String {
         return "Unknown NanoGraph FFI error"
     }
     return String(cString: errPtr)
+}
+
+private func absoluteFilePath(_ path: String) -> String {
+    let url = URL(fileURLWithPath: path, relativeTo: URL(fileURLWithPath: FileManager.default.currentDirectoryPath))
+    return url.standardizedFileURL.path
+}
+
+private func buildMediaMimeMap(from schema: SchemaDescribeMetadata) -> [String: [String: String]] {
+    var result: [String: [String: String]] = [:]
+    for typeDef in schema.nodeTypes + schema.edgeTypes {
+        let propMap = Dictionary(
+            uniqueKeysWithValues: typeDef.properties.compactMap { prop in
+                prop.mediaMimeProp.map { (prop.name, $0) }
+            }
+        )
+        result[typeDef.name] = propMap
+    }
+    return result
+}
+
+private func encodeLoadRows(_ rows: [LoadRow], schema: SchemaDescribeMetadata) throws -> String {
+    let mediaMimeMap = buildMediaMimeMap(from: schema)
+    let encodedRows = try rows.map { row in
+        let object = try encodeLoadRow(row, mediaMimeMap: mediaMimeMap)
+        let data = try JSONSerialization.data(withJSONObject: object, options: [])
+        guard let line = String(data: data, encoding: .utf8) else {
+            throw NanoGraphError.message("Failed to encode load row JSON")
+        }
+        return line
+    }
+    return encodedRows.joined(separator: "\n")
+}
+
+private func encodeLoadRow(
+    _ row: LoadRow,
+    mediaMimeMap: [String: [String: String]]
+) throws -> [String: Any] {
+    switch row {
+    case .node(let type, let data):
+        return [
+            "type": type,
+            "data": try encodeLoadData(typeName: type, data: data, mediaMimeMap: mediaMimeMap),
+        ]
+    case .edge(let type, let from, let to, let data):
+        var object: [String: Any] = [
+            "edge": type,
+            "from": from,
+            "to": to,
+        ]
+        if !data.isEmpty {
+            object["data"] = try encodeLoadData(typeName: type, data: data, mediaMimeMap: mediaMimeMap)
+        }
+        return object
+    }
+}
+
+private func encodeLoadData(
+    typeName: String,
+    data: [String: Any],
+    mediaMimeMap: [String: [String: String]]
+) throws -> [String: Any] {
+    var object: [String: Any] = [:]
+    let typeMediaMap = mediaMimeMap[typeName] ?? [:]
+
+    for (key, value) in data {
+        if let mediaRef = value as? MediaRef {
+            object[key] = mediaRef.encodedValue()
+            if let mimeType = mediaRef.mimeType,
+               let mimeProp = typeMediaMap[key]
+            {
+                if let existing = object[mimeProp] ?? data[mimeProp] {
+                    guard let existingMime = existing as? String, existingMime == mimeType else {
+                        throw NanoGraphError.message(
+                            "media MIME mismatch for \(typeName).\(key): helper mimeType '\(mimeType)' conflicts with '\(existing)' in '\(mimeProp)'"
+                        )
+                    }
+                } else {
+                    object[mimeProp] = mimeType
+                }
+            }
+            continue
+        }
+
+        object[key] = try encodeLoadValue(value)
+    }
+
+    return object
+}
+
+private func encodeLoadValue(_ value: Any) throws -> Any {
+    if let mediaRef = value as? MediaRef {
+        return mediaRef.encodedValue()
+    }
+    if value is NSNull || value is String || value is Bool || value is NSNumber {
+        return value
+    }
+    if let value = value as? Int { return value }
+    if let value = value as? Int32 { return Int(value) }
+    if let value = value as? Int64 { return value }
+    if let value = value as? UInt { return value }
+    if let value = value as? UInt32 { return value }
+    if let value = value as? UInt64 { return value }
+    if let value = value as? Double { return value }
+    if let value = value as? Float { return Double(value) }
+    if let array = value as? [Any] {
+        return try array.map(encodeLoadValue)
+    }
+    if let dict = value as? [String: Any] {
+        var out: [String: Any] = [:]
+        for (key, nested) in dict {
+            out[key] = try encodeLoadValue(nested)
+        }
+        return out
+    }
+    throw NanoGraphError.message("Value is not valid JSON or MediaRef")
 }

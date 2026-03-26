@@ -20,15 +20,18 @@ use crate::json_output::array_value_to_json;
 use crate::query::ast::{CompOp, Literal, MatchValue, Mutation, QueryDecl};
 use crate::result::MutationResult;
 use crate::store::graph::DatasetAccumulator;
-use crate::store::indexing::{rebuild_node_scalar_indexes, rebuild_node_vector_indexes};
+use crate::store::indexing::{
+    rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
+};
 use crate::store::lance_io::{
-    read_lance_batches, run_lance_delete_by_ids, run_lance_merge_insert_with_key,
-    write_lance_batch, write_lance_batch_with_mode,
+    latest_lance_dataset_version, read_lance_batches, run_lance_delete_by_ids,
+    run_lance_merge_insert_with_key, write_lance_batch, write_lance_batch_with_mode,
 };
 use crate::store::loader::{
-    EmbedValueRequest, build_next_storage_for_load, build_next_storage_for_load_reader,
-    build_next_storage_for_load_reader_internal, build_next_storage_for_load_reader_with_options,
-    collect_embed_specs, json_values_to_array, resolve_embedding_requests,
+    EmbedInput, EmbedSourceKind, EmbedValueRequest, build_next_storage_for_load,
+    build_next_storage_for_load_reader, build_next_storage_for_load_reader_internal,
+    build_next_storage_for_load_reader_with_options, collect_embed_specs, json_values_to_array,
+    resolve_embedding_requests,
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::metadata::DatabaseMetadata;
@@ -45,6 +48,7 @@ use super::cdc::{
 struct SelectedEmbedProp {
     target_prop: String,
     source_prop: String,
+    source_kind: EmbedSourceKind,
     dim: usize,
     indexed: bool,
 }
@@ -234,21 +238,52 @@ impl Database {
                         continue;
                     }
 
-                    let source_text = row
-                        .get(&prop.source_prop)
-                        .and_then(JsonValue::as_str)
-                        .ok_or_else(|| {
-                            NanoError::Execution(format!(
-                                "cannot embed {}.{}: source property {} must be a String",
-                                node_def.name, prop.target_prop, prop.source_prop
-                            ))
-                        })?;
+                    let request = match &prop.source_kind {
+                        EmbedSourceKind::Text => {
+                            let source_text = row
+                                .get(&prop.source_prop)
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| {
+                                    NanoError::Execution(format!(
+                                        "cannot embed {}.{}: source property {} must be a String",
+                                        node_def.name, prop.target_prop, prop.source_prop
+                                    ))
+                                })?;
+                            EmbedValueRequest {
+                                input: EmbedInput::Text(source_text.to_string()),
+                                dim: prop.dim,
+                            }
+                        }
+                        EmbedSourceKind::Media { mime_prop } => {
+                            let source_uri = row
+                                .get(&prop.source_prop)
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| {
+                                    NanoError::Execution(format!(
+                                        "cannot embed {}.{}: media source property {} must be a String URI",
+                                        node_def.name, prop.target_prop, prop.source_prop
+                                    ))
+                                })?;
+                            let mime_type = row
+                                .get(mime_prop)
+                                .and_then(JsonValue::as_str)
+                                .ok_or_else(|| {
+                                    NanoError::Execution(format!(
+                                        "cannot embed {}.{}: media mime property {} must be a String",
+                                        node_def.name, prop.target_prop, mime_prop
+                                    ))
+                                })?;
+                            EmbedValueRequest {
+                                input: EmbedInput::Media {
+                                    uri: source_uri.to_string(),
+                                    mime_type: mime_type.to_string(),
+                                },
+                                dim: prop.dim,
+                            }
+                        }
+                    };
 
-                    row_assignments.push((
-                        prop.target_prop.clone(),
-                        source_text.to_string(),
-                        prop.dim,
-                    ));
+                    row_assignments.push((prop.target_prop.clone(), request));
                 }
 
                 if row_assignments.is_empty() {
@@ -257,8 +292,8 @@ impl Database {
 
                 rows_selected += 1;
                 remaining_limit = remaining_limit.saturating_sub(1);
-                for (target_prop, source_text, dim) in row_assignments {
-                    requests.push(EmbedValueRequest { source_text, dim });
+                for (target_prop, request) in row_assignments {
+                    requests.push(request);
                     assignments.push((row_idx, target_prop));
                     embeddings_generated += 1;
                 }
@@ -427,6 +462,7 @@ impl Database {
                 let reader = BufReader::new(file);
                 let load_result = build_next_storage_for_load_reader(
                     &self.path,
+                    data_path.parent(),
                     previous_storage.as_ref(),
                     &self.schema_ir,
                     reader,
@@ -499,6 +535,7 @@ pub async fn load_database_file_sparse(
     let reader = BufReader::new(file);
     let load_result = build_next_storage_for_load_reader_with_options(
         db_path,
+        data_path.parent(),
         &existing_storage,
         metadata.schema_ir(),
         reader,
@@ -530,6 +567,7 @@ async fn persist_sparse_load_string_at_path(
     .await?;
     let load_result = build_next_storage_for_load_reader_with_options(
         db_path,
+        None,
         &existing_storage,
         metadata.schema_ir(),
         Cursor::new(data_source.as_bytes()),
@@ -561,6 +599,7 @@ async fn persist_sparse_load_file_at_path(
     let reader = BufReader::new(file);
     let load_result = build_next_storage_for_load_reader_with_options(
         db_path,
+        data_path.parent(),
         &existing_storage,
         metadata.schema_ir(),
         reader,
@@ -1033,6 +1072,7 @@ async fn build_sparse_storage_transition_from_string(
     .await?;
     let load_result = build_next_storage_for_load_reader_internal(
         metadata.path(),
+        None,
         &existing_storage,
         metadata.schema_ir(),
         Cursor::new(data_source.as_bytes()),
@@ -1177,7 +1217,7 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             && node_delta.inserts.is_none()
             && node_delta.upserts.is_none()
             && !node_delta.delete_ids.is_empty();
-        let dataset_version = if can_merge_upsert {
+        if can_merge_upsert {
             let source_batch = node_delta.upserts.clone().ok_or_else(|| {
                 NanoError::Storage(format!("missing node upsert batch for {}", node_def.name))
             })?;
@@ -1198,7 +1238,7 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 "merging node delta into existing Lance dataset"
             );
             run_lance_merge_insert_with_key(&dataset_path, pinned_version, source_batch, key_prop)
-                .await?
+                .await?;
         } else if can_append {
             let delta_batch = node_delta.inserts.clone().ok_or_else(|| {
                 NanoError::Storage(format!("missing node insert batch for {}", node_def.name))
@@ -1208,7 +1248,7 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 rows = delta_batch.num_rows(),
                 "appending node delta to existing Lance dataset"
             );
-            write_lance_batch_with_mode(&dataset_path, delta_batch, WriteMode::Append).await?
+            write_lance_batch_with_mode(&dataset_path, delta_batch, WriteMode::Append).await?;
         } else if can_native_delete {
             let pinned_version = previous_entry
                 .as_ref()
@@ -1224,17 +1264,19 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
                 rows = node_delta.delete_ids.len(),
                 "deleting node delta from existing Lance dataset"
             );
-            run_lance_delete_by_ids(&dataset_path, pinned_version, &node_delta.delete_ids).await?
+            run_lance_delete_by_ids(&dataset_path, pinned_version, &node_delta.delete_ids).await?;
         } else {
             debug!(
                 node_type = %node_def.name,
                 rows = row_count,
                 "writing full node dataset from dataset mutation plan"
             );
-            write_lance_batch(&dataset_path, batch).await?
-        };
+            write_lance_batch(&dataset_path, batch).await?;
+        }
         rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
+        rebuild_node_text_indexes(&dataset_path, node_def).await?;
         rebuild_node_vector_indexes(&dataset_path, node_def).await?;
+        let dataset_version = latest_lance_dataset_version(&dataset_path).await?;
         dataset_entries.push(DatasetEntry {
             type_id: node_def.type_id,
             type_name: node_def.name.clone(),
@@ -1778,6 +1820,7 @@ fn select_embed_types<'a>(
             .map(|spec| SelectedEmbedProp {
                 target_prop: spec.target_prop.clone(),
                 source_prop: spec.source_prop.clone(),
+                source_kind: spec.source_kind.clone(),
                 dim: spec.dim,
                 indexed: node_def
                     .properties

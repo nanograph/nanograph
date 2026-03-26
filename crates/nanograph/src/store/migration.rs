@@ -16,8 +16,10 @@ use crate::error::{NanoError, Result};
 use crate::schema::ast::{PropDecl, SchemaDecl, SchemaFile, annotation_value, has_annotation};
 use crate::schema::parser::parse_schema;
 use crate::store::graph::DatasetAccumulator;
-use crate::store::indexing::{rebuild_node_scalar_indexes, rebuild_node_vector_indexes};
-use crate::store::lance_io::{read_lance_batches, write_lance_batch};
+use crate::store::indexing::{
+    rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
+};
+use crate::store::lance_io::{latest_lance_dataset_version, read_lance_batches, write_lance_batch};
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::metadata::{DatabaseMetadata, DatasetLocator};
 use crate::store::txlog::commit_manifest_and_logs;
@@ -588,6 +590,8 @@ fn build_desired_schema_ir_with_ids(
                 index: has_annotation(&prop.annotations, "key")
                     || has_annotation(&prop.annotations, "index"),
                 embed_source: annotation_value(&prop.annotations, "embed").map(str::to_string),
+                media_mime_prop: annotation_value(&prop.annotations, "media_uri")
+                    .map(str::to_string),
                 description: annotation_value(&prop.annotations, "description").map(str::to_string),
             });
         }
@@ -691,6 +695,8 @@ fn build_desired_schema_ir_with_ids(
                 unique: false,
                 index: false,
                 embed_source: None,
+                media_mime_prop: annotation_value(&prop.annotations, "media_uri")
+                    .map(str::to_string),
                 description: annotation_value(&prop.annotations, "description").map(str::to_string),
             });
         }
@@ -2651,9 +2657,11 @@ async fn write_staged_db(
             let row_count = batch.num_rows() as u64;
             let dataset_rel_path = format!("nodes/{}", SchemaIR::dir_name(node_def.type_id));
             let dataset_path = path.join(&dataset_rel_path);
-            let dataset_version = write_lance_batch(&dataset_path, batch).await?;
+            write_lance_batch(&dataset_path, batch).await?;
             rebuild_node_scalar_indexes(&dataset_path, node_def).await?;
+            rebuild_node_text_indexes(&dataset_path, node_def).await?;
             rebuild_node_vector_indexes(&dataset_path, node_def).await?;
+            let dataset_version = latest_lance_dataset_version(&dataset_path).await?;
             dataset_entries.push(DatasetEntry {
                 type_id: node_def.type_id,
                 type_name: node_def.name.clone(),

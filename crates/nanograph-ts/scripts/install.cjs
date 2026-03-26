@@ -31,10 +31,22 @@ function bundledBinaryName() {
 
 const packageRoot = join(__dirname, '..')
 const bundledBinary = bundledBinaryName()
+const workspaceNanographManifest = join(packageRoot, '..', 'nanograph', 'Cargo.toml')
 
 if (bundledBinary && existsSync(join(packageRoot, bundledBinary))) {
   console.log(`Using bundled native binary ${bundledBinary}`)
   process.exit(0)
+}
+
+if (!existsSync(workspaceNanographManifest)) {
+  const targetLabel = bundledBinary ?? `${process.platform}-${process.arch}`
+  throw new Error(
+    [
+      `Missing bundled native binary for ${targetLabel}.`,
+      'This installed nanograph-db package is not self-contained: source rebuild requires the monorepo workspace, but ../nanograph is not present here.',
+      'Reinstall the package or publish a tarball with the correct bundled .node binary.',
+    ].join('\n'),
+  )
 }
 
 execFileSync(

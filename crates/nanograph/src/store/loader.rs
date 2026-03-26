@@ -20,7 +20,8 @@ mod jsonl;
 mod merge;
 
 pub(crate) use embeddings::{
-    EmbedSpec, EmbedValueRequest, collect_embed_specs, resolve_embedding_requests,
+    EmbedInput, EmbedSourceKind, EmbedSpec, EmbedValueRequest, collect_embed_specs,
+    resolve_embedding_requests,
 };
 pub(crate) use jsonl::{
     json_values_to_array, load_jsonl_reader_with_name_seed_at_path, parse_date32_literal,
@@ -50,24 +51,32 @@ pub(crate) async fn build_next_storage_for_load(
     mode: LoadMode,
 ) -> Result<LoadPlanResult> {
     let reader = Cursor::new(data_source.as_bytes());
-    build_next_storage_for_load_reader(db_path, existing, schema_ir, reader, mode).await
+    build_next_storage_for_load_reader(db_path, None, existing, schema_ir, reader, mode).await
 }
 
 pub(crate) async fn build_next_storage_for_load_reader<R: BufRead>(
     db_path: &Path,
+    source_base: Option<&Path>,
     existing: &DatasetAccumulator,
     schema_ir: &SchemaIR,
     reader: R,
     mode: LoadMode,
 ) -> Result<LoadPlanResult> {
     build_next_storage_for_load_reader_with_options(
-        db_path, existing, schema_ir, reader, mode, true,
+        db_path,
+        source_base,
+        existing,
+        schema_ir,
+        reader,
+        mode,
+        true,
     )
     .await
 }
 
 pub(crate) async fn build_next_storage_for_load_reader_with_options<R: BufRead>(
     db_path: &Path,
+    source_base: Option<&Path>,
     existing: &DatasetAccumulator,
     schema_ir: &SchemaIR,
     reader: R,
@@ -76,6 +85,7 @@ pub(crate) async fn build_next_storage_for_load_reader_with_options<R: BufRead>(
 ) -> Result<LoadPlanResult> {
     let internal = build_next_storage_for_load_reader_internal(
         db_path,
+        source_base,
         existing,
         schema_ir,
         reader,
@@ -90,6 +100,7 @@ pub(crate) async fn build_next_storage_for_load_reader_with_options<R: BufRead>(
 
 pub(crate) async fn build_next_storage_for_load_reader_internal<R: BufRead>(
     db_path: &Path,
+    source_base: Option<&Path>,
     existing: &DatasetAccumulator,
     schema_ir: &SchemaIR,
     reader: R,
@@ -119,14 +130,19 @@ pub(crate) async fn build_next_storage_for_load_reader_internal<R: BufRead>(
     };
 
     if embeddings::has_embedding_specs(schema_ir) {
-        let materialized_path =
-            embeddings::materialize_embeddings_for_load_to_tempfile(db_path, schema_ir, reader)
-                .await?;
+        let materialized_path = embeddings::materialize_embeddings_for_load_to_tempfile(
+            db_path,
+            source_base,
+            schema_ir,
+            reader,
+        )
+        .await?;
         let file = std::fs::File::open(&materialized_path)?;
         let buffered = std::io::BufReader::new(file);
         load_jsonl_reader_with_name_seed_at_path(
             &mut incoming_storage,
             db_path,
+            source_base,
             buffered,
             &key_props,
             key_seed.as_ref(),
@@ -136,6 +152,7 @@ pub(crate) async fn build_next_storage_for_load_reader_internal<R: BufRead>(
         load_jsonl_reader_with_name_seed_at_path(
             &mut incoming_storage,
             db_path,
+            source_base,
             reader,
             &key_props,
             key_seed.as_ref(),

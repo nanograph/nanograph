@@ -17,7 +17,8 @@ use nanograph::query::typecheck::{CheckedQuery, typecheck_query_decl};
 use nanograph::store::database::Database;
 
 use convert::{
-    js_object_to_param_map, parse_cleanup_options, parse_compact_options, parse_load_mode,
+    js_object_to_param_map, parse_cleanup_options, parse_compact_options, parse_embed_options,
+    parse_load_mode,
 };
 
 fn to_napi_err(e: NanoError) -> napi::Error {
@@ -71,6 +72,9 @@ fn prop_def_to_json(prop: &nanograph::schema_ir::PropDef) -> serde_json::Value {
     }
     if let Some(ref src) = prop.embed_source {
         obj["embedSource"] = serde_json::Value::String(src.clone());
+    }
+    if let Some(ref mime_prop) = prop.media_mime_prop {
+        obj["mediaMimeProp"] = serde_json::Value::String(mime_prop.clone());
     }
     if let Some(ref description) = prop.description {
         obj["description"] = serde_json::Value::String(description.clone());
@@ -302,6 +306,26 @@ impl JsDatabase {
         Ok(serde_json::json!({
             "nodeTypes": node_types,
             "edgeTypes": edge_types,
+        }))
+    }
+
+    /// Generate or backfill embeddings for @embed(...) properties.
+    ///
+    /// ```js
+    /// const result = await db.embed({ onlyNull: true });
+    /// ```
+    #[napi]
+    pub async fn embed(&self, options: Option<serde_json::Value>) -> Result<serde_json::Value> {
+        let opts = parse_embed_options(options.as_ref())?;
+        let db = self.db().await?;
+        let result = db.embed(opts).await.map_err(to_napi_err)?;
+        Ok(serde_json::json!({
+            "nodeTypesConsidered": result.node_types_considered,
+            "propertiesSelected": result.properties_selected,
+            "rowsSelected": result.rows_selected,
+            "embeddingsGenerated": result.embeddings_generated,
+            "reindexedTypes": result.reindexed_types,
+            "dryRun": result.dry_run,
         }))
     }
 
