@@ -1,0 +1,158 @@
+// ═══════════════════════════════════════════════════════════════════════════
+// Codebase Agent Workspace — JSONL Seed Data
+// Scenario: "Acme API" — a TypeScript API project with three agents working
+// concurrently on auth, billing, and refactoring tasks.
+// 36 nodes, 80 edges
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Agents (3) ────────────────────────────────────────────────
+{"type": "Agent", "data": {"slug": "agent-claude", "name": "Claude", "kind": "ai", "model": "claude-opus-4-6", "capabilities": ["refactoring", "testing", "documentation", "security"], "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"}}
+{"type": "Agent", "data": {"slug": "agent-devin", "name": "Devin", "kind": "ai", "model": "devin-2", "capabilities": ["feature-development", "frontend", "api-design"], "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"}}
+{"type": "Agent", "data": {"slug": "agent-sarah", "name": "Sarah", "kind": "human", "capabilities": ["architecture", "code-review", "database", "security"], "createdAt": "2026-01-01T00:00:00Z", "updatedAt": "2026-01-01T00:00:00Z"}}
+
+// ── Modules (4) ───────────────────────────────────────────────
+{"type": "Module", "data": {"slug": "mod-auth", "name": "auth", "path": "src/auth", "description": "Authentication and authorization module. Handles JWT tokens, session management, OAuth2 flows, and RBAC permission checks.", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-03-01T10:00:00Z"}}
+{"type": "Module", "data": {"slug": "mod-billing", "name": "billing", "path": "src/billing", "description": "Billing and subscription management. Stripe integration, usage metering, invoice generation, and plan enforcement.", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-03-01T10:00:00Z"}}
+{"type": "Module", "data": {"slug": "mod-api", "name": "api", "path": "src/api", "description": "REST API layer. Route definitions, request validation, rate limiting, and response serialization.", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-03-01T10:00:00Z"}}
+{"type": "Module", "data": {"slug": "mod-core", "name": "core", "path": "src/core", "description": "Shared core utilities. Database client, logger, config loader, error types, and middleware.", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-03-01T10:00:00Z"}}
+
+// ── Files (15) ────────────────────────────────────────────────
+{"type": "File", "data": {"slug": "file-auth-middleware", "path": "src/auth/middleware.ts", "language": "typescript", "content": "import { verify } from './jwt';\nimport { getPermissions } from './rbac';\nimport { AppError } from '../core/errors';\n\nexport function authMiddleware(requiredRole?: string) {\n  return async (req, res, next) => {\n    const token = req.headers.authorization?.replace('Bearer ', '');\n    if (!token) throw new AppError('UNAUTHORIZED', 401);\n    const claims = await verify(token);\n    if (requiredRole) {\n      const perms = await getPermissions(claims.sub);\n      if (!perms.includes(requiredRole)) throw new AppError('FORBIDDEN', 403);\n    }\n    req.user = claims;\n    next();\n  };\n}", "description": "Express middleware that validates JWT tokens and checks RBAC permissions. Guards API routes by extracting and verifying Bearer tokens from the Authorization header.", "size": 542, "hash": "a1b2c3d4", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-03-15T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-auth-jwt", "path": "src/auth/jwt.ts", "language": "typescript", "content": "import jwt from 'jsonwebtoken';\nimport { config } from '../core/config';\n\nexport async function sign(payload: object): Promise<string> {\n  return jwt.sign(payload, config.jwtSecret, { expiresIn: '1h' });\n}\n\nexport async function verify(token: string): Promise<JwtClaims> {\n  return jwt.verify(token, config.jwtSecret) as JwtClaims;\n}\n\nexport interface JwtClaims {\n  sub: string;\n  email: string;\n  iat: number;\n  exp: number;\n}", "description": "JWT token signing and verification using jsonwebtoken. Reads the secret from app config. Tokens expire after 1 hour.", "size": 423, "hash": "b2c3d4e5", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-02-01T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-auth-rbac", "path": "src/auth/rbac.ts", "language": "typescript", "content": "import { db } from '../core/db';\n\nexport async function getPermissions(userId: string): Promise<string[]> {\n  const rows = await db.query('SELECT role FROM user_roles WHERE user_id = $1', [userId]);\n  return rows.map(r => r.role);\n}\n\nexport async function hasPermission(userId: string, role: string): Promise<boolean> {\n  const perms = await getPermissions(userId);\n  return perms.includes(role);\n}", "description": "Role-based access control. Queries user roles from the database and provides permission checking helpers.", "size": 378, "hash": "c3d4e5f6", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-02-01T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-auth-oauth", "path": "src/auth/oauth.ts", "language": "typescript", "content": "import { sign } from './jwt';\nimport { config } from '../core/config';\nimport { db } from '../core/db';\n\nexport async function handleOAuthCallback(provider: string, code: string) {\n  const tokens = await exchangeCode(provider, code);\n  const profile = await fetchProfile(provider, tokens.access_token);\n  const user = await db.query('INSERT INTO users (email, name, provider) VALUES ($1, $2, $3) ON CONFLICT (email) DO UPDATE SET name = $2 RETURNING *', [profile.email, profile.name, provider]);\n  return sign({ sub: user[0].id, email: user[0].email });\n}", "description": "OAuth2 callback handler. Exchanges authorization codes for tokens, fetches user profiles, upserts users, and returns a signed JWT.", "size": 512, "hash": "d4e5f6a7", "createdAt": "2026-02-01T10:00:00Z", "updatedAt": "2026-02-01T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-billing-stripe", "path": "src/billing/stripe.ts", "language": "typescript", "content": "import Stripe from 'stripe';\nimport { config } from '../core/config';\nimport { logger } from '../core/logger';\n\nconst stripe = new Stripe(config.stripeSecretKey);\n\nexport async function createSubscription(customerId: string, priceId: string) {\n  logger.info('Creating subscription', { customerId, priceId });\n  return stripe.subscriptions.create({ customer: customerId, items: [{ price: priceId }] });\n}\n\nexport async function cancelSubscription(subscriptionId: string) {\n  return stripe.subscriptions.cancel(subscriptionId);\n}", "description": "Stripe SDK wrapper for subscription lifecycle management. Creates and cancels subscriptions, logs operations.", "size": 498, "hash": "e5f6a7b8", "createdAt": "2026-01-20T10:00:00Z", "updatedAt": "2026-03-01T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-billing-meter", "path": "src/billing/meter.ts", "language": "typescript", "content": "import { db } from '../core/db';\nimport { logger } from '../core/logger';\n\nexport async function recordUsage(orgId: string, metric: string, quantity: number) {\n  await db.query('INSERT INTO usage_events (org_id, metric, quantity, ts) VALUES ($1, $2, $3, NOW())', [orgId, metric, quantity]);\n  logger.debug('Usage recorded', { orgId, metric, quantity });\n}\n\nexport async function getUsageSummary(orgId: string, since: Date) {\n  return db.query('SELECT metric, SUM(quantity) as total FROM usage_events WHERE org_id = $1 AND ts >= $2 GROUP BY metric', [orgId, since]);\n}", "description": "Usage metering for billing. Records per-org usage events to the database and provides aggregation queries for invoice generation.", "size": 521, "hash": "f6a7b8c9", "createdAt": "2026-01-20T10:00:00Z", "updatedAt": "2026-03-01T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-billing-plans", "path": "src/billing/plans.ts", "language": "typescript", "content": "import { db } from '../core/db';\n\nexport const PLANS = {\n  starter: { apiCalls: 10_000, seats: 5 },\n  pro: { apiCalls: 100_000, seats: 25 },\n  enterprise: { apiCalls: Infinity, seats: Infinity },\n} as const;\n\nexport async function enforcePlanLimits(orgId: string, metric: string) {\n  const org = await db.query('SELECT plan FROM orgs WHERE id = $1', [orgId]);\n  const limits = PLANS[org[0].plan];\n  // TODO: check usage against limits\n}", "description": "Plan definitions and limit enforcement. Defines starter/pro/enterprise tiers and checks usage against plan quotas.", "size": 412, "hash": "a7b8c9d0", "createdAt": "2026-02-01T10:00:00Z", "updatedAt": "2026-02-01T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-api-routes", "path": "src/api/routes.ts", "language": "typescript", "content": "import { Router } from 'express';\nimport { authMiddleware } from '../auth/middleware';\nimport { createSubscription } from '../billing/stripe';\nimport { recordUsage } from '../billing/meter';\nimport { rateLimiter } from './rate-limiter';\n\nconst router = Router();\n\nrouter.use(rateLimiter());\n\nrouter.post('/subscribe', authMiddleware('billing:write'), async (req, res) => {\n  const sub = await createSubscription(req.body.customerId, req.body.priceId);\n  res.json(sub);\n});\n\nrouter.post('/usage', authMiddleware(), async (req, res) => {\n  await recordUsage(req.user.orgId, req.body.metric, req.body.quantity);\n  res.json({ ok: true });\n});\n\nexport { router };", "description": "Main API router. Mounts auth middleware and rate limiting on all routes. Exposes subscription and usage endpoints.", "size": 612, "hash": "b8c9d0e1", "createdAt": "2026-01-20T10:00:00Z", "updatedAt": "2026-03-10T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-api-rate-limiter", "path": "src/api/rate-limiter.ts", "language": "typescript", "content": "import { config } from '../core/config';\nimport { AppError } from '../core/errors';\n\nconst requests = new Map<string, number[]>();\n\nexport function rateLimiter(windowMs = 60000, max = 100) {\n  return (req, res, next) => {\n    const key = req.ip;\n    const now = Date.now();\n    const hits = (requests.get(key) || []).filter(t => t > now - windowMs);\n    if (hits.length >= max) throw new AppError('RATE_LIMITED', 429);\n    hits.push(now);\n    requests.set(key, hits);\n    next();\n  };\n}", "description": "In-memory sliding window rate limiter. Tracks request timestamps per IP and throws 429 when the window limit is exceeded.", "size": 445, "hash": "c9d0e1f2", "createdAt": "2026-01-20T10:00:00Z", "updatedAt": "2026-01-20T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-core-db", "path": "src/core/db.ts", "language": "typescript", "content": "import { Pool } from 'pg';\nimport { config } from './config';\n\nexport const db = new Pool({ connectionString: config.databaseUrl });\n", "description": "PostgreSQL connection pool using pg. Single shared pool instance configured from app config.", "size": 132, "hash": "d0e1f2a3", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-01-15T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-core-config", "path": "src/core/config.ts", "language": "typescript", "content": "export const config = {\n  port: parseInt(process.env.PORT || '3000'),\n  databaseUrl: process.env.DATABASE_URL!,\n  jwtSecret: process.env.JWT_SECRET!,\n  stripeSecretKey: process.env.STRIPE_SECRET_KEY!,\n  redisUrl: process.env.REDIS_URL,\n};", "description": "Application configuration loaded from environment variables. Central config object used across all modules.", "size": 248, "hash": "e1f2a3b4", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-03-01T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-core-errors", "path": "src/core/errors.ts", "language": "typescript", "content": "export class AppError extends Error {\n  constructor(public code: string, public statusCode: number, message?: string) {\n    super(message || code);\n  }\n}", "description": "Custom error class with HTTP status codes. Used across all modules for consistent error handling.", "size": 168, "hash": "f2a3b4c5", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-01-15T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-core-logger", "path": "src/core/logger.ts", "language": "typescript", "content": "import pino from 'pino';\nexport const logger = pino({ level: process.env.LOG_LEVEL || 'info' });", "description": "Structured JSON logger using pino. Log level configurable via environment variable.", "size": 98, "hash": "a3b4c5d6", "createdAt": "2026-01-15T10:00:00Z", "updatedAt": "2026-01-15T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-auth-middleware-test", "path": "src/auth/middleware.test.ts", "language": "typescript", "content": "import { authMiddleware } from './middleware';\nimport { verify } from './jwt';\n\njest.mock('./jwt');\n\ndescribe('authMiddleware', () => {\n  it('rejects requests without token', async () => {\n    const mw = authMiddleware();\n    const req = { headers: {} };\n    await expect(mw(req, {}, () => {})).rejects.toThrow('UNAUTHORIZED');\n  });\n\n  it('checks role permissions', async () => {\n    (verify as jest.Mock).mockResolvedValue({ sub: 'user-1' });\n    const mw = authMiddleware('admin');\n    // ...\n  });\n});", "description": "Unit tests for auth middleware. Tests token validation and RBAC permission checking.", "size": 412, "hash": "b4c5d6e7", "createdAt": "2026-02-15T10:00:00Z", "updatedAt": "2026-03-15T10:00:00Z"}}
+{"type": "File", "data": {"slug": "file-billing-webhook", "path": "src/billing/webhook.ts", "language": "typescript", "content": "import Stripe from 'stripe';\nimport { config } from '../core/config';\nimport { db } from '../core/db';\nimport { logger } from '../core/logger';\n\nexport async function handleWebhook(payload: Buffer, signature: string) {\n  const event = Stripe.webhooks.constructEvent(payload, signature, config.stripeWebhookSecret);\n  logger.info('Stripe webhook received', { type: event.type });\n  switch (event.type) {\n    case 'invoice.paid': await markInvoicePaid(event.data.object); break;\n    case 'customer.subscription.deleted': await handleChurn(event.data.object); break;\n  }\n}", "description": "Stripe webhook handler. Verifies webhook signatures and processes invoice and subscription lifecycle events.", "size": 498, "hash": "c5d6e7f8", "createdAt": "2026-03-01T10:00:00Z", "updatedAt": "2026-03-10T10:00:00Z"}}
+
+// ── Constraints (5) ───────────────────────────────────────────
+{"type": "Constraint", "data": {"slug": "con-typescript", "name": "TypeScript strict", "kind": "typecheck", "rule": "tsc --strict --noEmit", "severity": "error", "createdAt": "2026-01-15T10:00:00Z"}}
+{"type": "Constraint", "data": {"slug": "con-eslint", "name": "ESLint", "kind": "lint", "rule": "eslint --max-warnings 0", "severity": "error", "createdAt": "2026-01-15T10:00:00Z"}}
+{"type": "Constraint", "data": {"slug": "con-prettier", "name": "Prettier", "kind": "format", "rule": "prettier --check", "severity": "warning", "createdAt": "2026-01-15T10:00:00Z"}}
+{"type": "Constraint", "data": {"slug": "con-jest", "name": "Jest tests", "kind": "test", "rule": "jest --passWithNoTests", "severity": "error", "createdAt": "2026-01-15T10:00:00Z"}}
+{"type": "Constraint", "data": {"slug": "con-no-secrets", "name": "No hardcoded secrets", "kind": "security", "rule": "grep -rn 'sk_live\\|sk_test\\|password\\s*=' --include='*.ts'", "severity": "error", "createdAt": "2026-01-15T10:00:00Z"}}
+
+// ── Tasks (4) ─────────────────────────────────────────────────
+{"type": "Task", "data": {"slug": "task-refresh-tokens", "title": "Add refresh token rotation", "description": "Implement refresh token rotation to replace the current 1-hour JWT expiry. Store refresh tokens in the database with automatic rotation on use. Revoke all tokens on password change.", "status": "in_progress", "branch": "feat/refresh-tokens", "priority": "high", "createdAt": "2026-03-15T09:00:00Z", "updatedAt": "2026-03-18T14:00:00Z"}}
+{"type": "Task", "data": {"slug": "task-usage-alerts", "title": "Usage threshold alerts", "description": "Send email alerts when an organization reaches 80% and 100% of their plan's API call quota. Check usage on every API call and batch alert delivery.", "status": "in_progress", "branch": "feat/usage-alerts", "priority": "medium", "createdAt": "2026-03-16T10:00:00Z", "updatedAt": "2026-03-18T10:00:00Z"}}
+{"type": "Task", "data": {"slug": "task-redis-rate-limiter", "title": "Migrate rate limiter to Redis", "description": "Replace the in-memory rate limiter with Redis-backed sliding window. The current Map-based implementation doesn't work across multiple server instances and leaks memory.", "status": "in_review", "branch": "refactor/redis-rate-limiter", "priority": "high", "createdAt": "2026-03-14T08:00:00Z", "updatedAt": "2026-03-19T16:00:00Z"}}
+{"type": "Task", "data": {"slug": "task-webhook-idempotency", "title": "Add idempotency to Stripe webhooks", "description": "Stripe can deliver webhooks multiple times. Add an idempotency key check using the event ID to prevent duplicate processing of invoice.paid and subscription.deleted events.", "status": "open", "branch": "fix/webhook-idempotency", "priority": "medium", "createdAt": "2026-03-18T11:00:00Z", "updatedAt": "2026-03-18T11:00:00Z"}}
+
+// ── Decisions (3) — Append-only ───────────────────────────────
+{"type": "Decision", "data": {"slug": "dec-jwt-not-sessions", "summary": "Use stateless JWTs instead of server-side sessions", "reasoning": "We chose stateless JWTs over server-side sessions because our API is consumed by mobile clients and third-party integrations that can't maintain cookies. The trade-off is that we can't revoke individual tokens — logout just means the client deletes the token. This is acceptable for our current scale but we should revisit if we need instant revocation for compliance reasons.", "decidedAt": "2026-01-15T10:00:00Z", "createdAt": "2026-01-15T10:00:00Z"}}
+{"type": "Decision", "data": {"slug": "dec-stripe-only", "summary": "Use Stripe as sole payment processor", "reasoning": "Evaluated Stripe vs building on top of multiple processors. Stripe's subscription and metering APIs cover our needs without abstraction layers. The vendor lock-in risk is real but acceptable — migrating payment processors is painful regardless of abstraction. The engineering time saved by not building a payment abstraction layer is better spent on product features.", "decidedAt": "2026-01-18T10:00:00Z", "createdAt": "2026-01-18T10:00:00Z"}}
+{"type": "Decision", "data": {"slug": "dec-in-memory-rate-limiter", "summary": "Ship in-memory rate limiter as v1, migrate to Redis later", "reasoning": "The in-memory sliding window rate limiter is a known temporary solution. It doesn't work across multiple server instances and will leak memory over time. We shipped it because we needed rate limiting before launch and Redis wasn't in our infrastructure yet. Now that we're scaling to multiple instances, the Redis migration is due. The Map-based approach was explicitly marked as tech debt.", "decidedAt": "2026-01-20T10:00:00Z", "createdAt": "2026-01-20T10:00:00Z"}}
+
+// ── Reviews (2) — Append-only ─────────────────────────────────
+{"type": "Review", "data": {"slug": "rev-rate-limiter-sarah", "outcome": "changes_requested", "comment": "The Redis implementation looks solid but you're not handling the case where Redis is unavailable. Add a fallback to in-memory with a degraded mode log warning. Also add a TTL to the Redis keys so we don't leak memory there either.", "createdAt": "2026-03-19T16:00:00Z"}}
+{"type": "Review", "data": {"slug": "rev-rate-limiter-claude", "outcome": "approved", "comment": "LGTM after the fallback changes. The sliding window algorithm is correct and the Redis key structure is clean. TTL matches the window size.", "createdAt": "2026-03-20T09:00:00Z"}}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EDGES (80)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// ── Module contains File (15) ─────────────────────────────────
+{"edge": "Contains", "from": "mod-auth", "to": "file-auth-middleware"}
+{"edge": "Contains", "from": "mod-auth", "to": "file-auth-jwt"}
+{"edge": "Contains", "from": "mod-auth", "to": "file-auth-rbac"}
+{"edge": "Contains", "from": "mod-auth", "to": "file-auth-oauth"}
+{"edge": "Contains", "from": "mod-auth", "to": "file-auth-middleware-test"}
+{"edge": "Contains", "from": "mod-billing", "to": "file-billing-stripe"}
+{"edge": "Contains", "from": "mod-billing", "to": "file-billing-meter"}
+{"edge": "Contains", "from": "mod-billing", "to": "file-billing-plans"}
+{"edge": "Contains", "from": "mod-billing", "to": "file-billing-webhook"}
+{"edge": "Contains", "from": "mod-api", "to": "file-api-routes"}
+{"edge": "Contains", "from": "mod-api", "to": "file-api-rate-limiter"}
+{"edge": "Contains", "from": "mod-core", "to": "file-core-db"}
+{"edge": "Contains", "from": "mod-core", "to": "file-core-config"}
+{"edge": "Contains", "from": "mod-core", "to": "file-core-errors"}
+{"edge": "Contains", "from": "mod-core", "to": "file-core-logger"}
+
+// ── File imports File (25) ────────────────────────────────────
+{"edge": "Imports", "from": "file-auth-middleware", "to": "file-auth-jwt", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-auth-middleware", "to": "file-auth-rbac", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-auth-middleware", "to": "file-core-errors", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-auth-jwt", "to": "file-core-config", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-auth-rbac", "to": "file-core-db", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-auth-oauth", "to": "file-auth-jwt", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-auth-oauth", "to": "file-core-config", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-auth-oauth", "to": "file-core-db", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-billing-stripe", "to": "file-core-config", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-billing-stripe", "to": "file-core-logger", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-billing-meter", "to": "file-core-db", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-billing-meter", "to": "file-core-logger", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-billing-plans", "to": "file-core-db", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-billing-webhook", "to": "file-core-config", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-billing-webhook", "to": "file-core-db", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-billing-webhook", "to": "file-core-logger", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-api-routes", "to": "file-auth-middleware", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-api-routes", "to": "file-billing-stripe", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-api-routes", "to": "file-billing-meter", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-api-routes", "to": "file-api-rate-limiter", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-api-rate-limiter", "to": "file-core-config", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-api-rate-limiter", "to": "file-core-errors", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-core-db", "to": "file-core-config", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-auth-middleware-test", "to": "file-auth-middleware", "data": {"kind": "static"}}
+{"edge": "Imports", "from": "file-auth-middleware-test", "to": "file-auth-jwt", "data": {"kind": "static"}}
+
+// ── Agent assigned Task (3) ───────────────────────────────────
+{"edge": "Assigned", "from": "agent-claude", "to": "task-refresh-tokens"}
+{"edge": "Assigned", "from": "agent-devin", "to": "task-usage-alerts"}
+{"edge": "Assigned", "from": "agent-claude", "to": "task-redis-rate-limiter"}
+
+// ── Task modifies File (8) ────────────────────────────────────
+{"edge": "Modifies", "from": "task-refresh-tokens", "to": "file-auth-jwt", "data": {"changeType": "updated"}}
+{"edge": "Modifies", "from": "task-refresh-tokens", "to": "file-auth-middleware", "data": {"changeType": "updated"}}
+{"edge": "Modifies", "from": "task-refresh-tokens", "to": "file-core-db", "data": {"changeType": "updated"}}
+{"edge": "Modifies", "from": "task-usage-alerts", "to": "file-billing-meter", "data": {"changeType": "updated"}}
+{"edge": "Modifies", "from": "task-usage-alerts", "to": "file-billing-plans", "data": {"changeType": "updated"}}
+{"edge": "Modifies", "from": "task-usage-alerts", "to": "file-api-routes", "data": {"changeType": "updated"}}
+{"edge": "Modifies", "from": "task-redis-rate-limiter", "to": "file-api-rate-limiter", "data": {"changeType": "updated"}}
+{"edge": "Modifies", "from": "task-redis-rate-limiter", "to": "file-core-config", "data": {"changeType": "updated"}}
+
+// ── Agent expert Module (5) ───────────────────────────────────
+{"edge": "Expert", "from": "agent-sarah", "to": "mod-auth", "data": {"confidence": "high"}}
+{"edge": "Expert", "from": "agent-sarah", "to": "mod-core", "data": {"confidence": "high"}}
+{"edge": "Expert", "from": "agent-claude", "to": "mod-api", "data": {"confidence": "medium"}}
+{"edge": "Expert", "from": "agent-devin", "to": "mod-billing", "data": {"confidence": "high"}}
+{"edge": "Expert", "from": "agent-sarah", "to": "mod-billing", "data": {"confidence": "medium"}}
+
+// ── Constraint governs File (11) ──────────────────────────────
+{"edge": "Governs", "from": "con-typescript", "to": "file-auth-middleware"}
+{"edge": "Governs", "from": "con-typescript", "to": "file-auth-jwt"}
+{"edge": "Governs", "from": "con-typescript", "to": "file-billing-stripe"}
+{"edge": "Governs", "from": "con-typescript", "to": "file-api-routes"}
+{"edge": "Governs", "from": "con-typescript", "to": "file-api-rate-limiter"}
+{"edge": "Governs", "from": "con-eslint", "to": "file-auth-middleware"}
+{"edge": "Governs", "from": "con-eslint", "to": "file-api-routes"}
+{"edge": "Governs", "from": "con-jest", "to": "file-auth-middleware-test"}
+{"edge": "Governs", "from": "con-no-secrets", "to": "file-core-config"}
+{"edge": "Governs", "from": "con-no-secrets", "to": "file-billing-stripe"}
+{"edge": "Governs", "from": "con-no-secrets", "to": "file-billing-webhook"}
+
+// ── Decision edges (8) ───────────────────────────────────────
+{"edge": "Decides", "from": "dec-jwt-not-sessions", "to": "file-auth-jwt"}
+{"edge": "Decides", "from": "dec-jwt-not-sessions", "to": "file-auth-middleware"}
+{"edge": "Decides", "from": "dec-stripe-only", "to": "file-billing-stripe"}
+{"edge": "Decides", "from": "dec-stripe-only", "to": "file-billing-webhook"}
+{"edge": "Decides", "from": "dec-in-memory-rate-limiter", "to": "file-api-rate-limiter"}
+{"edge": "MadeBy", "from": "dec-jwt-not-sessions", "to": "agent-sarah"}
+{"edge": "MadeBy", "from": "dec-stripe-only", "to": "agent-sarah"}
+{"edge": "MadeBy", "from": "dec-in-memory-rate-limiter", "to": "agent-sarah"}
+
+// ── Review edges (4) ─────────────────────────────────────────
+{"edge": "Reviews", "from": "rev-rate-limiter-sarah", "to": "task-redis-rate-limiter"}
+{"edge": "ReviewedBy", "from": "rev-rate-limiter-sarah", "to": "agent-sarah"}
+{"edge": "Reviews", "from": "rev-rate-limiter-claude", "to": "task-redis-rate-limiter"}
+{"edge": "ReviewedBy", "from": "rev-rate-limiter-claude", "to": "agent-claude"}
+
+// ── Task references (1) ──────────────────────────────────────
+{"edge": "References", "from": "task-refresh-tokens", "to": "task-redis-rate-limiter", "data": {"kind": "related_to"}}

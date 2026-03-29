@@ -1,0 +1,131 @@
+// Codebase Agent Workspace — NanoGraph Schema
+// Multi-agent code collaboration graph for AI-native development.
+// 7 node types, 11 edge types.
+//
+// Models the "database as a git" paradigm: files as structured nodes,
+// agents working on branches, decisions as organizational memory,
+// and import relationships as first-class edges.
+//
+// Inspired by: gitgres (Andrew Nesbitt), Sam Hogan's agent workspace thesis.
+// Key principle: store full file content + metadata, not chunks or embeddings.
+// Agent tool calls (read, write, grep) become graph operations.
+
+// ═══════════════════════════════════════════════════════════════
+// POINTER NODES (Mutable)
+// Updated in place. All carry: slug @key, createdAt, updatedAt
+// ═══════════════════════════════════════════════════════════════
+
+node Module @description("A logical grouping of files — package, directory, or namespace.") {
+    slug: String @key
+    name: String @unique
+    path: String @description("Directory path relative to project root.")
+    description: String? @description("Human-readable summary of this module's purpose.")
+    descriptionEmbedding: Vector(8) @embed(description) @index @description("Semantic embedding for module search.")
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node File @description("A source file with full content. The atomic unit agents read and write.") @instruction("Store complete file content, not chunks or diffs. Agent read/write tool calls map directly to File node lookups and mutations.") {
+    slug: String @key
+    path: String @unique @description("Unique file path relative to project root.")
+    language: enum(css, go, html, javascript, json, markdown, other, python, rust, shell, sql, toml, typescript, yaml)
+    content: String @description("Full file content. Never chunked or truncated.")
+    description: String? @description("Human-readable summary of what this file does.")
+    descriptionEmbedding: Vector(8) @embed(description) @index @description("Semantic embedding for file search.")
+    size: I32 @description("Content length in bytes.")
+    hash: String @description("Content hash for change detection.")
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Agent @description("A human or AI agent that performs work on the codebase.") {
+    slug: String @key
+    name: String @unique
+    kind: enum(ai, human)
+    model: String? @description("For AI agents, the model identifier.")
+    capabilities: [String]? @description("What this agent is good at: testing, refactoring, frontend, etc.")
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Task @description("A unit of work performed on a branch. Maps 1:1 to a nanograph branch.") @instruction("Each Task corresponds to a nanograph branch. The branch field stores the branch name. When querying what an agent changed, traverse Task → Modifies → File.") {
+    slug: String @key
+    title: String
+    description: String? @description("What this task aims to accomplish.")
+    descriptionEmbedding: Vector(8) @embed(description) @index @description("Semantic embedding for task search.")
+    status: enum(abandoned, in_progress, in_review, merged, open)
+    branch: String @description("The nanograph branch name where this work happens.")
+    priority: enum(critical, high, low, medium)?
+    createdAt: DateTime
+    updatedAt: DateTime
+}
+
+node Constraint @description("A rule that must pass before a branch can merge.") @instruction("Constraints govern files. Before merging a Task's branch, query all Constraints that Govern any File the Task Modifies. All must pass.") {
+    slug: String @key
+    name: String @unique
+    kind: enum(format, lint, review, security, test, typecheck)
+    rule: String @description("The constraint definition — a command, pattern, or policy.")
+    severity: enum(error, info, warning)
+    createdAt: DateTime
+}
+
+// ═══════════════════════════════════════════════════════════════
+// APPEND-ONLY NODES (Immutable)
+// Never overwritten. Corrections create new records.
+// All carry: slug @key, createdAt (no updatedAt)
+// ═══════════════════════════════════════════════════════════════
+
+node Decision @description("Append-only record of why something was designed or changed a certain way.") @instruction("Never overwrite decisions. They are organizational memory. Embed reasoning for semantic search: 'why did we choose this approach?'") {
+    slug: String @key
+    summary: String @description("One-line summary of the decision.")
+    reasoning: String @description("Detailed rationale — the part worth remembering.")
+    reasoningEmbedding: Vector(8) @embed(reasoning) @index @description("Semantic embedding for decision search.")
+    decidedAt: DateTime
+    createdAt: DateTime
+}
+
+node Review @description("A review verdict on a task branch. Append-only — each review round creates a new record.") {
+    slug: String @key
+    outcome: enum(approved, blocked, changes_requested)
+    comment: String? @description("Review feedback or approval note.")
+    createdAt: DateTime
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EDGES — Structure
+// ═══════════════════════════════════════════════════════════════
+
+edge Contains: Module -> File @description("A module contains a file.")
+
+edge Imports: File -> File @description("Source file imports or depends on target file.") @instruction("Maintain on write: when an agent modifies a file's imports, update these edges. Enables blast radius queries.") {
+    kind: enum(dynamic, static, type_only)?
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EDGES — Work
+// ═══════════════════════════════════════════════════════════════
+
+edge Assigned: Agent -> Task @description("Agent is assigned to work on a task.")
+
+edge Modifies: Task -> File @description("Task modifies this file on its branch.") {
+    changeType: enum(created, deleted, updated)
+}
+
+edge Expert: Agent -> Module @description("Agent has expertise in this module. Used for review routing.") {
+    confidence: enum(high, low, medium)
+}
+
+edge Governs: Constraint -> File @description("This constraint must pass for this file.")
+
+// ═══════════════════════════════════════════════════════════════
+// EDGES — Collaboration
+// ═══════════════════════════════════════════════════════════════
+
+edge Decides: Decision -> File @description("This decision explains a design choice in this file.")
+edge MadeBy: Decision -> Agent @description("Who made or proposed this decision.")
+edge Reviews: Review -> Task @description("Review verdict on a task's branch.")
+edge ReviewedBy: Review -> Agent @description("Who performed the review.")
+
+edge References: Task -> Task @description("Task references or depends on another task.") {
+    kind: enum(blocks, depends_on, related_to)
+}
