@@ -1,6 +1,6 @@
 v1.1.1
 
-- Recommended stable release over `v1.1.0`. `v1.1.1` keeps the same feature set and fixes the SDK media test harness so CI and release smoke tests pass cleanly.
+- Historical patch release. `v1.1.1` is superseded by `v1.1.2` as the canonical stable release. It kept the `v1.1.0` feature set and fixed the SDK media test harness so CI and release smoke tests passed cleanly.
 
 - Added external media-node support for multimodal workflows:
   - `@media_uri(mime)` for external media URIs
