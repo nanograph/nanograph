@@ -6,10 +6,17 @@ use reqwest::Client;
 use serde::Deserialize;
 use tokio::time::sleep;
 
+#[cfg(feature = "local-embed")]
+use std::sync::Arc;
+
 use crate::error::{NanoError, Result};
+#[cfg(feature = "local-embed")]
+use crate::embedding_local::LocalEmbeddingModel;
 
 const DEFAULT_OPENAI_EMBED_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_GEMINI_EMBED_MODEL: &str = "gemini-embedding-2-preview";
+#[cfg(feature = "local-embed")]
+const DEFAULT_LOCAL_EMBED_MODEL: &str = "hf:sentence-transformers/all-MiniLM-L6-v2";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
@@ -24,6 +31,8 @@ const GEMINI_PDF_MAX_PAGES: usize = 6;
 enum EmbeddingProvider {
     OpenAi,
     Gemini,
+    #[cfg(feature = "local-embed")]
+    Local,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,6 +87,8 @@ impl EmbeddingTransport {
             Self::Mock => "Mock",
             Self::OpenAi { .. } => "OpenAI",
             Self::Gemini { .. } => "Gemini",
+            #[cfg(feature = "local-embed")]
+            Self::Local { .. } => "Local",
         }
     }
 
@@ -94,6 +105,11 @@ impl EmbeddingTransport {
                 "{} embeddings are text-only; media embeddings are not supported",
                 self.provider_name()
             )),
+            #[cfg(feature = "local-embed")]
+            Self::Local { .. } => NanoError::Execution(
+                "local ONNX embeddings are text-only; media embeddings are not supported"
+                    .to_string(),
+            ),
         }
     }
 }
@@ -110,6 +126,10 @@ enum EmbeddingTransport {
         api_key: String,
         base_url: String,
         http: Client,
+    },
+    #[cfg(feature = "local-embed")]
+    Local {
+        model: Arc<LocalEmbeddingModel>,
     },
 }
 
@@ -240,6 +260,28 @@ impl EmbeddingClient {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         let provider = infer_embedding_provider(configured_model.as_deref())?;
+
+        #[cfg(feature = "local-embed")]
+        if provider == EmbeddingProvider::Local {
+            let repo_id = configured_model
+                .as_deref()
+                .and_then(crate::embedding_local::parse_hf_model_id)
+                .ok_or_else(|| {
+                    NanoError::Execution(
+                        "local embedding provider requires NANOGRAPH_EMBED_MODEL=hf:<org>/<repo>"
+                            .to_string(),
+                    )
+                })?;
+            let model_arc = LocalEmbeddingModel::load(repo_id)?;
+            let model_name = model_arc.model_name().to_string();
+            return Ok(Self {
+                model: model_name,
+                retry_attempts,
+                retry_backoff_ms,
+                transport: EmbeddingTransport::Local { model: model_arc },
+            });
+        }
+
         let model =
             configured_model.unwrap_or_else(|| default_model_for_provider(provider).to_string());
 
@@ -278,6 +320,8 @@ impl EmbeddingClient {
                     http,
                 }
             }
+            #[cfg(feature = "local-embed")]
+            EmbeddingProvider::Local => unreachable!("handled above"),
         };
 
         Ok(Self {
@@ -348,6 +392,24 @@ impl EmbeddingClient {
                 self.embed_texts_gemini_with_retry(inputs, expected_dim, role)
                     .await
             }
+            #[cfg(feature = "local-embed")]
+            EmbeddingTransport::Local { model } => {
+                let model_dim = model.dim();
+                if model_dim != expected_dim {
+                    return Err(NanoError::Execution(format!(
+                        "local embedding model produces {}-d vectors but schema declares Vector({}); \
+                         use a model whose output dimension matches or change the schema",
+                        model_dim, expected_dim
+                    )));
+                }
+                let model = model.clone();
+                let inputs = inputs.to_vec();
+                tokio::task::spawn_blocking(move || model.embed_texts(&inputs))
+                    .await
+                    .map_err(|e| {
+                        NanoError::Execution(format!("local embedding task failed: {}", e))
+                    })?
+            }
         }
     }
 
@@ -394,6 +456,8 @@ impl EmbeddingClient {
                 self.embed_media_gemini_with_retry(inputs, expected_dim, role)
                     .await
             }
+            #[cfg(feature = "local-embed")]
+            EmbeddingTransport::Local { .. } => unreachable!("local transport is rejected"),
         }
     }
 
@@ -434,6 +498,10 @@ impl EmbeddingClient {
             EmbeddingTransport::Mock => unreachable!("mock transport should not call OpenAI"),
             EmbeddingTransport::Gemini { .. } => {
                 unreachable!("gemini transport should not call OpenAI")
+            }
+            #[cfg(feature = "local-embed")]
+            EmbeddingTransport::Local { .. } => {
+                unreachable!("local transport should not call OpenAI")
             }
         };
 
@@ -880,11 +948,24 @@ fn infer_embedding_provider(configured_model: Option<&str>) -> Result<EmbeddingP
         return match provider.as_str() {
             "openai" => Ok(EmbeddingProvider::OpenAi),
             "gemini" => Ok(EmbeddingProvider::Gemini),
+            #[cfg(feature = "local-embed")]
+            "local" => Ok(EmbeddingProvider::Local),
+            #[cfg(not(feature = "local-embed"))]
+            "local" => Err(NanoError::Execution(
+                "embedding provider `local` requires the `local-embed` feature flag \
+                 (rebuild with `cargo build --features local-embed`)"
+                    .to_string(),
+            )),
             other => Err(NanoError::Execution(format!(
-                "unsupported embedding provider `{}` (supported: openai, gemini)",
+                "unsupported embedding provider `{}` (supported: openai, gemini, local)",
                 other
             ))),
         };
+    }
+
+    #[cfg(feature = "local-embed")]
+    if configured_model.is_some_and(|m| crate::embedding_local::parse_hf_model_id(m).is_some()) {
+        return Ok(EmbeddingProvider::Local);
     }
 
     if configured_model.is_some_and(|model| model.starts_with("gemini-")) {
@@ -901,6 +982,8 @@ fn default_model_for_provider(provider: EmbeddingProvider) -> &'static str {
     match provider {
         EmbeddingProvider::OpenAi => DEFAULT_OPENAI_EMBED_MODEL,
         EmbeddingProvider::Gemini => DEFAULT_GEMINI_EMBED_MODEL,
+        #[cfg(feature = "local-embed")]
+        EmbeddingProvider::Local => DEFAULT_LOCAL_EMBED_MODEL,
     }
 }
 

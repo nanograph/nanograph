@@ -1,5 +1,7 @@
 mod catalog;
 mod embedding;
+#[cfg(feature = "local-embed")]
+mod embedding_local;
 pub mod error;
 mod ir;
 pub mod json_output;

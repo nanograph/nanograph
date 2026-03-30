@@ -11,6 +11,9 @@ readme = "../../README.md"
 name = "nanograph"
 path = "src/main.rs"
 
+[features]
+local-embed = ["nanograph/local-embed"]
+
 [dependencies]
 nanograph = { path = "../nanograph", version = "1.1.2" }
 arrow-array = { workspace = true }

@@ -42,6 +42,14 @@ base64 = "0.22"
 sha2 = "0.10"
 url = "2"
 
+# Optional: local ONNX embedding runtime
+tract-onnx = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
+
+[features]
+local-embed = ["dep:tract-onnx", "dep:tokenizers", "dep:hf-hub"]
+
 [dev-dependencies]
 tokio = { workspace = true }
 criterion = { workspace = true }

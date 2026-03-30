@@ -342,7 +342,7 @@ impl LoadedConfig {
         let embedding = &self.settings.embedding;
         let provider = trim_nonempty(embedding.provider.as_deref()).unwrap_or("openai");
         match provider {
-            "openai" | "gemini" => {
+            "openai" | "gemini" | "local" => {
                 set_if_missing(
                     &mut exists,
                     &mut set,
@@ -357,7 +357,7 @@ impl LoadedConfig {
             }
             other => {
                 return Err(eyre!(
-                    "unsupported embedding.provider `{}` (supported: openai, gemini, mock)",
+                    "unsupported embedding.provider `{}` (supported: openai, gemini, local, mock)",
                     other
                 ));
             }

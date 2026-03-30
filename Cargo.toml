@@ -51,6 +51,9 @@ tempfile = "3"
 ahash = "0.8"
 ariadne = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tract-onnx = "0.22"
+tokenizers = { version = "0.22", default-features = false, features = ["fancy-regex"] }
+hf-hub = { version = "0.5", default-features = false, features = ["ureq"] }
 napi = { version = "2", features = ["async", "serde-json"] }
 napi-derive = "2"
 criterion = "0.5"
