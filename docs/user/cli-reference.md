@@ -227,26 +227,47 @@ If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
 
 ### `changes`
 
-Read commit-gated CDC rows from the authoritative JSONL log.
+Read committed graph changes.
 
 ```bash
-nanograph changes [--db <db_path>] [--since <db_version> | --from <db_version> --to <db_version>] [--format jsonl|json] [--no-embeddings]
+nanograph changes [--db <db_path>] [--since <graph_version> | --from <graph_version> --to <graph_version>] [--format jsonl|json] [--no-embeddings]
 ```
 
 If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
-`--no-embeddings` strips vector embedding properties from CDC payloads to keep output compact.
+`--no-embeddings` strips vector embedding properties from returned row images to keep output compact.
 
-## CDC semantics (time machine)
+For new graphs, nanograph uses the `NamespaceLineage` storage generation by default. In that mode, `changes` is lineage-native.
 
-- Source of truth: CDC is read from `_cdc_log.jsonl`, gated by `_tx_catalog.jsonl` and manifest `db_version`.
-- Commit visibility: only fully committed transactions at or below current manifest `db_version` are visible.
-- Ordering: rows are emitted in logical commit order by `(db_version, seq_in_tx)`.
+## CDC semantics
+
+- Source of truth for new graphs: `__graph_tx` defines committed transaction windows, Lance lineage reconstructs inserts and updates, and `__graph_deletes` stores delete tombstones.
+- Commit visibility: only fully committed transactions at or below the current committed `graph_version` are visible.
 - Windowing:
-  - `--since X` returns rows with `db_version > X`
+  - `--since X` returns rows with `graph_version > X`
   - `--from A --to B` returns rows in inclusive range `[A, B]`
-- Crash/recovery safety: trailing partial JSONL lines are truncated on open/read reconciliation; orphan tx/cdc tail rows beyond manifest visibility are ignored/truncated.
-- Retention impact: `nanograph cleanup --retain-tx-versions N` prunes old tx/cdc history, so time-machine replay is guaranteed only within retained versions.
-- Analytics materialization: `nanograph cdc-materialize` builds derived Lance dataset `__cdc_analytics` for analytics acceleration, but does not change CDC correctness semantics.
+- Ordering for new graphs is deterministic:
+  - `graph_version`
+  - `entity_kind`
+  - `type_name`
+  - `rowid` when present, otherwise `logical_key`
+  - `change_kind`
+- Returned fields for new graphs are:
+  - `graph_version`
+  - `tx_id`
+  - `committed_at`
+  - `change_kind`
+  - `entity_kind`
+  - `type_name`
+  - `table_id`
+  - `rowid`
+  - `entity_id`
+  - `logical_key`
+  - `row`
+  - `previous_graph_version`
+- `row` is the current row image for inserts and updates, and the tombstoned last-visible row image for deletes.
+- `seq_in_tx` is not part of the new public CDC contract.
+- Retention impact: `nanograph cleanup --retain-tx-versions N` guarantees replay only for the retained graph-version window. nanograph keeps the required Lance table history automatically for that window.
+- Legacy graphs may still expose older CDC shapes during migration or compatibility workflows.
 
 ### `compact`
 
@@ -260,13 +281,14 @@ If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
 
 ### `cleanup`
 
-Prune tx/CDC history and old Lance dataset versions while preserving replay/manifest correctness.
+Prune old graph history and Lance versions while preserving committed replay windows.
 
 ```bash
 nanograph cleanup [--db <db_path>] [--retain-tx-versions <n>] [--retain-dataset-versions <n>]
 ```
 
 If `db.default_path` is set in `nanograph.toml`, `--db` can be omitted.
+For new `NamespaceLineage` graphs, `retain-tx-versions` is the primary retention control. nanograph derives the necessary Lance version retention automatically. `retain-dataset-versions` is mainly relevant for legacy storage generations.
 
 ### `doctor`
 
@@ -284,8 +306,8 @@ Use `--verbose` to show per-dataset Lance storage formats in human output. JSON 
 
 ### `cdc-materialize`
 
-Materialize visible CDC rows into derived Lance dataset `__cdc_analytics` for analytics acceleration.
-This does not change `changes` semantics; JSONL remains authoritative.
+Materialize currently visible change rows into derived Lance dataset `__cdc_analytics` for analytics acceleration.
+This does not change `changes` semantics or CDC authority.
 
 ```bash
 nanograph cdc-materialize [--db <db_path>] [--min-new-rows <n>] [--force]

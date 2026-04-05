@@ -96,8 +96,10 @@ Key modules: `embedding.rs` (OpenAI client, retry, mock mode), `store/loader/emb
 | `store/loader/` | Load orchestration: `jsonl.rs` (parsing + Arrow builders), `constraints.rs`, `merge.rs`, `embeddings.rs` (load-time embedding materialization) |
 | `store/indexing.rs` | Lance scalar, vector, and FTS index lifecycle |
 | `store/migration.rs` | Schema evolution engine |
-| `store/manifest.rs` | Dataset inventory (`graph.manifest.json`) — tracks which node/edge types have Lance datasets |
-| `store/txlog.rs` | Transaction catalog + CDC log (`_tx_catalog.jsonl`, `_cdc_log.jsonl`) |
+| `store/manifest.rs` | Committed graph snapshot payload (`GraphManifest`) used inside storage layers |
+| `store/txlog.rs` | CDC readers/writers across storage generations; default new graphs use lineage-native CDC |
+| `store/namespace_lineage_graph_log.rs` | `NamespaceLineage` internal tables: `__graph_tx` and `__graph_deletes` |
+| `store/namespace_lineage_internal.rs` | Ensures and merges `NamespaceLineage` internal datasets into committed snapshots |
 | `embedding.rs` | OpenAI embedding client, retry logic, mock mode |
 | `json_output.rs` | Shared Arrow→JSON serialization for CLI and SDKs. Handles JS safe integer range (i64/u64 > 2^53 are stringified) |
 | `query_input.rs` | Query param parsing, named query lookup from `.gq` files, JSON→ParamMap conversion |
@@ -141,12 +143,15 @@ All library errors go through `NanoError` (in `error.rs`). Variants: `Parse`, `C
 <name>.nano/
 ├── schema.pg              # source schema
 ├── schema.ir.json         # compiled schema IR
-├── graph.manifest.json    # dataset inventory
-├── _tx_catalog.jsonl      # transaction log
-├── _cdc_log.jsonl         # CDC event log
+├── __graph_snapshot/      # committed graph snapshot table
+├── __graph_tx/            # committed transaction windows
+├── __graph_deletes/       # delete tombstones for lineage-native CDC
+├── __blob_store/          # managed imported media blobs
 ├── nodes/<type_id_hex>/   # Lance dataset per node type
 └── edges/<type_id_hex>/   # Lance dataset per edge type
 ```
+
+New graphs default to the `NamespaceLineage` storage generation. CDC is reconstructed from Lance lineage plus `__graph_deletes`; `__graph_changes` is legacy-only.
 
 Type IDs are FNV-1a hashes of `"node:TypeName"` / `"edge:TypeName"` → u32 hex.
 

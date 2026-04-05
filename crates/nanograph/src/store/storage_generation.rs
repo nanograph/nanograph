@@ -11,6 +11,14 @@ const STORAGE_METADATA_VERSION: u32 = 1;
 #[serde(rename_all = "kebab-case")]
 pub enum StorageGeneration {
     V4Namespace,
+    #[serde(alias = "v5-lineage-native")]
+    NamespaceLineage,
+}
+
+impl StorageGeneration {
+    pub(crate) fn is_namespace_managed(self) -> bool {
+        matches!(self, Self::V4Namespace | Self::NamespaceLineage)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,7 +46,7 @@ pub(crate) fn write_storage_generation(
     Ok(())
 }
 
-pub(crate) fn read_storage_generation(db_path: &Path) -> Result<Option<StorageGeneration>> {
+pub fn read_storage_generation(db_path: &Path) -> Result<Option<StorageGeneration>> {
     let path = storage_metadata_path(db_path);
     if !path.exists() {
         return Ok(None);
@@ -61,6 +69,6 @@ pub(crate) fn read_storage_generation(db_path: &Path) -> Result<Option<StorageGe
     Ok(Some(metadata.generation))
 }
 
-pub(crate) fn detect_storage_generation(db_path: &Path) -> Result<Option<StorageGeneration>> {
+pub fn detect_storage_generation(db_path: &Path) -> Result<Option<StorageGeneration>> {
     read_storage_generation(db_path)
 }

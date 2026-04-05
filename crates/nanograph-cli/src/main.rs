@@ -44,9 +44,13 @@ use nanograph::store::database::{
 };
 use nanograph::store::metadata::DatabaseMetadata;
 use nanograph::store::migration::{SchemaDiffReport, analyze_schema_diff};
-use nanograph::store::storage_migrate::migrate_storage_to_lance_v4;
+use nanograph::store::storage_generation::{StorageGeneration, detect_storage_generation};
+use nanograph::store::storage_migrate::{
+    migrate_storage_to_lance_v4, migrate_storage_to_lineage_native,
+};
 use nanograph::store::txlog::{
-    CdcLogEntry, VisibleCdcSource, read_visible_cdc_entries_with_source,
+    CdcLogEntry, VisibleCdcSource, VisibleChangeRow, read_visible_cdc_entries_with_source,
+    read_visible_change_rows,
 };
 use nanograph::{ParamMap, lower_query};
 use schema_ops::{cmd_migrate, cmd_schema_diff, schema_compatibility_label};
@@ -191,13 +195,13 @@ enum Commands {
         /// Database directory
         #[arg(long)]
         db: Option<PathBuf>,
-        /// Return changes with db_version strictly greater than this value
+        /// Return changes with graph_version strictly greater than this value
         #[arg(long, conflicts_with_all = ["from_version", "to_version"])]
         since: Option<u64>,
-        /// Inclusive lower bound for db_version (requires --to)
+        /// Inclusive lower bound for graph_version (requires --to)
         #[arg(long = "from", requires = "to_version", conflicts_with = "since")]
         from_version: Option<u64>,
-        /// Inclusive upper bound for db_version (requires --from)
+        /// Inclusive upper bound for graph_version (requires --from)
         #[arg(long = "to", requires = "from_version", conflicts_with = "since")]
         to_version: Option<u64>,
         /// Output format: jsonl or json
@@ -358,6 +362,7 @@ enum LoadModeArg {
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 enum StorageTargetArg {
     LanceV4,
+    LineageNative,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -1181,6 +1186,7 @@ async fn cmd_storage_migrate(
 ) -> Result<()> {
     let result = match target {
         StorageTargetArg::LanceV4 => migrate_storage_to_lance_v4(db_path).await?,
+        StorageTargetArg::LineageNative => migrate_storage_to_lineage_native(db_path).await?,
     };
 
     if json {
@@ -1194,17 +1200,25 @@ async fn cmd_storage_migrate(
                 "node_tables": result.node_tables,
                 "edge_tables": result.edge_tables,
                 "media_uris_rewritten": result.media_uris_rewritten,
-                "target": "lance-v4",
+                "target": match target {
+                    StorageTargetArg::LanceV4 => "lance-v4",
+                    StorageTargetArg::LineageNative => "lineage-native",
+                },
             })
         );
     } else if !quiet {
+        let label = match target {
+            StorageTargetArg::LanceV4 => "lance-v4",
+            StorageTargetArg::LineageNative => "lineage-native",
+        };
         println!(
             "{}",
             format_status_line(
                 StatusTone::Ok,
                 &format!(
-                    "Migrated {} to lance-v4 storage (backup: {})",
+                    "Migrated {} to {} storage (backup: {})",
                     db_path.display(),
+                    label,
                     result.backup_path
                 ),
                 stdout_supports_color()
@@ -1419,20 +1433,36 @@ async fn cmd_changes(
     source: VisibleCdcSource,
 ) -> Result<()> {
     let window = resolve_changes_window(since, from_version, to_version)?;
-    let mut rows = read_visible_cdc_entries_with_source(
-        db_path,
-        window.from_db_version_exclusive,
-        window.to_db_version_inclusive,
-        source,
-    )?;
-    if no_embeddings {
-        let metadata = DatabaseMetadata::open(db_path)?;
-        let embedding_props = build_embedding_property_map(metadata.schema_ir());
-        strip_embedding_payloads(&mut rows, &embedding_props);
-    }
-
     let effective_format = if json { "json" } else { format };
-    render_changes(effective_format, &rows)
+    if matches!(
+        detect_storage_generation(db_path)?,
+        Some(StorageGeneration::NamespaceLineage)
+    ) {
+        let mut rows = read_visible_change_rows(
+            db_path,
+            window.from_db_version_exclusive,
+            window.to_db_version_inclusive,
+        )?;
+        if no_embeddings {
+            let metadata = DatabaseMetadata::open(db_path)?;
+            let embedding_props = build_embedding_property_map(metadata.schema_ir());
+            strip_embedding_fields_from_visible_rows(&mut rows, &embedding_props);
+        }
+        render_visible_change_rows(effective_format, &rows)
+    } else {
+        let mut rows = read_visible_cdc_entries_with_source(
+            db_path,
+            window.from_db_version_exclusive,
+            window.to_db_version_inclusive,
+            source,
+        )?;
+        if no_embeddings {
+            let metadata = DatabaseMetadata::open(db_path)?;
+            let embedding_props = build_embedding_property_map(metadata.schema_ir());
+            strip_embedding_payloads(&mut rows, &embedding_props);
+        }
+        render_changes(effective_format, &rows)
+    }
 }
 
 fn build_embedding_property_map(
@@ -1481,6 +1511,19 @@ fn strip_embedding_payloads(
     }
 }
 
+fn strip_embedding_fields_from_visible_rows(
+    rows: &mut [VisibleChangeRow],
+    embedding_props: &HashMap<(String, String), HashSet<String>>,
+) {
+    for row in rows {
+        let Some(props) = embedding_props.get(&(row.entity_kind.clone(), row.type_name.clone()))
+        else {
+            continue;
+        };
+        strip_embedding_fields_from_row(&mut row.row, props);
+    }
+}
+
 fn strip_embedding_fields_from_payload(
     payload: &mut serde_json::Value,
     embedding_props: &HashSet<String>,
@@ -1519,6 +1562,27 @@ fn render_changes(format: &str, rows: &[CdcLogEntry]) -> Result<()> {
         "json" => {
             let out =
                 serde_json::to_string_pretty(rows).wrap_err("failed to serialize CDC rows")?;
+            println!("{}", out);
+        }
+        other => {
+            return Err(eyre!("unknown format: {} (supported: jsonl, json)", other));
+        }
+    }
+    Ok(())
+}
+
+fn render_visible_change_rows(format: &str, rows: &[VisibleChangeRow]) -> Result<()> {
+    match format {
+        "jsonl" => {
+            for row in rows {
+                let line =
+                    serde_json::to_string(row).wrap_err("failed to serialize visible change row")?;
+                println!("{}", line);
+            }
+        }
+        "json" => {
+            let out = serde_json::to_string_pretty(rows)
+                .wrap_err("failed to serialize visible change rows")?;
             println!("{}", out);
         }
         other => {

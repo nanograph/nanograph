@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -16,6 +16,7 @@ use crate::error::{NanoError, Result};
 use crate::schema::ast::{PropDecl, SchemaDecl, SchemaFile, annotation_value, has_annotation};
 use crate::schema::parser::parse_schema;
 use crate::store::graph::DatasetAccumulator;
+use crate::store::graph_types::{GraphCommitRecord, GraphTableVersion, GraphTouchedTableWindow};
 use crate::store::graph_mirror::rebuild_graph_mirror_from_wal;
 use crate::store::indexing::{
     rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
@@ -28,9 +29,12 @@ use crate::store::metadata::{DatabaseMetadata, DatasetLocator};
 use crate::store::namespace::{
     open_directory_namespace, resolve_table_location, write_namespace_batch,
 };
+use crate::store::namespace_lineage_internal::merge_namespace_lineage_internal_dataset_entries;
 use crate::store::snapshot::read_committed_graph_snapshot;
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
-use crate::store::txlog::commit_manifest_and_logs;
+use crate::store::txlog::{
+    commit_graph_records_and_manifest_namespace_lineage, commit_manifest_and_logs,
+};
 use crate::store::v4_internal::merge_v4_internal_dataset_entries;
 use crate::types::ScalarType;
 
@@ -2242,7 +2246,10 @@ async fn apply_planned_migration(db_path: &Path, planned: &PlannedMigration) -> 
     let new_storage =
         transform_storage_for_new_schema(&mut data_view, &planned.new_ir, &new_catalog).await?;
 
-    if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+    if matches!(
+        storage_generation,
+        Some(generation) if generation.is_namespace_managed()
+    ) {
         journal.state = JournalState::Applying;
         write_journal(&names.journal_path, &journal)?;
 
@@ -2689,8 +2696,10 @@ async fn write_staged_db(
     let ir_json = serde_json::to_string_pretty(schema_ir)
         .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
     match storage_generation {
-        Some(StorageGeneration::V4Namespace) => {
-            let db = crate::store::database::Database::init(path, schema_source).await?;
+        Some(generation) if generation.is_namespace_managed() => {
+            let db =
+                crate::store::database::Database::init_with_generation(path, schema_source, generation)
+                    .await?;
             drop(db);
             std::fs::write(path.join(SCHEMA_PG_FILENAME), schema_source)?;
             std::fs::write(path.join(SCHEMA_IR_FILENAME), &ir_json)?;
@@ -2768,9 +2777,48 @@ async fn write_staged_db(
                 .saturating_add(1)
                 .max(1);
             manifest.datasets = dataset_entries;
-            merge_v4_internal_dataset_entries(path, &mut manifest.datasets).await?;
-
-            commit_manifest_and_logs(path, &manifest, &[], "schema_migration")?;
+            match generation {
+                StorageGeneration::V4Namespace => {
+                    merge_v4_internal_dataset_entries(path, &mut manifest.datasets).await?;
+                    commit_manifest_and_logs(path, &manifest, &[], "schema_migration")?;
+                }
+                StorageGeneration::NamespaceLineage => {
+                    merge_namespace_lineage_internal_dataset_entries(path, &mut manifest.datasets)
+                        .await?;
+                    let graph_commit = GraphCommitRecord {
+                        tx_id: manifest.last_tx_id.clone().into(),
+                        graph_version: manifest.db_version.into(),
+                        table_versions: manifest
+                            .datasets
+                            .iter()
+                            .map(|entry| {
+                                GraphTableVersion::new(
+                                    entry.effective_table_id().to_string(),
+                                    entry.dataset_version,
+                                )
+                            })
+                            .collect(),
+                        committed_at: manifest.committed_at.clone(),
+                        op_summary: "schema_migration".to_string(),
+                        schema_identity_version: manifest.schema_identity_version,
+                        touched_tables: build_touched_table_windows_for_migration(
+                            manifest_seed,
+                            &manifest,
+                        ),
+                        tx_props: BTreeMap::from([
+                            ("graph_version".to_string(), manifest.db_version.to_string()),
+                            ("tx_id".to_string(), manifest.last_tx_id.clone()),
+                            ("op_summary".to_string(), "schema_migration".to_string()),
+                        ]),
+                    };
+                    commit_graph_records_and_manifest_namespace_lineage(
+                        path,
+                        &graph_commit,
+                        &[],
+                        &manifest,
+                    )?;
+                }
+            }
             Ok(())
         }
         None => {
@@ -2840,7 +2888,49 @@ async fn write_staged_db(
             let _ = rebuild_graph_mirror_from_wal(path).await;
             Ok(())
         }
+        Some(_) => Err(NanoError::Storage(
+            "unsupported namespace-managed storage generation for staged schema migration"
+                .to_string(),
+        )),
     }
+}
+
+fn build_touched_table_windows_for_migration(
+    previous_manifest: &GraphManifest,
+    next_manifest: &GraphManifest,
+) -> Vec<GraphTouchedTableWindow> {
+    let previous_by_key = previous_manifest
+        .datasets
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
+        .map(|entry| (format!("{}:{}", entry.kind, entry.type_name), entry))
+        .collect::<HashMap<_, _>>();
+    let mut windows = next_manifest
+        .datasets
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
+        .filter_map(|entry| {
+            let previous = previous_by_key.get(&format!("{}:{}", entry.kind, entry.type_name));
+            let before_version = previous.map(|entry| entry.dataset_version).unwrap_or(0);
+            if before_version == entry.dataset_version {
+                return None;
+            }
+            Some(GraphTouchedTableWindow::new(
+                entry.effective_table_id().to_string(),
+                entry.kind.clone(),
+                entry.type_name.clone(),
+                before_version,
+                entry.dataset_version,
+            ))
+        })
+        .collect::<Vec<_>>();
+    windows.sort_by(|a, b| {
+        a.entity_kind
+            .cmp(&b.entity_kind)
+            .then(a.type_name.cmp(&b.type_name))
+            .then(a.table_id.as_str().cmp(b.table_id.as_str()))
+    });
+    windows
 }
 
 async fn resolve_manifest_dataset_path(

@@ -133,6 +133,80 @@ pub(crate) async fn ensure_graph_changes_table(db_path: &Path) -> Result<Dataset
     ))
 }
 
+pub(crate) async fn rewrite_graph_commit_records(
+    db_path: &Path,
+    records: &[GraphCommitRecord],
+) -> Result<StagedNamespaceTable> {
+    let namespace = open_directory_namespace(db_path).await?;
+    let table_id = GRAPH_TX_TABLE_ID;
+    let batch = graph_commit_records_to_batch(records)?.unwrap_or_else(empty_graph_commit_batch);
+    let version = write_namespace_batch(
+        namespace.clone(),
+        table_id,
+        batch,
+        WriteMode::Overwrite,
+        None,
+    )
+    .await?;
+    let location = resolve_table_location(namespace, table_id).await?;
+    let entry = DatasetEntry::internal(
+        table_id,
+        manifest_dataset_path(db_path, &location, table_id),
+        version.version,
+        records.len() as u64,
+    );
+    let published_version =
+        namespace_published_version_for_table(db_path, table_id, version.version)
+            .await?
+            .ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "rewritten graph tx {} version {} is not publishable",
+                    table_id, version.version
+                ))
+            })?;
+    Ok(StagedNamespaceTable {
+        entry,
+        published_version,
+    })
+}
+
+pub(crate) async fn rewrite_graph_change_records(
+    db_path: &Path,
+    records: &[GraphChangeRecord],
+) -> Result<StagedNamespaceTable> {
+    let namespace = open_directory_namespace(db_path).await?;
+    let table_id = GRAPH_CHANGES_TABLE_ID;
+    let batch = graph_change_records_to_batch(records)?.unwrap_or_else(empty_graph_change_batch);
+    let version = write_namespace_batch(
+        namespace.clone(),
+        table_id,
+        batch,
+        WriteMode::Overwrite,
+        None,
+    )
+    .await?;
+    let location = resolve_table_location(namespace, table_id).await?;
+    let entry = DatasetEntry::internal(
+        table_id,
+        manifest_dataset_path(db_path, &location, table_id),
+        version.version,
+        records.len() as u64,
+    );
+    let published_version =
+        namespace_published_version_for_table(db_path, table_id, version.version)
+            .await?
+            .ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "rewritten graph changes {} version {} is not publishable",
+                    table_id, version.version
+                ))
+            })?;
+    Ok(StagedNamespaceTable {
+        entry,
+        published_version,
+    })
+}
+
 pub(crate) async fn stage_graph_change_records(
     db_path: &Path,
     manifest: &GraphManifest,
@@ -538,6 +612,9 @@ fn graph_commit_records_from_batch(batch: &RecordBatch) -> Result<Vec<GraphCommi
             table_versions,
             committed_at: committed_at.value(row).to_string(),
             op_summary: op_summary.value(row).to_string(),
+            schema_identity_version: 0,
+            touched_tables: Vec::new(),
+            tx_props: std::collections::BTreeMap::new(),
         });
     }
     Ok(out)

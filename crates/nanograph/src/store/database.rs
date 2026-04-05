@@ -30,6 +30,7 @@ use crate::store::metadata::{DatabaseMetadata, SCHEMA_IR_FILENAME};
 use crate::store::namespace::{
     cleanup_namespace_orphan_versions, cleanup_namespace_snapshot_orphan_versions,
 };
+use crate::store::namespace_lineage_internal::ensure_namespace_lineage_internal_dataset_entries;
 use crate::store::runtime::DatabaseRuntime;
 use crate::store::snapshot::{publish_committed_graph_snapshot, read_committed_graph_snapshot};
 use crate::store::storage_generation::{StorageGeneration, write_storage_generation};
@@ -353,7 +354,16 @@ impl Database {
     /// Create a new database directory from schema source text.
     #[instrument(skip(schema_source), fields(db_path = %db_path.display()))]
     pub async fn init(db_path: &Path, schema_source: &str) -> Result<Self> {
-        Self::init_internal(db_path, schema_source, None).await
+        Self::init_with_generation(db_path, schema_source, StorageGeneration::NamespaceLineage)
+            .await
+    }
+
+    pub async fn init_with_generation(
+        db_path: &Path,
+        schema_source: &str,
+        generation: StorageGeneration,
+    ) -> Result<Self> {
+        Self::init_internal(db_path, schema_source, None, generation).await
     }
 
     /// Create a new tempdir-backed database that cleans itself up when dropped.
@@ -362,13 +372,20 @@ impl Database {
             .prefix("nanograph_in_memory_")
             .tempdir()?;
         let temp_path = tempdir.path().to_path_buf();
-        Self::init_internal(&temp_path, schema_source, Some(tempdir)).await
+        Self::init_internal(
+            &temp_path,
+            schema_source,
+            Some(tempdir),
+            StorageGeneration::NamespaceLineage,
+        )
+        .await
     }
 
     async fn init_internal(
         db_path: &Path,
         schema_source: &str,
         tempdir: Option<TempDir>,
+        generation: StorageGeneration,
     ) -> Result<Self> {
         info!("initializing database");
         // Parse and validate schema
@@ -395,9 +412,14 @@ impl Database {
         let (next_type_id, next_prop_id) = next_schema_identity_counters(&schema_ir);
         manifest.next_type_id = next_type_id;
         manifest.next_prop_id = next_prop_id;
-        write_storage_generation(db_path, StorageGeneration::V4Namespace)?;
+        write_storage_generation(db_path, generation)?;
         manifest.committed_at = now_unix_seconds_string();
-        manifest.datasets = ensure_v4_internal_dataset_entries(db_path).await?;
+        manifest.datasets = match generation {
+            StorageGeneration::V4Namespace => ensure_v4_internal_dataset_entries(db_path).await?,
+            StorageGeneration::NamespaceLineage => {
+                ensure_namespace_lineage_internal_dataset_entries(db_path).await?
+            }
+        };
         publish_committed_graph_snapshot(db_path, &manifest)?;
 
         let runtime = Arc::new(DatabaseRuntime::empty(catalog.clone()));
@@ -418,7 +440,7 @@ impl Database {
         info!("opening database");
         if matches!(
             crate::store::storage_generation::detect_storage_generation(db_path)?,
-            Some(StorageGeneration::V4Namespace)
+            Some(generation) if generation.is_namespace_managed()
         ) {
             cleanup_namespace_snapshot_orphan_versions(db_path).await?;
             let snapshot = read_committed_graph_snapshot(db_path)?;

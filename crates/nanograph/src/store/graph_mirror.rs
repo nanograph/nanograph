@@ -295,6 +295,9 @@ fn graph_commit_records_from_batch(batch: &RecordBatch) -> Result<Vec<GraphCommi
             table_versions,
             committed_at: committed_at.value(row).to_string(),
             op_summary: op_summary.value(row).to_string(),
+            schema_identity_version: 0,
+            touched_tables: Vec::new(),
+            tx_props: std::collections::BTreeMap::new(),
         });
     }
     Ok(rows)

@@ -182,7 +182,7 @@ query delete_task() {
     ]);
     assert!(tasks_after_delete.is_empty());
 
-    let changes_range = workspace.run_ok(&[
+    let changes_range = workspace.json_rows(&[
         "changes",
         "--from",
         &insert_version.to_string(),
@@ -193,41 +193,65 @@ query delete_task() {
     ]);
     assert!(
         changes_range
-            .stdout
-            .contains(&format!("\"db_version\": {}", insert_version))
+            .iter()
+            .any(|row| row["graph_version"].as_u64() == Some(insert_version))
     );
     assert!(
         changes_range
-            .stdout
-            .contains(&format!("\"db_version\": {}", update_opp_version))
+            .iter()
+            .any(|row| row["graph_version"].as_u64() == Some(update_opp_version))
     );
     assert!(
         changes_range
-            .stdout
-            .contains(&format!("\"db_version\": {}", update_task_version))
+            .iter()
+            .any(|row| row["graph_version"].as_u64() == Some(update_task_version))
     );
     assert!(
         changes_range
-            .stdout
-            .contains(&format!("\"db_version\": {}", delete_task_version))
-    );
-    assert!(changes_range.stdout.contains("\"type_name\": \"Signal\""));
-    assert!(
-        changes_range
-            .stdout
-            .contains("\"type_name\": \"Opportunity\"")
+            .iter()
+            .any(|row| row["graph_version"].as_u64() == Some(delete_task_version))
     );
     assert!(
         changes_range
-            .stdout
-            .contains("\"type_name\": \"ActionItem\"")
+            .iter()
+            .any(|row| row["type_name"].as_str() == Some("Signal"))
     );
-    assert!(changes_range.stdout.contains("\"op\": \"insert\""));
-    assert!(changes_range.stdout.contains("\"op\": \"update\""));
-    assert!(changes_range.stdout.contains("\"op\": \"delete\""));
-    assert!(changes_range.stdout.contains("\"urgency\": \"critical\""));
+    assert!(
+        changes_range
+            .iter()
+            .any(|row| row["type_name"].as_str() == Some("Opportunity"))
+    );
+    assert!(
+        changes_range
+            .iter()
+            .any(|row| row["type_name"].as_str() == Some("ActionItem"))
+    );
+    assert!(
+        changes_range
+            .iter()
+            .any(|row| row["change_kind"].as_str() == Some("insert"))
+    );
+    assert!(
+        changes_range
+            .iter()
+            .any(|row| row["change_kind"].as_str() == Some("update"))
+    );
+    assert!(
+        changes_range
+            .iter()
+            .any(|row| row["change_kind"].as_str() == Some("delete"))
+    );
+    assert!(
+        changes_range.iter().all(|row| row.get("db_version").is_none())
+            && changes_range.iter().all(|row| row.get("seq_in_tx").is_none())
+    );
+    assert!(
+        changes_range.iter().any(|row| {
+            row["type_name"] == "Signal" && row["row"]["urgency"] == "critical"
+        })
+    );
 
-    let changes_since = workspace.run_ok(&[
+    let changes_since = workspace.jsonl_rows(&[
         "changes",
         "--since",
         &update_task_version.to_string(),
@@ -236,10 +260,14 @@ query delete_task() {
     ]);
     assert!(
         changes_since
-            .stdout
-            .contains(&format!("\"db_version\":{}", delete_task_version))
+            .iter()
+            .any(|row| row["graph_version"].as_u64() == Some(delete_task_version))
     );
-    assert!(changes_since.stdout.contains("\"op\":\"delete\""));
+    assert!(
+        changes_since
+            .iter()
+            .any(|row| row["change_kind"].as_str() == Some("delete"))
+    );
 
     let compact =
         workspace.json_value(&["--json", "compact", "--target-rows-per-fragment", "1024"]);

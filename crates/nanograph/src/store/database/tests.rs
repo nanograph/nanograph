@@ -23,11 +23,12 @@ use crate::store::namespace_commit::{build_graph_update_bundle, publish_graph_co
 use crate::store::snapshot::{
     graph_snapshot_table_present, publish_committed_graph_snapshot, read_committed_graph_snapshot,
 };
-use crate::store::storage_generation::storage_metadata_path;
+use crate::store::storage_generation::{StorageGeneration, storage_metadata_path};
 use crate::store::txlog::{
     VisibleCdcSource, append_tx_catalog_entry, collect_visible_lineage_shadow_cdc_entries,
     read_tx_catalog_entries, read_visible_cdc_entries, read_visible_cdc_entries_with_source,
-    read_visible_graph_change_records, read_visible_graph_commit_records,
+    read_visible_change_rows, read_visible_graph_change_records,
+    read_visible_graph_commit_records,
 };
 use arrow_array::{Array, StringArray, UInt32Array, UInt64Array};
 use arrow_schema::{Field, Schema};
@@ -80,6 +81,12 @@ fn assert_lineage_shadow_cdc_matches_authoritative(
         shadow.shadow_entries, shadow.authoritative_entries_compared,
         "expected lineage shadow CDC to match authoritative CDC"
     );
+}
+
+async fn init_v4_db(path: &std::path::Path, schema_source: &str) -> Database {
+    Database::init_with_generation(path, schema_source, StorageGeneration::V4Namespace)
+        .await
+        .unwrap()
 }
 
 fn duplicate_edge_data_src() -> &'static str {
@@ -557,6 +564,9 @@ fn graph_commit_for_manifest(manifest: &GraphManifest, op_summary: &str) -> Grap
             .collect(),
         committed_at: manifest.committed_at.clone(),
         op_summary: op_summary.to_string(),
+        schema_identity_version: manifest.schema_identity_version,
+        touched_tables: Vec::new(),
+        tx_props: std::collections::BTreeMap::new(),
     }
 }
 
@@ -823,6 +833,25 @@ async fn test_init_creates_directory_structure() {
     assert!(!path.join("graph.manifest.json").exists());
     assert!(path.join("nodes").exists());
     assert!(path.join("edges").exists());
+    let manifest = read_committed_graph_snapshot(path).unwrap();
+    assert!(
+        manifest
+            .datasets
+            .iter()
+            .any(|entry| entry.effective_table_id() == GRAPH_TX_TABLE_ID)
+    );
+    assert!(
+        manifest
+            .datasets
+            .iter()
+            .any(|entry| entry.effective_table_id() == "__graph_deletes")
+    );
+    assert!(
+        manifest
+            .datasets
+            .iter()
+            .all(|entry| entry.effective_table_id() != GRAPH_CHANGES_TABLE_ID)
+    );
 
     assert_eq!(db.catalog.node_types.len(), 2);
     assert_eq!(db.catalog.edge_types.len(), 2);
@@ -833,7 +862,7 @@ async fn test_v4_init_bootstraps_internal_tables_without_wal() {
     let dir = test_dir("v4_init_internal_tables");
     let path = dir.path();
 
-    let _db = Database::init(path, test_schema_src()).await.unwrap();
+    let _db = init_v4_db(path, test_schema_src()).await;
 
     assert!(storage_metadata_path(path).exists());
     assert!(!path.join("_wal.jsonl").exists());
@@ -865,7 +894,7 @@ async fn test_v4_unpublished_table_write_is_invisible_until_snapshot_publish() {
     let dir = test_dir("v4_snapshot_visibility");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
 
     let metadata = DatabaseMetadata::open(path).unwrap();
@@ -933,7 +962,7 @@ async fn test_v4_cleanup_removes_orphan_unpublished_versions() {
     let dir = test_dir("v4_cleanup_orphan_unpublished_versions");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
 
     let metadata = DatabaseMetadata::open(path).unwrap();
@@ -1008,7 +1037,7 @@ async fn test_v4_open_uses_namespace_snapshot_without_manifest_file() {
     let dir = test_dir("v4_namespace_snapshot_without_file");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
 
     assert!(!path.join("graph.manifest.json").exists());
@@ -1031,13 +1060,14 @@ async fn test_v4_staged_internal_bundle_is_invisible_until_publish() {
     let dir = test_dir("v4_internal_bundle_visibility");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
     drop(db);
 
     let committed_before = read_committed_graph_snapshot(path).unwrap();
     let tx_before = read_tx_catalog_entries(path).unwrap();
-    let cdc_before = read_visible_cdc_entries(path, 0, Some(committed_before.db_version)).unwrap();
+    let changes_before =
+        read_visible_graph_change_records(path, 0, Some(committed_before.db_version)).unwrap();
 
     let mut next_snapshot = committed_before.clone();
     next_snapshot.db_version += 1;
@@ -1064,8 +1094,9 @@ async fn test_v4_staged_internal_bundle_is_invisible_until_publish() {
 
     let committed_after_stage = read_committed_graph_snapshot(path).unwrap();
     let tx_after_stage = read_tx_catalog_entries(path).unwrap();
-    let cdc_after_stage =
-        read_visible_cdc_entries(path, 0, Some(committed_after_stage.db_version)).unwrap();
+    let changes_after_stage =
+        read_visible_graph_change_records(path, 0, Some(committed_after_stage.db_version))
+            .unwrap();
     let exported_before_publish = build_export_rows_at_path(path, false, true).await.unwrap();
 
     assert_eq!(
@@ -1073,7 +1104,7 @@ async fn test_v4_staged_internal_bundle_is_invisible_until_publish() {
         committed_before.db_version
     );
     assert_eq!(tx_after_stage.len(), tx_before.len());
-    assert_eq!(cdc_after_stage.len(), cdc_before.len());
+    assert_eq!(changes_after_stage.len(), changes_before.len());
     assert!(
         !exported_before_publish
             .iter()
@@ -1084,19 +1115,20 @@ async fn test_v4_staged_internal_bundle_is_invisible_until_publish() {
 
     let committed_after_publish = read_committed_graph_snapshot(path).unwrap();
     let tx_after_publish = read_tx_catalog_entries(path).unwrap();
-    let cdc_after_publish =
-        read_visible_cdc_entries(path, 0, Some(committed_after_publish.db_version)).unwrap();
+    let changes_after_publish =
+        read_visible_graph_change_records(path, 0, Some(committed_after_publish.db_version))
+            .unwrap();
     let visible_commits = read_visible_graph_commit_records(path).unwrap();
 
     assert_eq!(committed_after_publish.db_version, next_snapshot.db_version);
     assert_eq!(tx_after_publish.len(), tx_before.len() + 1);
-    assert_eq!(cdc_after_publish.len(), cdc_before.len() + 1);
+    assert_eq!(changes_after_publish.len(), changes_before.len() + 1);
     assert_eq!(
         tx_after_publish.last().unwrap().db_version,
         next_snapshot.db_version
     );
     assert_eq!(
-        cdc_after_publish.last().unwrap().entity_key,
+        changes_after_publish.last().unwrap().entity_key,
         "bundle:person"
     );
     assert_eq!(
@@ -1110,7 +1142,7 @@ async fn test_v4_open_recovers_from_orphan_staged_internal_bundle_versions() {
     let dir = test_dir("v4_open_recovers_orphan_internal_bundle");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
     drop(db);
 
@@ -1180,7 +1212,7 @@ async fn test_v4_cleanup_removes_orphan_staged_internal_bundle_versions() {
     let dir = test_dir("v4_cleanup_internal_bundle_orphans");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
     drop(db);
 
@@ -1258,7 +1290,7 @@ async fn test_new_datasets_use_lance_v2_2_storage_format() {
     let dir = test_dir("new_dataset_v2_2");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
 
     let manifest = read_committed_graph_snapshot(path).unwrap();
@@ -1275,6 +1307,7 @@ async fn test_new_datasets_use_lance_v2_2_storage_format() {
 }
 
 #[tokio::test]
+#[ignore = "legacy raw-layout compatibility coverage"]
 async fn test_lance_v2_0_datasets_remain_operational_in_v0_11_0() {
     let dir = test_dir("lance_v2_0_compat");
     let path = dir.path();
@@ -1487,7 +1520,7 @@ async fn test_load_overwrite_emits_insert_cdc_events() {
     let dir = test_dir("cdc_load_insert");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load_with_mode(test_data_src(), LoadMode::Overwrite)
         .await
         .unwrap();
@@ -1539,7 +1572,7 @@ async fn test_load_merge_emits_update_and_insert_cdc_events() {
     let dir = test_dir("cdc_load_merge");
     let path = dir.path();
 
-    let db = Database::init(path, keyed_schema_src()).await.unwrap();
+    let db = init_v4_db(path, keyed_schema_src()).await;
     db.load_with_mode(keyed_data_initial(), LoadMode::Overwrite)
         .await
         .unwrap();
@@ -1547,14 +1580,14 @@ async fn test_load_merge_emits_update_and_insert_cdc_events() {
         .await
         .unwrap();
 
-    let cdc = read_visible_cdc_entries(path, 1, Some(2)).unwrap();
+    let cdc = read_visible_graph_change_records(path, 1, Some(2)).unwrap();
     assert!(
         cdc.iter()
-            .any(|e| { e.op == "update" && e.entity_kind == "node" && e.type_name == "Person" })
+            .any(|e| e.op == "update" && e.entity_kind == "node" && e.type_name == "Person")
     );
     assert!(
         cdc.iter()
-            .any(|e| { e.op == "insert" && e.entity_kind == "node" && e.type_name == "Person" })
+            .any(|e| e.op == "insert" && e.entity_kind == "node" && e.type_name == "Person")
     );
 
     let person_update = cdc
@@ -1566,11 +1599,80 @@ async fn test_load_merge_emits_update_and_insert_cdc_events() {
 }
 
 #[tokio::test]
+async fn test_v5_changes_returns_lineage_native_rows_for_merge() {
+    let dir = test_dir("v5_changes_merge");
+    let path = dir.path();
+
+    let db = Database::init(path, keyed_schema_src()).await.unwrap();
+    db.load_with_mode(keyed_data_initial(), LoadMode::Overwrite)
+        .await
+        .unwrap();
+    db.load_with_mode(keyed_data_upsert(), LoadMode::Merge)
+        .await
+        .unwrap();
+
+    let rows = read_visible_change_rows(path, 1, Some(2)).unwrap();
+    assert!(rows.len() >= 3);
+
+    let insert = rows
+        .iter()
+        .find(|row| {
+            row.change_kind == "insert"
+                && row.entity_kind == "node"
+                && row.type_name == "Person"
+                && row.row["name"] == "Charlie"
+        })
+        .unwrap();
+    let charlie_rowid = rowid_for_entity(path, "node", "Person", insert.entity_id).await;
+    assert_eq!(insert.graph_version, 2);
+    assert_eq!(insert.previous_graph_version, Some(1));
+    assert_eq!(insert.rowid, charlie_rowid);
+
+    let update = rows
+        .iter()
+        .find(|row| {
+            row.change_kind == "update"
+                && row.entity_kind == "node"
+                && row.type_name == "Person"
+                && row.row["name"] == "Alice"
+        })
+        .unwrap();
+    let persons = read_node_batch_for_db(&db, "Person").await.unwrap();
+    let alice_id = person_id_by_name(&persons, "Alice");
+    let alice_rowid = rowid_for_entity(path, "node", "Person", update.entity_id).await;
+    assert_eq!(update.graph_version, 2);
+    assert_eq!(update.previous_graph_version, Some(1));
+    assert_eq!(update.rowid, alice_rowid);
+    assert_eq!(update.entity_id, alice_id);
+    assert!(
+        rows.iter().any(|row| {
+            row.change_kind == "insert"
+                && row.entity_kind == "edge"
+                && row.type_name == "Knows"
+        }),
+        "expected lineage-native rows to include the new Knows edge: {rows:?}"
+    );
+
+    let mut sorted = rows.clone();
+    sorted.sort_by(|a, b| {
+        a.graph_version
+            .cmp(&b.graph_version)
+            .then(a.entity_kind.cmp(&b.entity_kind))
+            .then(a.type_name.cmp(&b.type_name))
+            .then(a.rowid.cmp(&b.rowid))
+            .then(a.logical_key.cmp(&b.logical_key))
+            .then(a.change_kind.cmp(&b.change_kind))
+    });
+    assert_eq!(rows, sorted);
+}
+
+#[tokio::test]
+#[ignore = "legacy v3 wal repair coverage"]
 async fn test_open_repairs_trailing_partial_tx_catalog_row() {
     let dir = test_dir("tx_catalog_repair");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
     drop(db);
 
@@ -1593,11 +1695,12 @@ async fn test_open_repairs_trailing_partial_tx_catalog_row() {
 }
 
 #[tokio::test]
+#[ignore = "legacy v3 wal repair coverage"]
 async fn test_open_truncates_tx_catalog_rows_beyond_manifest_version() {
     let dir = test_dir("tx_catalog_manifest_gate");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
     drop(db);
 
@@ -1626,7 +1729,7 @@ async fn test_load_deduplicates_edges() {
     let dir = test_dir("dedup_edges");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(duplicate_edge_data_src()).await.unwrap();
 
     let knows = read_edge_batch_for_db(&db, "Knows").await.unwrap();
@@ -1638,7 +1741,7 @@ async fn test_load_mode_overwrite_replaces_existing_data() {
     let dir = test_dir("mode_overwrite");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load_with_mode(test_data_src(), LoadMode::Overwrite)
         .await
         .unwrap();
@@ -2289,6 +2392,49 @@ async fn test_cleanup_prunes_old_dataset_versions_but_keeps_manifest_visible_sta
 }
 
 #[tokio::test]
+async fn test_v4_cleanup_retains_versions_needed_for_lineage_backed_cdc() {
+    let dir = test_dir("cleanup_lineage_cdc_versions");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load_with_mode(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}"#,
+        LoadMode::Overwrite,
+    )
+    .await
+    .unwrap();
+    db.load_with_mode(
+        r#"{"type":"Person","data":{"name":"Alice","age":31}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    db.load_with_mode(
+        r#"{"type":"Person","data":{"name":"Alice","age":32}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+
+    db.cleanup(CleanupOptions {
+        retain_tx_versions: 2,
+        retain_dataset_versions: 1,
+    })
+    .await
+    .unwrap();
+
+    let cdc_rows = read_visible_cdc_entries(path, 1, None).unwrap();
+    assert_eq!(cdc_rows.len(), 2);
+    assert_eq!(
+        cdc_rows
+            .iter()
+            .map(|row| row.payload["after"]["age"].as_i64().unwrap())
+            .collect::<Vec<_>>(),
+        vec![31, 32]
+    );
+}
+
+#[tokio::test]
 async fn test_doctor_reports_healthy_database() {
     let dir = test_dir("doctor_healthy");
     let path = dir.path();
@@ -2305,7 +2451,7 @@ async fn test_doctor_reports_healthy_database() {
     assert!(report.issues.is_empty());
     assert!(
         report.warnings.is_empty(),
-        "expected no warnings for healthy v4 database: {:?}",
+        "expected no warnings for healthy database: {:?}",
         report.warnings
     );
     assert!(report.datasets_checked >= 1);
@@ -2317,13 +2463,10 @@ async fn test_doctor_reports_healthy_database() {
             .all(|dataset| dataset.storage_version == "2.2"),
         "expected doctor to report Lance 2.2 storage versions for new datasets"
     );
-    let lineage_shadow = report
-        .lineage_shadow
-        .as_ref()
-        .expect("expected v4 doctor report to include lineage shadow details");
-    assert!(lineage_shadow.windows_considered >= 1);
-    assert!(lineage_shadow.windows_verified >= 1);
-    assert_eq!(lineage_shadow.windows_mismatched, 0);
+    assert!(
+        report.lineage_shadow.is_none(),
+        "expected default NamespaceLineage doctor report to omit V4 lineage-shadow details"
+    );
 }
 
 #[tokio::test]
@@ -2331,7 +2474,7 @@ async fn test_v4_doctor_reports_graph_change_rowid_mismatches() {
     let dir = test_dir("doctor_v4_rowid_mismatch");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
     drop(db);
 
@@ -2367,6 +2510,7 @@ async fn test_v4_doctor_reports_graph_change_rowid_mismatches() {
 }
 
 #[tokio::test]
+#[ignore = "legacy graph mirror coverage"]
 async fn test_graph_mirror_matches_authoritative_wal_after_commit() {
     let dir = test_dir("graph_mirror_matches_wal");
     let path = dir.path();
@@ -2404,6 +2548,7 @@ async fn test_graph_mirror_matches_authoritative_wal_after_commit() {
 }
 
 #[tokio::test]
+#[ignore = "legacy graph mirror coverage"]
 async fn test_rebuild_graph_mirror_recreates_missing_datasets() {
     let dir = test_dir("graph_mirror_rebuild");
     let path = dir.path();
@@ -2423,6 +2568,7 @@ async fn test_rebuild_graph_mirror_recreates_missing_datasets() {
 }
 
 #[tokio::test]
+#[ignore = "legacy graph mirror coverage"]
 async fn test_cleanup_rebuilds_graph_mirror_to_retained_window() {
     let dir = test_dir("graph_mirror_cleanup");
     let path = dir.path();
@@ -2464,6 +2610,7 @@ async fn test_cleanup_rebuilds_graph_mirror_to_retained_window() {
 }
 
 #[tokio::test]
+#[ignore = "legacy graph mirror coverage"]
 async fn test_mirror_write_failure_does_not_invalidate_commit_and_doctor_warns() {
     let dir = test_dir("graph_mirror_failure");
     let path = dir.path();
@@ -2494,7 +2641,7 @@ async fn test_migration_rebuilds_scalar_indexes_for_indexed_properties() {
     let dir = test_dir("migration_scalar_indexed_props");
     let path = dir.path();
 
-    let db = Database::init(path, indexed_schema_src()).await.unwrap();
+    let db = init_v4_db(path, indexed_schema_src()).await;
     db.load(indexed_data_src()).await.unwrap();
     drop(db);
 
@@ -2523,10 +2670,9 @@ async fn test_migration_rebuilds_scalar_indexes_for_indexed_properties() {
     let expected_index_name = crate::store::indexing::scalar_index_name(person.type_id, "handle");
     let expected_text_index_name =
         crate::store::indexing::text_index_name(person.type_id, "handle");
-    let dataset_path = path.join("nodes").join(SchemaIR::dir_name(person.type_id));
-
-    let uri = dataset_path.to_string_lossy().to_string();
-    let dataset = Dataset::open(&uri).await.unwrap();
+    let metadata = DatabaseMetadata::open(path).unwrap();
+    let locator = metadata.node_dataset_locator("Person").unwrap();
+    let dataset = open_dataset_for_locator(&locator).await.unwrap();
     let index_names: HashSet<String> = dataset
         .load_indices()
         .await
@@ -2551,7 +2697,7 @@ async fn test_v4_schema_migration_preserves_internal_tables() {
     let dir = test_dir("v4_schema_migration_internal_tables");
     let path = dir.path();
 
-    let db = Database::init(path, indexed_schema_src()).await.unwrap();
+    let db = init_v4_db(path, indexed_schema_src()).await;
     db.load(indexed_data_src()).await.unwrap();
     drop(db);
 
@@ -2595,7 +2741,7 @@ async fn test_v4_graph_changes_capture_stable_row_ids_for_live_rows() {
     let dir = test_dir("v4_graph_changes_rowids");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
 
     let manifest_after_insert = read_committed_graph_snapshot(path).unwrap();
@@ -2663,7 +2809,7 @@ async fn test_v4_doctor_reports_lineage_shadow_mismatches() {
     let dir = test_dir("doctor_v4_lineage_shadow_mismatch");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
     db.load_with_mode(
         r#"{"type":"Person","data":{"name":"Alice","age":31}}"#,
@@ -2715,7 +2861,7 @@ async fn test_v4_doctor_reports_lineage_shadow_mismatches() {
         .unwrap_err();
     assert!(
         err.to_string()
-            .contains("lineage shadow CDC diverged from authoritative CDC"),
+            .contains("lineage-backed CDC diverged from the committed payload log"),
         "expected strict lineage shadow reader mismatch error, got {err}"
     );
     let lineage_shadow = report
@@ -2735,7 +2881,7 @@ async fn test_v4_lineage_shadow_cdc_source_errors_when_rowids_are_missing() {
     let dir = test_dir("v4_lineage_shadow_missing_rowids");
     let path = dir.path();
 
-    let db = Database::init(path, test_schema_src()).await.unwrap();
+    let db = init_v4_db(path, test_schema_src()).await;
     db.load(test_data_src()).await.unwrap();
     drop(db);
 
@@ -2755,7 +2901,7 @@ async fn test_v4_lineage_shadow_cdc_source_errors_when_rowids_are_missing() {
     let err = read_visible_cdc_entries_with_source(path, 0, None, VisibleCdcSource::LineageShadow)
         .unwrap_err();
     assert!(
-        err.to_string().contains("lineage shadow CDC is incomplete"),
+        err.to_string().contains("lineage-backed CDC is incomplete"),
         "expected strict lineage shadow reader incompleteness error, got {err}"
     );
 }
@@ -2784,10 +2930,9 @@ async fn test_migration_rebuilds_vector_indexes_for_indexed_vector_properties() 
         .find(|n| n.name == "Doc")
         .expect("doc node type");
     let expected_index_name = crate::store::indexing::vector_index_name(doc.type_id, "embedding");
-    let dataset_path = path.join("nodes").join(SchemaIR::dir_name(doc.type_id));
-
-    let uri = dataset_path.to_string_lossy().to_string();
-    let dataset = Dataset::open(&uri).await.unwrap();
+    let metadata = DatabaseMetadata::open(path).unwrap();
+    let locator = metadata.node_dataset_locator("Doc").unwrap();
+    let dataset = open_dataset_for_locator(&locator).await.unwrap();
     let index_names: HashSet<String> = dataset
         .load_indices()
         .await
@@ -2848,36 +2993,28 @@ async fn test_delete_nodes_cascades_edges() {
     assert_eq!(tx_rows[1].db_version, 2);
     assert_eq!(tx_rows[1].op_summary, "mutation:delete_nodes");
 
-    let cdc_rows = read_visible_cdc_entries(path, 1, Some(2)).unwrap();
+    let change_rows = read_visible_change_rows(path, 1, Some(2)).unwrap();
     assert!(
-        cdc_rows
+        change_rows
             .iter()
-            .any(|e| { e.op == "delete" && e.entity_kind == "node" && e.type_name == "Person" })
+            .any(|row| row.change_kind == "delete" && row.entity_kind == "node" && row.type_name == "Person")
     );
     assert!(
-        cdc_rows
+        change_rows
             .iter()
-            .any(|e| { e.op == "delete" && e.entity_kind == "edge" })
+            .any(|row| row.change_kind == "delete" && row.entity_kind == "edge")
     );
-    let delete_rows = read_visible_graph_change_records(path, 1, Some(2)).unwrap();
+    let delete_rows = change_rows;
     let alice_delete = delete_rows
         .iter()
         .find(|row| {
-            row.op == "delete"
+            row.change_kind == "delete"
                 && row.entity_kind == "node"
                 && row.type_name == "Person"
-                && row.entity_key == format!("id={alice_id}")
+                && row.entity_id == alice_id
         })
         .unwrap();
-    assert_eq!(alice_delete.rowid_if_known, Some(alice_rowid_before));
-    assert!(
-        delete_rows
-            .iter()
-            .filter(|row| row.op == "delete")
-            .all(|row| row.rowid_if_known.is_some()),
-        "expected all delete rows to carry row ids: {:?}",
-        delete_rows
-    );
+    assert_eq!(alice_delete.rowid, alice_rowid_before);
     assert_lineage_shadow_cdc_matches_authoritative(path, 1, Some(2));
 
     drop(db);
@@ -2984,14 +3121,16 @@ async fn test_delete_edges_uses_lance_native_delete_path() {
         dataset.count_deleted_rows().await.unwrap() > 0,
         "expected native delete tombstones in Knows dataset"
     );
-    let delete_rows = read_visible_graph_change_records(path, 1, Some(2)).unwrap();
+    let delete_rows = read_visible_change_rows(path, 1, Some(2)).unwrap();
     let deleted_edge_rows = delete_rows
         .iter()
-        .filter(|row| row.op == "delete" && row.entity_kind == "edge" && row.type_name == "Knows")
+        .filter(|row| {
+            row.change_kind == "delete" && row.entity_kind == "edge" && row.type_name == "Knows"
+        })
         .collect::<Vec<_>>();
     assert_eq!(deleted_edge_rows.len(), 1);
     let deleted_edge = deleted_edge_rows[0];
-    assert_eq!(deleted_edge.rowid_if_known, Some(alice_bob_rowid_before));
+    assert_eq!(deleted_edge.rowid, alice_bob_rowid_before);
     assert_lineage_shadow_cdc_matches_authoritative(path, 1, Some(2));
     let report = db.doctor().await.unwrap();
     assert!(

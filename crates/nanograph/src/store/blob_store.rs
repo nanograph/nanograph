@@ -87,7 +87,7 @@ pub(crate) async fn store_managed_blob(
 
     let batch = managed_blob_record_batch(&blob_id, bytes, mime_type, source_hint)?;
     match detect_storage_generation(db_path)? {
-        Some(StorageGeneration::V4Namespace) => {
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
             let namespace = open_directory_namespace(db_path).await?;
             write_namespace_batch(
                 namespace,
@@ -147,7 +147,7 @@ pub(crate) async fn read_managed_blob_bytes(db_path: &Path, blob_id: &str) -> Re
 
 async fn find_blob_row_index(db_path: &Path, blob_id: &str) -> Result<Option<(u64, usize)>> {
     let (version, batches) = match detect_storage_generation(db_path)? {
-        Some(StorageGeneration::V4Namespace) => {
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
             let namespace = open_directory_namespace(db_path).await?;
             let version =
                 match namespace_latest_version(namespace.clone(), BLOB_STORE_TABLE_ID).await {
@@ -212,7 +212,7 @@ pub(crate) async fn ensure_blob_store_table(db_path: &Path) -> Result<DatasetEnt
     }
 
     match detect_storage_generation(db_path)? {
-        Some(StorageGeneration::V4Namespace) => {
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
             let namespace = open_directory_namespace(db_path).await?;
             let batch = empty_blob_store_batch();
             let version = write_namespace_batch(
@@ -255,7 +255,7 @@ pub(crate) async fn ensure_blob_store_table(db_path: &Path) -> Result<DatasetEnt
 
 pub(crate) async fn blob_store_manifest_entry(db_path: &Path) -> Result<Option<DatasetEntry>> {
     match detect_storage_generation(db_path)? {
-        Some(StorageGeneration::V4Namespace) => {
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
             let namespace = open_directory_namespace(db_path).await?;
             let location =
                 match resolve_table_location(namespace.clone(), BLOB_STORE_TABLE_ID).await {
@@ -344,7 +344,7 @@ fn manifest_dataset_path(db_path: &Path, location: &str, fallback: &str) -> Stri
 
 async fn open_blob_store_dataset(db_path: &Path, version: u64) -> Result<Dataset> {
     match detect_storage_generation(db_path)? {
-        Some(StorageGeneration::V4Namespace) => {
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
             let namespace = open_directory_namespace(db_path).await?;
             let location = resolve_table_location(namespace, BLOB_STORE_TABLE_ID).await?;
             Dataset::open(&location)

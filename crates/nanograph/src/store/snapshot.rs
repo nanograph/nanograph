@@ -47,14 +47,16 @@ impl GraphSnapshotStore for NamespaceGraphSnapshotStore {
 
 pub fn read_committed_graph_snapshot(db_dir: &Path) -> Result<GraphManifest> {
     match detect_storage_generation(db_dir)? {
-        Some(StorageGeneration::V4Namespace) => NamespaceGraphSnapshotStore.read_snapshot(db_dir),
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
+            NamespaceGraphSnapshotStore.read_snapshot(db_dir)
+        }
         None => ManifestGraphSnapshotStore.read_snapshot(db_dir),
     }
 }
 
 pub fn publish_committed_graph_snapshot(db_dir: &Path, snapshot: &GraphManifest) -> Result<()> {
     match detect_storage_generation(db_dir)? {
-        Some(StorageGeneration::V4Namespace) => {
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
             NamespaceGraphSnapshotStore.publish_snapshot(db_dir, snapshot)
         }
         None => ManifestGraphSnapshotStore.publish_snapshot(db_dir, snapshot),

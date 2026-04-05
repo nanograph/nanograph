@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,30 +21,41 @@ use super::{
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
 use crate::store::graph_mirror::{inspect_graph_mirror, rebuild_graph_mirror_from_wal};
-use crate::store::graph_types::GraphChangeRecord;
+use crate::store::graph_types::{GraphChangeRecord, GraphCommitRecord, GraphDeleteRecord, GraphTouchedTableWindow};
 use crate::store::lance_io::{
     LANCE_INTERNAL_ID_FIELD, open_dataset_for_locator, write_lance_batch,
 };
 use crate::store::manifest::GraphManifest;
 use crate::store::metadata::{DatabaseMetadata, DatasetLocator};
 use crate::store::namespace::{
-    BLOB_STORE_TABLE_ID, GRAPH_CHANGES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID, GRAPH_TX_TABLE_ID,
+    BLOB_STORE_TABLE_ID, GRAPH_CHANGES_TABLE_ID, GRAPH_DELETES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID,
+    GRAPH_TX_TABLE_ID,
     cleanup_namespace_orphan_versions, open_directory_namespace, resolve_table_location,
+};
+use crate::store::namespace_commit::publish_snapshot_bundle_with_staged_entries;
+use crate::store::namespace_lineage_graph_log::{
+    rewrite_graph_delete_records, rewrite_namespace_lineage_graph_commit_records,
 };
 use crate::store::snapshot::{graph_snapshot_table_present, read_committed_graph_snapshot};
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
 use crate::store::txlog::{
     CdcLogEntry, collect_visible_lineage_shadow_cdc_entries, commit_manifest_and_logs,
-    prune_logs_for_replay_window, read_cdc_log_entries, read_tx_catalog_entries,
+    commit_graph_records_and_manifest_namespace_lineage, prune_logs_for_replay_window,
+    read_cdc_log_entries, read_tx_catalog_entries, read_visible_change_rows,
+    read_visible_graph_delete_records_namespace_lineage,
     read_visible_cdc_entries, read_visible_graph_change_records, read_visible_graph_commit_records,
     reconcile_logs_to_manifest,
 };
+use crate::store::v4_graph_log::{rewrite_graph_change_records, rewrite_graph_commit_records};
 
 /// Compact all manifest-tracked Lance datasets and commit updated dataset versions.
 pub async fn compact_database(db_path: &Path, options: CompactOptions) -> Result<CompactResult> {
     let storage_generation = detect_storage_generation(db_path)?;
     let previous_manifest = read_committed_graph_snapshot(db_path)?;
-    if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+    if matches!(
+        storage_generation,
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage)
+    ) {
         cleanup_namespace_orphan_versions(db_path, &previous_manifest).await?;
     }
     reconcile_logs_to_manifest(db_path, previous_manifest.db_version)?;
@@ -97,15 +108,53 @@ pub async fn compact_database(db_path: &Path, options: CompactOptions) -> Result
         next_manifest.db_version = previous_manifest.db_version.saturating_add(1);
         next_manifest.last_tx_id = format!("manifest-{}", next_manifest.db_version);
         next_manifest.committed_at = now_unix_seconds_string();
-        commit_manifest_and_logs(db_path, &next_manifest, &[], "maintenance:compact")?;
-        if !matches!(storage_generation, Some(StorageGeneration::V4Namespace))
-            && let Err(err) = rebuild_graph_mirror_from_wal(db_path).await
-        {
-            warn!(
-                error = %err,
-                db_path = %db_path.display(),
-                "graph mirror rebuild failed after compaction commit"
-            );
+        match storage_generation {
+            Some(StorageGeneration::NamespaceLineage) => {
+                let graph_commit = GraphCommitRecord {
+                    tx_id: next_manifest.last_tx_id.clone().into(),
+                    graph_version: next_manifest.db_version.into(),
+                    table_versions: next_manifest
+                        .datasets
+                        .iter()
+                        .map(|entry| {
+                            crate::store::graph_types::GraphTableVersion::new(
+                                entry.effective_table_id().to_string(),
+                                entry.dataset_version,
+                            )
+                        })
+                        .collect(),
+                    committed_at: next_manifest.committed_at.clone(),
+                    op_summary: "maintenance:compact".to_string(),
+                    schema_identity_version: next_manifest.schema_identity_version,
+                    touched_tables: build_namespace_lineage_touched_table_windows(
+                        &previous_manifest,
+                        &next_manifest,
+                    ),
+                    tx_props: BTreeMap::from([
+                        ("graph_version".to_string(), next_manifest.db_version.to_string()),
+                        ("tx_id".to_string(), next_manifest.last_tx_id.clone()),
+                        ("op_summary".to_string(), "maintenance:compact".to_string()),
+                    ]),
+                };
+                commit_graph_records_and_manifest_namespace_lineage(
+                    db_path,
+                    &graph_commit,
+                    &[],
+                    &next_manifest,
+                )?;
+            }
+            _ => {
+                commit_manifest_and_logs(db_path, &next_manifest, &[], "maintenance:compact")?;
+                if !matches!(storage_generation, Some(StorageGeneration::V4Namespace))
+                    && let Err(err) = rebuild_graph_mirror_from_wal(db_path).await
+                {
+                    warn!(
+                        error = %err,
+                        db_path = %db_path.display(),
+                        "graph mirror rebuild failed after compaction commit"
+                    );
+                }
+            }
         }
         result.manifest_committed = true;
     }
@@ -121,6 +170,9 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
             "retain_tx_versions must be >= 1".to_string(),
         ));
     }
+    if matches!(storage_generation, Some(StorageGeneration::NamespaceLineage)) {
+        return cleanup_database_namespace_lineage(db_path, options).await;
+    }
     if options.retain_dataset_versions == 0 {
         return Err(NanoError::Storage(
             "retain_dataset_versions must be >= 1".to_string(),
@@ -132,11 +184,35 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
         cleanup_namespace_orphan_versions(db_path, &manifest).await?;
     }
     reconcile_logs_to_manifest(db_path, manifest.db_version)?;
+    let v4_all_commits = if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+        Some(read_visible_graph_commit_records(db_path)?)
+    } else {
+        None
+    };
+    let v4_retained_window = v4_all_commits
+        .as_ref()
+        .map(|commits| select_retained_v4_graph_window(commits, options.retain_tx_versions));
+    let v4_lineage_required_versions = v4_all_commits
+        .as_ref()
+        .map(|commits| compute_v4_lineage_required_versions(&manifest, commits, options.retain_tx_versions));
     let log_prune = prune_logs_for_replay_window(db_path, options.retain_tx_versions)?;
     let mut result = if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+        let retained = v4_retained_window.as_ref().expect("v4 retained window");
+        let retained_changes =
+            read_visible_graph_change_records(
+                db_path,
+                retained.lower_bound_exclusive,
+                Some(manifest.db_version),
+            )?;
         CleanupResult {
-            tx_rows_kept: read_tx_catalog_entries(db_path)?.len(),
-            cdc_rows_kept: read_visible_cdc_entries(db_path, 0, Some(manifest.db_version))?.len(),
+            tx_rows_removed: read_tx_catalog_entries(db_path)?
+                .len()
+                .saturating_sub(retained.logical_commits.len()),
+            tx_rows_kept: retained.logical_commits.len(),
+            cdc_rows_removed: read_visible_graph_change_records(db_path, 0, Some(manifest.db_version))?
+                .len()
+                .saturating_sub(retained_changes.len()),
+            cdc_rows_kept: retained_changes.len(),
             ..Default::default()
         }
     } else {
@@ -177,6 +253,23 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
                 options.retain_dataset_versions.max(needed_for_manifest)
             })
             .unwrap_or(options.retain_dataset_versions);
+        let effective_retain_n = if matches!(storage_generation, Some(StorageGeneration::V4Namespace))
+            && matches!(entry.kind.as_str(), "node" | "edge")
+        {
+            v4_lineage_required_versions
+                .as_ref()
+                .and_then(|required| required.get(entry.effective_table_id()))
+                .and_then(|oldest_required| {
+                    versions
+                        .iter()
+                        .position(|version| version.version == *oldest_required)
+                        .map(|idx| versions.len().saturating_sub(idx))
+                })
+                .map(|needed_for_lineage| effective_retain_n.max(needed_for_lineage))
+                .unwrap_or(effective_retain_n)
+        } else {
+            effective_retain_n
+        };
         let policy = CleanupPolicyBuilder::default()
             .retain_n_versions(&dataset, effective_retain_n)
             .await
@@ -193,6 +286,36 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
         result.dataset_bytes_removed += stats.bytes_removed;
     }
 
+    if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+        let retained = v4_retained_window.as_ref().expect("v4 retained window");
+        let retained_changes =
+            read_visible_graph_change_records(
+                db_path,
+                retained.lower_bound_exclusive,
+                Some(manifest.db_version),
+            )?;
+        let staged_tx = rewrite_graph_commit_records(db_path, &retained.staged_commits).await?;
+        let staged_changes = rewrite_graph_change_records(db_path, &retained_changes).await?;
+        let mut next_snapshot = manifest.clone();
+        let replaced_ids = [GRAPH_TX_TABLE_ID, GRAPH_CHANGES_TABLE_ID]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        next_snapshot
+            .datasets
+            .retain(|entry| !replaced_ids.contains(entry.effective_table_id()));
+        next_snapshot
+            .datasets
+            .push(staged_tx.entry.clone());
+        next_snapshot
+            .datasets
+            .push(staged_changes.entry.clone());
+        publish_snapshot_bundle_with_staged_entries(
+            db_path,
+            &next_snapshot,
+            &[staged_tx, staged_changes],
+        )?;
+    }
+
     if !matches!(storage_generation, Some(StorageGeneration::V4Namespace))
         && let Err(err) = rebuild_graph_mirror_from_wal(db_path).await
     {
@@ -204,6 +327,298 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
     }
 
     Ok(result)
+}
+
+async fn cleanup_database_namespace_lineage(
+    db_path: &Path,
+    options: CleanupOptions,
+) -> Result<CleanupResult> {
+    let manifest = read_committed_graph_snapshot(db_path)?;
+    cleanup_namespace_orphan_versions(db_path, &manifest).await?;
+
+    let all_commits = read_visible_graph_commit_records(db_path)?;
+    let retained = select_retained_namespace_lineage_graph_window(
+        &all_commits,
+        options.retain_tx_versions,
+    );
+    let retained_deletes = read_visible_graph_delete_records_namespace_lineage(
+        db_path,
+        retained.lower_bound_exclusive,
+        Some(manifest.db_version),
+    )?;
+    let total_change_rows = read_visible_change_rows(db_path, 0, Some(manifest.db_version))?;
+    let retained_change_rows = read_visible_change_rows(
+        db_path,
+        retained.lower_bound_exclusive,
+        Some(manifest.db_version),
+    )?;
+    let required_versions =
+        compute_namespace_lineage_required_versions(&retained.logical_commits);
+
+    let mut result = CleanupResult {
+        tx_rows_removed: all_commits.len().saturating_sub(retained.logical_commits.len()),
+        tx_rows_kept: retained.logical_commits.len(),
+        cdc_rows_removed: total_change_rows.len().saturating_sub(retained_change_rows.len()),
+        cdc_rows_kept: retained_change_rows.len(),
+        ..Default::default()
+    };
+
+    for entry in &manifest.datasets {
+        let dataset_path = db_path.join(&entry.dataset_path);
+        let uri = dataset_path.to_string_lossy().to_string();
+        let dataset = Dataset::open(&uri)
+            .await
+            .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
+        dataset
+            .checkout_version(entry.dataset_version)
+            .await
+            .map_err(|e| {
+                NanoError::Lance(format!(
+                    "checkout version {} error: {}",
+                    entry.dataset_version, e
+                ))
+            })?;
+
+        let versions = dataset
+            .versions()
+            .await
+            .map_err(|e| NanoError::Lance(format!("list versions error: {}", e)))?;
+        let effective_retain_n = if matches!(entry.kind.as_str(), "node" | "edge") {
+            required_versions
+                .get(entry.effective_table_id())
+                .and_then(|oldest_required| {
+                    versions
+                        .iter()
+                        .position(|version| version.version == *oldest_required)
+                        .map(|idx| versions.len().saturating_sub(idx))
+                })
+                .unwrap_or(1)
+        } else {
+            1
+        };
+
+        let policy = CleanupPolicyBuilder::default()
+            .retain_n_versions(&dataset, effective_retain_n.max(1))
+            .await
+            .map_err(|e| NanoError::Lance(format!("cleanup policy error: {}", e)))?
+            .build();
+        let stats = dataset
+            .cleanup_with_policy(policy)
+            .await
+            .map_err(|e| NanoError::Lance(format!("cleanup error: {}", e)))?;
+        if stats.old_versions > 0 {
+            result.datasets_cleaned += 1;
+        }
+        result.dataset_old_versions_removed += stats.old_versions;
+        result.dataset_bytes_removed += stats.bytes_removed;
+    }
+
+    let staged_tx = rewrite_namespace_lineage_graph_commit_records(
+        db_path,
+        &retained.logical_commits,
+    )
+    .await?;
+    let staged_deletes = rewrite_graph_delete_records(db_path, &retained_deletes).await?;
+    let mut next_snapshot = manifest.clone();
+    let replaced_ids = [GRAPH_TX_TABLE_ID, GRAPH_DELETES_TABLE_ID]
+        .into_iter()
+        .collect::<HashSet<_>>();
+    next_snapshot
+        .datasets
+        .retain(|entry| !replaced_ids.contains(entry.effective_table_id()));
+    next_snapshot.datasets.push(staged_tx.entry.clone());
+    next_snapshot.datasets.push(staged_deletes.entry.clone());
+    publish_snapshot_bundle_with_staged_entries(
+        db_path,
+        &next_snapshot,
+        &[staged_tx, staged_deletes],
+    )?;
+    cleanup_namespace_orphan_versions(db_path, &next_snapshot).await?;
+
+    Ok(result)
+}
+
+struct RetainedV4GraphWindow {
+    staged_commits: Vec<GraphCommitRecord>,
+    logical_commits: Vec<GraphCommitRecord>,
+    lower_bound_exclusive: u64,
+}
+
+struct RetainedNamespaceLineageGraphWindow {
+    logical_commits: Vec<GraphCommitRecord>,
+    lower_bound_exclusive: u64,
+}
+
+fn select_retained_v4_graph_window(
+    commits: &[GraphCommitRecord],
+    retain_tx_versions: u64,
+) -> RetainedV4GraphWindow {
+    let retain_count = (retain_tx_versions as usize).min(commits.len());
+    if retain_count == 0 {
+        return RetainedV4GraphWindow {
+            staged_commits: Vec::new(),
+            logical_commits: Vec::new(),
+            lower_bound_exclusive: 0,
+        };
+    }
+    let logical_start = commits.len().saturating_sub(retain_count);
+    let logical_commits = commits[logical_start..].to_vec();
+    let mut staged_commits = logical_commits.clone();
+    if let Some(predecessor) = logical_start.checked_sub(1).and_then(|idx| commits.get(idx)) {
+        staged_commits.insert(0, predecessor.clone());
+    }
+    let lower_bound_exclusive = logical_commits
+        .first()
+        .map(|commit| commit.graph_version.value().saturating_sub(1))
+        .unwrap_or(0);
+    RetainedV4GraphWindow {
+        staged_commits,
+        logical_commits,
+        lower_bound_exclusive,
+    }
+}
+
+fn select_retained_namespace_lineage_graph_window(
+    commits: &[GraphCommitRecord],
+    retain_tx_versions: u64,
+) -> RetainedNamespaceLineageGraphWindow {
+    let retain_count = (retain_tx_versions as usize).min(commits.len());
+    if retain_count == 0 {
+        return RetainedNamespaceLineageGraphWindow {
+            logical_commits: Vec::new(),
+            lower_bound_exclusive: 0,
+        };
+    }
+    let logical_start = commits.len().saturating_sub(retain_count);
+    let logical_commits = commits[logical_start..].to_vec();
+    let lower_bound_exclusive = logical_commits
+        .first()
+        .map(|commit| commit.graph_version.value().saturating_sub(1))
+        .unwrap_or(0);
+    RetainedNamespaceLineageGraphWindow {
+        logical_commits,
+        lower_bound_exclusive,
+    }
+}
+
+fn compute_v4_lineage_required_versions(
+    manifest: &GraphManifest,
+    commits: &[GraphCommitRecord],
+    retain_tx_versions: u64,
+) -> BTreeMap<String, u64> {
+    let retain_count = (retain_tx_versions as usize).min(commits.len());
+    if retain_count == 0 {
+        return BTreeMap::new();
+    }
+    let retain_start = commits.len().saturating_sub(retain_count);
+    let predecessor = retain_start.checked_sub(1).and_then(|idx| commits.get(idx));
+    let retained_commits = &commits[retain_start..];
+    let mut out = BTreeMap::new();
+
+    for entry in manifest
+        .datasets
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
+    {
+        let table_id = entry.effective_table_id().to_string();
+        let mut previous_version =
+            predecessor.and_then(|commit| graph_commit_table_version(commit, &table_id));
+        let mut oldest_required = None::<u64>;
+
+        for commit in retained_commits {
+            let Some(current_version) = graph_commit_table_version(commit, &table_id) else {
+                continue;
+            };
+            if previous_version != Some(current_version) {
+                oldest_required = Some(
+                    oldest_required
+                        .map(|version| version.min(current_version))
+                        .unwrap_or(current_version),
+                );
+                if let Some(previous_version) = previous_version {
+                    oldest_required = Some(
+                        oldest_required
+                            .map(|version| version.min(previous_version))
+                            .unwrap_or(previous_version),
+                    );
+                }
+            }
+            previous_version = Some(current_version);
+        }
+
+        if let Some(oldest_required) = oldest_required {
+            out.insert(table_id, oldest_required);
+        }
+    }
+
+    out
+}
+
+fn compute_namespace_lineage_required_versions(
+    commits: &[GraphCommitRecord],
+) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    for commit in commits {
+        for window in &commit.touched_tables {
+            if window.before_version > 0 {
+                out.entry(window.table_id.as_str().to_string())
+                    .and_modify(|version: &mut u64| *version = (*version).min(window.before_version))
+                    .or_insert(window.before_version);
+            }
+            if window.after_version > 0 {
+                out.entry(window.table_id.as_str().to_string())
+                    .and_modify(|version: &mut u64| *version = (*version).min(window.after_version))
+                    .or_insert(window.after_version);
+            }
+        }
+    }
+    out
+}
+
+fn build_namespace_lineage_touched_table_windows(
+    previous_manifest: &GraphManifest,
+    next_manifest: &GraphManifest,
+) -> Vec<GraphTouchedTableWindow> {
+    let previous_by_key = previous_manifest
+        .datasets
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
+        .map(|entry| (format!("{}:{}", entry.kind, entry.type_name), entry))
+        .collect::<HashMap<_, _>>();
+    let mut windows = next_manifest
+        .datasets
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
+        .filter_map(|entry| {
+            let previous = previous_by_key.get(&format!("{}:{}", entry.kind, entry.type_name));
+            let before_version = previous.map(|entry| entry.dataset_version).unwrap_or(0);
+            if before_version == entry.dataset_version {
+                return None;
+            }
+            Some(GraphTouchedTableWindow::new(
+                entry.effective_table_id().to_string(),
+                entry.kind.clone(),
+                entry.type_name.clone(),
+                before_version,
+                entry.dataset_version,
+            ))
+        })
+        .collect::<Vec<_>>();
+    windows.sort_by(|a, b| {
+        a.entity_kind
+            .cmp(&b.entity_kind)
+            .then(a.type_name.cmp(&b.type_name))
+            .then(a.table_id.as_str().cmp(b.table_id.as_str()))
+    });
+    windows
+}
+
+fn graph_commit_table_version(commit: &GraphCommitRecord, table_id: &str) -> Option<u64> {
+    commit
+        .table_versions
+        .iter()
+        .find(|version| version.table_id.as_str() == table_id)
+        .map(|version| version.version)
 }
 
 impl Database {
@@ -408,7 +823,27 @@ impl Database {
             }
         }
 
-        if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+        if matches!(storage_generation, Some(StorageGeneration::NamespaceLineage)) {
+            let namespace = open_directory_namespace(&self.path).await?;
+            for required in [
+                GRAPH_TX_TABLE_ID,
+                GRAPH_DELETES_TABLE_ID,
+                BLOB_STORE_TABLE_ID,
+                GRAPH_SNAPSHOT_TABLE_ID,
+            ] {
+                if let Err(err) = resolve_table_location(namespace.clone(), required).await {
+                    warnings.push(format!(
+                        "namespace-lineage internal table {} is missing: {}",
+                        required, err
+                    ));
+                }
+            }
+            if !graph_snapshot_table_present(&self.path).await? {
+                warnings.push("namespace-lineage graph snapshot table is missing".to_string());
+            }
+            validate_namespace_lineage_state(&metadata, &manifest, &mut issues, &mut warnings)
+                .await?;
+        } else if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
             let namespace = open_directory_namespace(&self.path).await?;
             for required in [
                 GRAPH_TX_TABLE_ID,
@@ -465,7 +900,29 @@ impl Database {
             }
         }
 
-        let cdc_rows = read_cdc_log_entries(&self.path)?;
+        let cdc_rows = match storage_generation {
+            Some(StorageGeneration::NamespaceLineage) => match read_visible_change_rows(
+                &self.path,
+                0,
+                Some(manifest.db_version),
+            ) {
+                Ok(rows) => rows.len(),
+                Err(err) => {
+                    issues.push(format!("NamespaceLineage CDC read failed: {}", err));
+                    0
+                }
+            },
+            _ => match read_cdc_log_entries(&self.path) {
+                Ok(rows) => rows.len(),
+                Err(err) if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) => {
+                    issues.push(format!("v4 lineage-backed CDC read failed: {}", err));
+                    read_visible_graph_change_records(&self.path, 0, Some(manifest.db_version))
+                        .map(|rows| rows.len())
+                        .unwrap_or(0)
+                }
+                Err(err) => return Err(err),
+            },
+        };
         let healthy = issues.is_empty();
         Ok(DoctorReport {
             healthy,
@@ -475,7 +932,7 @@ impl Database {
             datasets_checked,
             datasets,
             tx_rows: tx_rows.len(),
-            cdc_rows: cdc_rows.len(),
+            cdc_rows,
             lineage_shadow,
         })
     }
@@ -516,6 +973,89 @@ struct ExpectedLineageChanges {
     inserts: BTreeSet<(u64, u64)>,
     updates: BTreeSet<(u64, u64)>,
     missing_rowid_entities: Vec<String>,
+}
+
+async fn validate_namespace_lineage_state(
+    metadata: &DatabaseMetadata,
+    manifest: &GraphManifest,
+    issues: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let commits = read_visible_graph_commit_records(metadata.path())?;
+    for commit in &commits {
+        for window in &commit.touched_tables {
+            if window.after_version == 0 {
+                issues.push(format!(
+                    "namespace-lineage tx {} has invalid touched-table after_version for {} {}",
+                    commit.tx_id.as_str(),
+                    window.entity_kind,
+                    window.type_name
+                ));
+            }
+            if window.before_version > window.after_version && window.after_version > 0 {
+                issues.push(format!(
+                    "namespace-lineage tx {} has inverted touched-table window {} {} {}>{}",
+                    commit.tx_id.as_str(),
+                    window.entity_kind,
+                    window.type_name,
+                    window.before_version,
+                    window.after_version
+                ));
+            }
+        }
+    }
+
+    let deletes =
+        read_visible_graph_delete_records_namespace_lineage(
+            metadata.path(),
+            0,
+            Some(manifest.db_version),
+        )?;
+    validate_namespace_lineage_delete_records(&deletes, issues, warnings);
+
+    if let Err(err) = read_visible_change_rows(metadata.path(), 0, Some(manifest.db_version)) {
+        issues.push(format!(
+            "NamespaceLineage CDC reconstruction failed for retained window: {}",
+            err
+        ));
+    }
+    Ok(())
+}
+
+fn validate_namespace_lineage_delete_records(
+    deletes: &[GraphDeleteRecord],
+    issues: &mut Vec<String>,
+    warnings: &mut Vec<String>,
+) {
+    let mut seen = BTreeSet::new();
+    for row in deletes {
+        if row.logical_key.is_empty() {
+            issues.push(format!(
+                "namespace-lineage delete tombstone is missing logical_key for {} {} id={}",
+                row.entity_kind, row.type_name, row.entity_id
+            ));
+        }
+        if !row.row.is_object() {
+            issues.push(format!(
+                "namespace-lineage delete tombstone row payload is not an object for {} {} id={}",
+                row.entity_kind, row.type_name, row.entity_id
+            ));
+        }
+        let key = (
+            row.graph_version.value(),
+            row.table_id.as_str().to_string(),
+            row.rowid,
+        );
+        if !seen.insert(key) {
+            warnings.push(format!(
+                "duplicate namespace-lineage delete tombstone for {} {} rowid={} graph_version={}",
+                row.entity_kind,
+                row.type_name,
+                row.rowid,
+                row.graph_version.value()
+            ));
+        }
+    }
 }
 
 async fn validate_v4_lineage_state(

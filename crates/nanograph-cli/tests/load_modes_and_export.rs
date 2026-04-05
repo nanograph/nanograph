@@ -131,7 +131,9 @@ fn load_accepts_db_flag_end_to_end() {
         "--format",
         "jsonl",
     ]);
-    assert!(changes.stdout.contains("\"db_version\""));
+    assert!(changes.stdout.contains("\"graph_version\""));
+    assert!(changes.stdout.contains("\"change_kind\""));
+    assert!(!changes.stdout.contains("\"seq_in_tx\""));
 }
 
 #[test]

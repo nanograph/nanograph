@@ -5,8 +5,8 @@ use tracing::instrument;
 
 use crate::ui::{stdout_supports_color, style_label};
 use nanograph::store::export::build_export_rows_at_path;
-use nanograph::store::manifest::GraphManifest;
 use nanograph::store::metadata::DatabaseMetadata;
+use nanograph::store::snapshot::read_committed_graph_snapshot;
 
 #[instrument(fields(db = ?db_path.as_ref().map(|p| p.display().to_string())))]
 pub(crate) async fn cmd_version(db_path: Option<PathBuf>, json: bool, quiet: bool) -> Result<()> {
@@ -31,7 +31,7 @@ pub(crate) fn build_version_payload(db_path: Option<&Path>) -> Result<serde_json
     });
 
     if let Some(path) = db_path {
-        let manifest = GraphManifest::read(path)?;
+        let manifest = read_committed_graph_snapshot(path)?;
         let dataset_versions = manifest
             .datasets
             .iter()

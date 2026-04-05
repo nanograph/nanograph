@@ -20,7 +20,10 @@ use crate::query::ast::{CompOp, Literal, MatchValue, Mutation, QueryDecl};
 use crate::result::MutationResult;
 use crate::store::graph::DatasetAccumulator;
 use crate::store::graph_mirror::rebuild_graph_mirror_from_wal;
-use crate::store::graph_types::{GraphChangeRecord, GraphCommitRecord, GraphTableVersion};
+use crate::store::graph_types::{
+    GraphChangeRecord, GraphCommitRecord, GraphDeleteRecord, GraphTableVersion,
+    GraphTouchedTableWindow,
+};
 use crate::store::indexing::{
     rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
 };
@@ -37,10 +40,14 @@ use crate::store::loader::{
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::metadata::DatabaseMetadata;
 use crate::store::namespace::{open_directory_namespace, resolve_table_location};
+use crate::store::namespace_lineage_internal::merge_namespace_lineage_internal_dataset_entries;
 use crate::store::runtime::DatabaseRuntime;
 use crate::store::snapshot::read_committed_graph_snapshot;
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
-use crate::store::txlog::{CdcLogEntry, commit_graph_records_and_manifest};
+use crate::store::txlog::{
+    CdcLogEntry, commit_graph_records_and_manifest,
+    commit_graph_records_and_manifest_namespace_lineage,
+};
 use crate::store::v4_internal::merge_v4_internal_dataset_entries;
 use crate::types::ScalarType;
 
@@ -1160,7 +1167,10 @@ async fn resolve_manifest_dataset_path(
     fallback_rel_path: &str,
     storage_generation: Option<StorageGeneration>,
 ) -> Result<String> {
-    if !matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
+    if !matches!(
+        storage_generation,
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage)
+    ) {
         return Ok(fallback_rel_path.to_string());
     }
 
@@ -1180,7 +1190,9 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
 ) -> Result<()> {
     let storage_generation = detect_storage_generation(db_path)?;
     let table_store: Box<dyn TableStore> = match storage_generation {
-        Some(StorageGeneration::V4Namespace) => Box::new(V4NamespaceTableStore::new(db_path)),
+        Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
+            Box::new(V4NamespaceTableStore::new(db_path))
+        }
         None => Box::new(V3TableStore::new()),
     };
     let previous_manifest = read_committed_graph_snapshot(db_path)?;
@@ -1221,7 +1233,9 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             .map(|entry| entry.dataset_path.clone())
             .unwrap_or_else(|| table_id.clone());
         let dataset_path = match storage_generation {
-            Some(StorageGeneration::V4Namespace) => db_path.join(&table_id),
+            Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
+                db_path.join(&table_id)
+            }
             None => db_path.join(&dataset_rel_path),
         };
         let duplicate_field_names = schema_has_duplicate_field_names(batch.schema().as_ref());
@@ -1378,7 +1392,9 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             .map(|entry| entry.dataset_path.clone())
             .unwrap_or_else(|| table_id.clone());
         let dataset_path = match storage_generation {
-            Some(StorageGeneration::V4Namespace) => db_path.join(&table_id),
+            Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
+                db_path.join(&table_id)
+            }
             None => db_path.join(&dataset_rel_path),
         };
         let duplicate_field_names = schema_has_duplicate_field_names(batch.schema().as_ref());
@@ -1456,7 +1472,16 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
         ));
     }
 
-    merge_v4_internal_dataset_entries(db_path, &mut dataset_entries).await?;
+    match storage_generation {
+        Some(StorageGeneration::V4Namespace) => {
+            merge_v4_internal_dataset_entries(db_path, &mut dataset_entries).await?;
+        }
+        Some(StorageGeneration::NamespaceLineage) => {
+            merge_namespace_lineage_internal_dataset_entries(db_path, &mut dataset_entries)
+                .await?;
+        }
+        None => {}
+    }
 
     let ir_json = serde_json::to_string_pretty(schema_ir)
         .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
@@ -1474,10 +1499,7 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
     manifest.schema_identity_version = previous_manifest.schema_identity_version.max(1);
     manifest.datasets = dataset_entries;
 
-    let committed_cdc_events = finalize_cdc_entries_for_manifest(
-        &build_pending_cdc_entries_from_delta(&plan.delta)?,
-        &manifest,
-    );
+    let touched_tables = build_touched_table_windows(&previous_manifest, &manifest);
     let graph_commit = GraphCommitRecord {
         tx_id: manifest.last_tx_id.clone().into(),
         graph_version: manifest.db_version.into(),
@@ -1493,7 +1515,36 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             .collect(),
         committed_at: manifest.committed_at.clone(),
         op_summary: plan.op_summary.clone(),
+        schema_identity_version: manifest.schema_identity_version,
+        touched_tables,
+        tx_props: BTreeMap::from([
+            ("graph_version".to_string(), manifest.db_version.to_string()),
+            ("tx_id".to_string(), manifest.last_tx_id.clone()),
+            ("op_summary".to_string(), plan.op_summary.clone()),
+        ]),
     };
+    if matches!(storage_generation, Some(StorageGeneration::NamespaceLineage)) {
+        let graph_deletes = build_namespace_lineage_delete_records_from_delta(
+            db_path,
+            &previous_manifest,
+            &manifest,
+            &plan.delta,
+        )
+        .await?;
+        commit_graph_records_and_manifest_namespace_lineage(
+            db_path,
+            &graph_commit,
+            &graph_deletes,
+            &manifest,
+        )?;
+        super::maintenance::cleanup_stale_dirs(db_path, &manifest)?;
+        return Ok(());
+    }
+
+    let committed_cdc_events = finalize_cdc_entries_for_manifest(
+        &build_pending_cdc_entries_from_delta(&plan.delta)?,
+        &manifest,
+    );
     let mut graph_changes: Vec<GraphChangeRecord> = committed_cdc_events
         .iter()
         .cloned()
@@ -2167,6 +2218,186 @@ async fn resolve_rowids_for_locator_from_committed_snapshot(
         out.insert(entity_ids.value(row), rowids.value(row));
     }
     Ok(out)
+}
+
+fn build_touched_table_windows(
+    previous_manifest: &GraphManifest,
+    next_manifest: &GraphManifest,
+) -> Vec<GraphTouchedTableWindow> {
+    let previous_by_key = previous_manifest
+        .datasets
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
+        .map(|entry| (dataset_entity_key(&entry.kind, &entry.type_name), entry))
+        .collect::<HashMap<_, _>>();
+    let mut windows = next_manifest
+        .datasets
+        .iter()
+        .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
+        .filter_map(|entry| {
+            let previous = previous_by_key.get(&dataset_entity_key(&entry.kind, &entry.type_name));
+            let previous_version = previous.map(|entry| entry.dataset_version).unwrap_or(0);
+            if previous_version == entry.dataset_version {
+                return None;
+            }
+            Some(GraphTouchedTableWindow::new(
+                entry.effective_table_id().to_string(),
+                entry.kind.clone(),
+                entry.type_name.clone(),
+                previous_version,
+                entry.dataset_version,
+            ))
+        })
+        .collect::<Vec<_>>();
+    windows.sort_by(|a, b| {
+        a.entity_kind
+            .cmp(&b.entity_kind)
+            .then(a.type_name.cmp(&b.type_name))
+            .then(a.table_id.as_str().cmp(b.table_id.as_str()))
+    });
+    windows
+}
+
+async fn build_namespace_lineage_delete_records_from_delta(
+    db_path: &Path,
+    previous_manifest: &GraphManifest,
+    next_manifest: &GraphManifest,
+    delta: &MutationDelta,
+) -> Result<Vec<GraphDeleteRecord>> {
+    let metadata = DatabaseMetadata::open(db_path)?;
+    let mut rows = Vec::new();
+
+    let mut node_names: Vec<&String> = delta.node_changes.keys().collect();
+    node_names.sort();
+    for type_name in node_names {
+        let Some(change) = delta.node_changes.get(type_name) else {
+            continue;
+        };
+        let Some(before_batch) = &change.before_for_deletes else {
+            continue;
+        };
+        rows.extend(
+            build_namespace_lineage_delete_records_for_batch(
+                &metadata,
+                previous_manifest,
+                next_manifest,
+                "node",
+                type_name,
+                before_batch,
+            )
+            .await?,
+        );
+    }
+
+    let mut edge_names: Vec<&String> = delta.edge_changes.keys().collect();
+    edge_names.sort();
+    for type_name in edge_names {
+        let Some(change) = delta.edge_changes.get(type_name) else {
+            continue;
+        };
+        let Some(before_batch) = &change.before_for_deletes else {
+            continue;
+        };
+        rows.extend(
+            build_namespace_lineage_delete_records_for_batch(
+                &metadata,
+                previous_manifest,
+                next_manifest,
+                "edge",
+                type_name,
+                before_batch,
+            )
+            .await?,
+        );
+    }
+
+    Ok(rows)
+}
+
+async fn build_namespace_lineage_delete_records_for_batch(
+    metadata: &DatabaseMetadata,
+    previous_manifest: &GraphManifest,
+    next_manifest: &GraphManifest,
+    entity_kind: &str,
+    type_name: &str,
+    batch: &RecordBatch,
+) -> Result<Vec<GraphDeleteRecord>> {
+    if batch.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+    let locator = metadata
+        .dataset_locator(entity_kind, type_name)
+        .ok_or_else(|| {
+            NanoError::Storage(format!(
+                "missing committed dataset locator for {} {} while building namespace-lineage deletes",
+                entity_kind, type_name
+            ))
+        })?;
+    let ids = collect_ids_from_batch(batch)?
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let rowids = resolve_rowids_for_locator_from_committed_snapshot(&locator, &ids).await?;
+    let table_id = previous_manifest
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == entity_kind && entry.type_name == type_name)
+        .map(|entry| entry.effective_table_id().to_string())
+        .unwrap_or_else(|| locator.table_id.clone());
+    let previous_graph_version = (previous_manifest.db_version > 0).then_some(previous_manifest.db_version);
+
+    let mut out = Vec::with_capacity(batch.num_rows());
+    for row in 0..batch.num_rows() {
+        let object = record_batch_row_to_json_map(batch, row)?;
+        let entity_id = object
+            .get("__ng_id")
+            .and_then(|value| value.as_u64())
+            .or_else(|| object.get("id").and_then(|value| value.as_u64()))
+            .ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "missing id for {} {} tombstone row {}",
+                    entity_kind, type_name, row
+                ))
+            })?;
+        let rowid = rowids.get(&entity_id).copied().ok_or_else(|| {
+            NanoError::Storage(format!(
+                "missing stable rowid for {} {} tombstone id={}",
+                entity_kind, type_name, entity_id
+            ))
+        })?;
+        let row_value = serde_json::Value::Object(object);
+        out.push(GraphDeleteRecord {
+            tx_id: next_manifest.last_tx_id.clone().into(),
+            graph_version: next_manifest.db_version.into(),
+            committed_at: next_manifest.committed_at.clone(),
+            entity_kind: entity_kind.to_string(),
+            type_name: type_name.to_string(),
+            table_id: table_id.clone().into(),
+            rowid,
+            entity_id,
+            logical_key: namespace_lineage_delete_logical_key(entity_kind, entity_id, &row_value),
+            row: row_value,
+            previous_graph_version,
+        });
+    }
+    Ok(out)
+}
+
+fn namespace_lineage_delete_logical_key(
+    entity_kind: &str,
+    entity_id: u64,
+    row: &serde_json::Value,
+) -> String {
+    let Some(object) = row.as_object() else {
+        return format!("id={}", entity_id);
+    };
+    if entity_kind == "edge" {
+        let src = object.get("src").and_then(|value| value.as_u64());
+        let dst = object.get("dst").and_then(|value| value.as_u64());
+        if let (Some(src), Some(dst)) = (src, dst) {
+            return format!("id={},src={},dst={}", entity_id, src, dst);
+        }
+    }
+    format!("id={}", entity_id)
 }
 
 fn build_pending_cdc_entries_from_delta(delta: &MutationDelta) -> Result<Vec<CdcLogEntry>> {

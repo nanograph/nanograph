@@ -34,9 +34,11 @@ pub struct DatabaseMetadata {
 impl DatabaseMetadata {
     pub fn open(db_path: &Path) -> Result<Self> {
         match detect_storage_generation(db_path)? {
-            Some(StorageGeneration::V4Namespace) => Self::open_v4(db_path),
+            Some(StorageGeneration::V4Namespace | StorageGeneration::NamespaceLineage) => {
+                Self::open_namespace(db_path)
+            }
             None => Err(NanoError::Storage(format!(
-                "database {} uses legacy v3 storage; run `nanograph storage migrate --db {} --target lance-v4`",
+                "database {} uses legacy v3 storage; run `nanograph storage migrate --db {} --target lineage-native`",
                 db_path.display(),
                 db_path.display()
             ))),
@@ -85,7 +87,7 @@ impl DatabaseMetadata {
         })
     }
 
-    fn open_v4(db_path: &Path) -> Result<Self> {
+    fn open_namespace(db_path: &Path) -> Result<Self> {
         if !db_path.exists() {
             return Err(NanoError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
@@ -162,7 +164,7 @@ impl DatabaseMetadata {
                 row_count: entry.row_count,
                 namespace_managed: matches!(
                     detect_storage_generation(&self.path),
-                    Ok(Some(StorageGeneration::V4Namespace))
+                    Ok(Some(generation)) if generation.is_namespace_managed()
                 ),
             })
     }

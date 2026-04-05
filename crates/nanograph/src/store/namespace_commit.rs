@@ -219,6 +219,24 @@ pub(crate) fn publish_snapshot_bundle(db_dir: &Path, snapshot: &GraphManifest) -
     })
 }
 
+pub(crate) fn publish_snapshot_bundle_with_staged_entries(
+    db_dir: &Path,
+    snapshot: &GraphManifest,
+    staged_entries: &[StagedNamespaceTable],
+) -> Result<()> {
+    let db_dir = db_dir.to_path_buf();
+    let snapshot = snapshot.clone();
+    let staged_entries = staged_entries.to_vec();
+    run_namespace_commit_task("publish v4 snapshot bundle with staged entries", move || async move {
+        let bundle =
+            build_snapshot_bundle_with_staged_entries_async(&db_dir, &snapshot, &staged_entries)
+                .await?;
+        GraphCommitBundlePublisher
+            .publish_bundle_async(&db_dir, &bundle)
+            .await
+    })
+}
+
 async fn build_graph_update_bundle_async(
     db_dir: &Path,
     graph_commit: &GraphCommitRecord,

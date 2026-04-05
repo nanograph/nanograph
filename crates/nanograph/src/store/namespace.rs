@@ -26,6 +26,7 @@ const DEFAULT_NEW_DATASET_STORAGE_VERSION: LanceFileVersion = LanceFileVersion::
 
 pub(crate) const GRAPH_TX_TABLE_ID: &str = "__graph_tx";
 pub(crate) const GRAPH_CHANGES_TABLE_ID: &str = "__graph_changes";
+pub(crate) const GRAPH_DELETES_TABLE_ID: &str = "__graph_deletes";
 pub(crate) const GRAPH_SNAPSHOT_TABLE_ID: &str = "__graph_snapshot";
 pub(crate) const BLOB_STORE_TABLE_ID: &str = "__blob_store";
 

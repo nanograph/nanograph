@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -11,7 +12,7 @@ use crate::error::{NanoError, Result};
 use crate::store::blob_store::store_managed_blob;
 use crate::store::database::Database;
 use crate::store::database::persist::{json_rows_to_record_batch, record_batch_to_json_rows};
-use crate::store::graph_types::{GraphCommitRecord, GraphTableVersion};
+use crate::store::graph_types::{GraphCommitRecord, GraphTableVersion, GraphTouchedTableWindow};
 use crate::store::indexing::{
     rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
 };
@@ -21,9 +22,12 @@ use crate::store::metadata::DatabaseMetadata;
 use crate::store::namespace::{
     open_directory_namespace, resolve_table_location, write_namespace_batch,
 };
+use crate::store::namespace_lineage_internal::merge_namespace_lineage_internal_dataset_entries;
 use crate::store::snapshot::read_committed_graph_snapshot;
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
-use crate::store::txlog::commit_graph_records_and_manifest;
+use crate::store::txlog::{
+    commit_graph_records_and_manifest, commit_graph_records_and_manifest_namespace_lineage,
+};
 use crate::store::v4_internal::merge_v4_internal_dataset_entries;
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
@@ -46,6 +50,12 @@ pub async fn migrate_storage_to_lance_v4(db_path: &Path) -> Result<StorageMigrat
                 db_path.display()
             )));
         }
+        Some(StorageGeneration::NamespaceLineage) => {
+            return Err(NanoError::Storage(format!(
+                "database {} already uses NamespaceLineage storage",
+                db_path.display()
+            )));
+        }
         None => {}
     }
 
@@ -65,7 +75,8 @@ pub async fn migrate_storage_to_lance_v4(db_path: &Path) -> Result<StorageMigrat
         let node_table_count = legacy.schema_ir().node_types().count();
         let edge_table_count = legacy.schema_ir().edge_types().count();
 
-        Database::init(db_path, &schema_source).await?;
+        Database::init_with_generation(db_path, &schema_source, StorageGeneration::V4Namespace)
+            .await?;
 
         let mut dataset_entries = Vec::new();
         let mut media_uris_rewritten = 0usize;
@@ -166,6 +177,9 @@ pub async fn migrate_storage_to_lance_v4(db_path: &Path) -> Result<StorageMigrat
                 .collect(),
             committed_at: manifest.committed_at.clone(),
             op_summary: "storage:migrate:v3-to-lance-v4".to_string(),
+            schema_identity_version: manifest.schema_identity_version,
+            touched_tables: Vec::new(),
+            tx_props: std::collections::BTreeMap::new(),
         };
         commit_graph_records_and_manifest(db_path, &graph_commit, &[], &manifest)?;
 
@@ -173,6 +187,194 @@ pub async fn migrate_storage_to_lance_v4(db_path: &Path) -> Result<StorageMigrat
             db_path: db_path.display().to_string(),
             backup_path: backup_path.display().to_string(),
             graph_version: legacy_manifest.db_version,
+            node_tables: node_table_count,
+            edge_tables: edge_table_count,
+            media_uris_rewritten,
+        })
+    }
+    .await;
+
+    if migration_result.is_err() {
+        let _ = std::fs::remove_dir_all(db_path);
+        let _ = std::fs::rename(&backup_path, db_path);
+    }
+
+    migration_result
+}
+
+pub async fn migrate_storage_to_lineage_native(db_path: &Path) -> Result<StorageMigrationResult> {
+    match detect_storage_generation(db_path)? {
+        Some(StorageGeneration::NamespaceLineage) => {
+            return Err(NanoError::Storage(format!(
+                "database {} already uses NamespaceLineage storage",
+                db_path.display()
+            )));
+        }
+        Some(StorageGeneration::V4Namespace) | None => {}
+    }
+
+    let backup_path = backup_db_path(db_path)?;
+    if backup_path.exists() {
+        return Err(NanoError::Storage(format!(
+            "backup path already exists: {}",
+            backup_path.display()
+        )));
+    }
+    let schema_source = std::fs::read_to_string(db_path.join(SCHEMA_PG_FILENAME))?;
+    std::fs::rename(db_path, &backup_path)?;
+
+    let migration_result = async {
+        let source = match detect_storage_generation(&backup_path)? {
+            Some(StorageGeneration::V4Namespace) => DatabaseMetadata::open(&backup_path)?,
+            Some(StorageGeneration::NamespaceLineage) => {
+                return Err(NanoError::Storage(format!(
+                    "unexpected lineage-native backup during migration: {}",
+                    backup_path.display()
+                )));
+            }
+            None => DatabaseMetadata::open_v3_legacy(&backup_path)?,
+        };
+        let source_manifest = source.manifest().clone();
+        let node_table_count = source.schema_ir().node_types().count();
+        let edge_table_count = source.schema_ir().edge_types().count();
+
+        Database::init_with_generation(db_path, &schema_source, StorageGeneration::NamespaceLineage)
+            .await?;
+
+        let mut dataset_entries = Vec::new();
+        let mut media_uris_rewritten = 0usize;
+        let namespace = open_directory_namespace(db_path).await?;
+
+        for node_def in source.schema_ir().node_types() {
+            let Some(batch) = load_full_batch(source.node_dataset_locator(&node_def.name)).await?
+            else {
+                continue;
+            };
+            let batch = rewrite_node_media_uris(
+                db_path,
+                &backup_path,
+                db_path,
+                node_def,
+                &batch,
+                &mut media_uris_rewritten,
+            )
+            .await?;
+            let table_id = format!("nodes/{}", SchemaIR::dir_name(node_def.type_id));
+            write_namespace_batch(
+                namespace.clone(),
+                &table_id,
+                batch.clone(),
+                WriteMode::Overwrite,
+                None,
+            )
+            .await?;
+            let manifest_path =
+                resolve_manifest_dataset_path(db_path, namespace.clone(), &table_id).await?;
+            let dataset_physical_path = db_path.join(&manifest_path);
+            rebuild_node_scalar_indexes(&dataset_physical_path, node_def).await?;
+            rebuild_node_text_indexes(&dataset_physical_path, node_def).await?;
+            rebuild_node_vector_indexes(&dataset_physical_path, node_def).await?;
+            let version = latest_lance_dataset_version(&dataset_physical_path).await?;
+            dataset_entries.push(DatasetEntry::new(
+                node_def.type_id,
+                node_def.name.clone(),
+                "node",
+                table_id,
+                manifest_path,
+                version,
+                batch.num_rows() as u64,
+            ));
+        }
+
+        for edge_def in source.schema_ir().edge_types() {
+            let Some(batch) = load_full_batch(source.edge_dataset_locator(&edge_def.name)).await?
+            else {
+                continue;
+            };
+            let table_id = format!("edges/{}", SchemaIR::dir_name(edge_def.type_id));
+            let version = write_namespace_batch(
+                namespace.clone(),
+                &table_id,
+                batch.clone(),
+                WriteMode::Overwrite,
+                None,
+            )
+            .await?;
+            let manifest_path =
+                resolve_manifest_dataset_path(db_path, namespace.clone(), &table_id).await?;
+            dataset_entries.push(DatasetEntry::new(
+                edge_def.type_id,
+                edge_def.name.clone(),
+                "edge",
+                table_id,
+                manifest_path,
+                version.version,
+                batch.num_rows() as u64,
+            ));
+        }
+
+        let mut manifest = read_committed_graph_snapshot(db_path)?;
+        manifest.db_version = 1;
+        manifest.last_tx_id = "storage-migrate-lineage-native-1".to_string();
+        manifest.committed_at = now_unix_seconds_string();
+        manifest.next_node_id = source_manifest.next_node_id;
+        manifest.next_edge_id = source_manifest.next_edge_id;
+        manifest.next_type_id = source_manifest.next_type_id;
+        manifest.next_prop_id = source_manifest.next_prop_id;
+        manifest.schema_identity_version = source_manifest.schema_identity_version.max(1);
+        manifest.datasets = dataset_entries;
+        merge_namespace_lineage_internal_dataset_entries(db_path, &mut manifest.datasets).await?;
+
+        let graph_commit = GraphCommitRecord {
+            tx_id: manifest.last_tx_id.clone().into(),
+            graph_version: manifest.db_version.into(),
+            table_versions: manifest
+                .datasets
+                .iter()
+                .map(|entry| {
+                    GraphTableVersion::new(
+                        entry.effective_table_id().to_string(),
+                        entry.dataset_version,
+                    )
+                })
+                .collect(),
+            committed_at: manifest.committed_at.clone(),
+            op_summary: "storage:migrate:lineage-native".to_string(),
+            schema_identity_version: manifest.schema_identity_version,
+            touched_tables: manifest
+                .datasets
+                .iter()
+                .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
+                .map(|entry| {
+                    GraphTouchedTableWindow::new(
+                        entry.effective_table_id().to_string(),
+                        entry.kind.clone(),
+                        entry.type_name.clone(),
+                        0,
+                        entry.dataset_version,
+                    )
+                })
+                .collect(),
+            tx_props: BTreeMap::from([
+                ("graph_version".to_string(), manifest.db_version.to_string()),
+                ("tx_id".to_string(), manifest.last_tx_id.clone()),
+                (
+                    "op_summary".to_string(),
+                    "storage:migrate:lineage-native".to_string(),
+                ),
+            ]),
+        };
+        commit_graph_records_and_manifest_namespace_lineage(
+            db_path,
+            &graph_commit,
+            &[],
+            &manifest,
+        )?;
+
+        Ok(StorageMigrationResult {
+            db_path: db_path.display().to_string(),
+            backup_path: backup_path.display().to_string(),
+            graph_version: manifest.db_version,
             node_tables: node_table_count,
             edge_tables: edge_table_count,
             media_uris_rewritten,

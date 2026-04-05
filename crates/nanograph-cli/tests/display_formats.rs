@@ -252,7 +252,7 @@ fn export_and_changes_fall_back_when_global_output_format_is_unsupported() {
     assert!(
         change_rows
             .iter()
-            .all(|row| row.get("db_version").is_some())
+            .all(|row| row.get("graph_version").is_some() && row.get("change_kind").is_some())
     );
 }
 

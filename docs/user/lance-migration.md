@@ -55,7 +55,7 @@ The output includes a storage format column for each tracked dataset. If some da
 
 **Not preserved:**
 
-- **CDC history** — the transaction log (`_tx_catalog.jsonl`) and CDC event log (`_cdc_log.jsonl`) do not survive export/reimport. The new database starts with a fresh transaction history.
+- **Legacy CDC history** — old WAL-style transaction and CDC logs do not survive export/reimport. The new database starts with a fresh lineage-native graph history.
 - **Dataset versions** — Lance version history is reset. Time-travel to previous dataset versions is no longer possible.
 - **Computed embeddings** — vectors from `@embed(...)` fields are stripped during export and regenerated afterward. If using a real embedding provider (`provider = "openai"`), this makes API calls.
 
