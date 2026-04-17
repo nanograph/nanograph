@@ -1,0 +1,561 @@
+// Codebase Agent Workspace — NanoGraph Queries
+// Demonstrates: file lookup, import traversal, blast radius,
+//               conflict detection, review routing, semantic search,
+//               hybrid search, aggregation, negation, date filtering,
+//               decision traces, task management, mutations
+
+// ═══════════════════════════════════════════════════════════════
+// FILE OPERATIONS — What agents call instead of filesystem I/O
+// ═══════════════════════════════════════════════════════════════
+
+query read_file($path: String)
+  @description("Read a file by path. Equivalent to agent 'read' tool call.")
+{
+    match { $f: File { path: $path } }
+    return { $f.slug, $f.path, $f.language, $f.content, $f.hash }
+}
+
+query list_files($mod: String)
+  @description("List all files in a module.")
+{
+    match {
+        $m: Module { slug: $mod }
+        $m contains $f
+    }
+    return { $f.slug, $f.path, $f.language, $f.size }
+    order { $f.path }
+}
+
+// ── Search: keyword, semantic, hybrid ───────────────────────────
+
+query keyword_search_files($q: String)
+  @description("Find files whose descriptions contain the query tokens.")
+  @instruction("Use for exact term lookup across file descriptions.")
+{
+    match {
+        $f: File
+        search($f.description, $q)
+    }
+    return { $f.slug, $f.path, $f.language }
+    order { $f.path }
+}
+
+query semantic_search_files($q: String)
+  @description("Rank files by semantic similarity against their descriptions.")
+  @instruction("Use for broad conceptual search: 'where is the auth code?' or 'find the rate limiter'.")
+{
+    match { $f: File }
+    return { $f.slug, $f.path, $f.language, $f.description, nearest($f.descriptionEmbedding, $q) as score }
+    order { nearest($f.descriptionEmbedding, $q) }
+    limit 10
+}
+
+query hybrid_search_files($q: String)
+  @description("Blend semantic and lexical ranking across file descriptions.")
+  @instruction("Use when both exact wording and broader meaning matter.")
+{
+    match { $f: File }
+    return {
+        $f.slug
+        $f.path
+        $f.language
+        nearest($f.descriptionEmbedding, $q) as semantic_distance
+        bm25($f.description, $q) as lexical_score
+        rrf(nearest($f.descriptionEmbedding, $q), bm25($f.description, $q)) as hybrid_score
+    }
+    order { rrf(nearest($f.descriptionEmbedding, $q), bm25($f.description, $q)) desc }
+    limit 10
+}
+
+query search_modules($q: String)
+  @description("Semantic search across module descriptions.")
+{
+    match { $m: Module }
+    return { $m.slug, $m.name, $m.path, $m.description, nearest($m.descriptionEmbedding, $q) as score }
+    order { nearest($m.descriptionEmbedding, $q) }
+    limit 5
+}
+
+// ═══════════════════════════════════════════════════════════════
+// IMPORT GRAPH — Blast radius and dependency analysis
+// ═══════════════════════════════════════════════════════════════
+
+query file_dependencies($path: String)
+  @description("What does this file import?")
+{
+    match {
+        $f: File { path: $path }
+        $f imports $dep
+    }
+    return { $f.path as file, $dep.path as imports, $dep.language }
+}
+
+query file_dependents($path: String)
+  @description("What files import this file? The blast radius of a change.")
+  @instruction("Run this before modifying any file to understand impact.")
+{
+    match {
+        $f: File { path: $path }
+        $dependent imports $f
+    }
+    return { $f.path as file, $dependent.path as imported_by, $dependent.language }
+}
+
+query import_chain($path: String)
+  @description("Files that import this file, and files that import those.")
+{
+    match {
+        $f: File { path: $path }
+        $d1 imports $f
+        $d2 imports $d1
+    }
+    return { $f.path as source, $d1.path as direct_dependent, $d2.path as transitive_dependent }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// TASK & AGENT MANAGEMENT
+// ═══════════════════════════════════════════════════════════════
+
+query agent_tasks($agent: String)
+  @description("All tasks assigned to an agent.")
+{
+    match {
+        $a: Agent { slug: $agent }
+        $a assigned $t
+    }
+    return { $t.slug, $t.title, $t.status, $t.branch, $t.priority }
+    order { $t.priority }
+}
+
+query task_files($task: String)
+  @description("All files a task modifies on its branch.")
+{
+    match {
+        $t: Task { slug: $task }
+        $t modifies $f
+    }
+    return { $t.title, $f.path, $f.language }
+    order { $f.path }
+}
+
+query task_detail($task: String)
+  @description("Full task view: agent, files modified, and reviews.")
+{
+    match {
+        $t: Task { slug: $task }
+        $a assigned $t
+        $t modifies $f
+    }
+    return { $t.title, $t.status, $t.branch, $a.name as agent, $f.path as file }
+}
+
+query active_work()
+  @description("All in-progress tasks with their agents and branches.")
+{
+    match {
+        $t: Task { status: "in_progress" }
+        $a assigned $t
+    }
+    return { $a.name as agent, $t.title, $t.branch, $t.priority }
+    order { $t.priority }
+}
+
+query open_tasks()
+  @description("Tasks not yet started.")
+{
+    match { $t: Task { status: "open" } }
+    return { $t.slug, $t.title, $t.priority, $t.description }
+    order { $t.priority }
+}
+
+query search_tasks($q: String)
+  @description("Semantic search across task descriptions.")
+  @instruction("Use to find tasks related to a concept: 'anything about rate limiting?'")
+{
+    match { $t: Task }
+    return { $t.slug, $t.title, $t.status, nearest($t.descriptionEmbedding, $q) as score }
+    order { nearest($t.descriptionEmbedding, $q) }
+    limit 5
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CONFLICT DETECTION — Do any active tasks overlap?
+// ═══════════════════════════════════════════════════════════════
+
+query file_conflicts($task: String)
+  @description("Find other tasks that modify the same files as this task.")
+  @instruction("Run before merging. If results are non-empty, coordinate with the other task's agent.")
+{
+    match {
+        $t: Task { slug: $task }
+        $t modifies $f
+        $other modifies $f
+    }
+    return { $t.title as this_task, $other.slug as conflicting_task, $other.title as conflicting_title, $f.path as contested_file }
+}
+
+query import_conflicts($task: String)
+  @description("Find tasks that modify files imported by files this task modifies.")
+  @instruction("Subtler than direct conflicts: another task changed a dependency of your code.")
+{
+    match {
+        $t: Task { slug: $task }
+        $t modifies $f
+        $f imports $dep
+        $other modifies $dep
+    }
+    return { $t.title as this_task, $f.path as your_file, $dep.path as dependency, $other.title as other_task }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// REVIEW ROUTING — Who should review this?
+// ═══════════════════════════════════════════════════════════════
+
+query review_candidates($task: String)
+  @description("Find agents with expertise in modules containing files this task modifies.")
+  @instruction("Use to auto-assign reviewers. Prefer agents not assigned to the task itself.")
+{
+    match {
+        $t: Task { slug: $task }
+        $t modifies $f
+        $m contains $f
+        $expert expert $m
+    }
+    return { $t.title, $f.path as file, $m.name as module, $expert.name as reviewer }
+}
+
+query task_constraints($task: String)
+  @description("All constraints that apply to files this task modifies.")
+  @instruction("All constraints with severity=error must pass before merge.")
+{
+    match {
+        $t: Task { slug: $task }
+        $t modifies $f
+        $c governs $f
+    }
+    return { $t.title, $f.path, $c.name as constraint, $c.kind, $c.severity, $c.rule }
+}
+
+query task_reviews($task: String)
+  @description("All reviews on a task.")
+{
+    match {
+        $r: Review
+        $r reviews $t
+        $t: Task { slug: $task }
+        $r reviewedBy $a
+    }
+    return { $t.title, $r.outcome, $r.comment, $a.name as reviewer, $r.createdAt }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DECISIONS — Organizational memory
+// ═══════════════════════════════════════════════════════════════
+
+query search_decisions($q: String)
+  @description("Semantic search across past decisions.")
+  @instruction("Use when an agent asks 'why was this done this way?' or 'has anyone decided on X before?'")
+{
+    match { $d: Decision }
+    return { $d.slug, $d.summary, $d.reasoning, nearest($d.reasoningEmbedding, $q) as score }
+    order { nearest($d.reasoningEmbedding, $q) }
+    limit 5
+}
+
+query keyword_search_decisions($q: String)
+  @description("Find decisions whose reasoning contains the query tokens.")
+  @instruction("Use for exact term lookup in decision history.")
+{
+    match {
+        $d: Decision
+        search($d.reasoning, $q)
+    }
+    return { $d.slug, $d.summary, $d.decidedAt }
+    order { $d.decidedAt desc }
+}
+
+query file_decisions($path: String)
+  @description("All decisions that affect a specific file.")
+{
+    match {
+        $f: File { path: $path }
+        $d decides $f
+        $d madeBy $a
+    }
+    return { $d.summary, $d.reasoning, $a.name as decided_by, $d.decidedAt }
+    order { $d.decidedAt desc }
+}
+
+query decision_trace($task: String)
+  @description("Decisions linked to files modified by a task.")
+  @instruction("Use before starting work to understand prior design choices in the area.")
+{
+    match {
+        $t: Task { slug: $task }
+        $t modifies $f
+        $d decides $f
+        $d madeBy $a
+    }
+    return { $t.title, $f.path, $d.summary, $a.name as decided_by }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AGENT EXPERTISE
+// ═══════════════════════════════════════════════════════════════
+
+query module_experts($mod: String)
+  @description("Who knows this module?")
+{
+    match {
+        $m: Module { slug: $mod }
+        $a expert $m
+    }
+    return { $m.name as module, $a.name as expert, $a.kind }
+}
+
+query agent_expertise($agent: String)
+  @description("What modules does this agent know?")
+{
+    match {
+        $a: Agent { slug: $agent }
+        $a expert $m
+    }
+    return { $a.name, $m.name as module, $m.path }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AGGREGATION
+// ═══════════════════════════════════════════════════════════════
+
+query files_per_module()
+  @description("Count of files in each module.")
+{
+    match {
+        $m: Module
+        $m contains $f
+    }
+    return {
+        $m.name
+        count($f) as files
+    }
+    order { files desc }
+}
+
+query tasks_per_agent()
+  @description("Count of tasks assigned to each agent.")
+{
+    match {
+        $a: Agent
+        $a assigned $t
+    }
+    return {
+        $a.name
+        count($t) as tasks
+    }
+    order { tasks desc }
+}
+
+query most_imported()
+  @description("Files ranked by how many other files import them.")
+{
+    match {
+        $dep: File
+        $f imports $dep
+    }
+    return {
+        $dep.path
+        count($f) as importers
+    }
+    order { importers desc }
+    limit 5
+}
+
+query most_constrained()
+  @description("Files with the most constraints applied.")
+{
+    match {
+        $f: File
+        $c governs $f
+    }
+    return {
+        $f.path
+        count($c) as constraints
+    }
+    order { constraints desc }
+    limit 5
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NEGATION — Find gaps
+// ═══════════════════════════════════════════════════════════════
+
+query ungoverned_files()
+  @description("Files with no constraints applied.")
+  @instruction("These files have no lint, typecheck, test, or security rules. Consider adding constraints.")
+{
+    match {
+        $f: File
+        not { $_ governs $f }
+    }
+    return { $f.path, $f.language }
+    order { $f.path }
+}
+
+query unassigned_tasks()
+  @description("Tasks with no agent assigned.")
+{
+    match {
+        $t: Task
+        not { $_ assigned $t }
+    }
+    return { $t.slug, $t.title, $t.status, $t.priority }
+}
+
+query orphan_files()
+  @description("Files not contained in any module.")
+{
+    match {
+        $f: File
+        not { $_ contains $f }
+    }
+    return { $f.path, $f.language }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// FILTERING — DateTime, Enum
+// ═══════════════════════════════════════════════════════════════
+
+query recent_tasks($since: DateTime)
+  @description("Tasks created after a given date.")
+{
+    match {
+        $t: Task
+        $t.createdAt >= $since
+    }
+    return { $t.slug, $t.title, $t.status, $t.priority, $t.createdAt }
+    order { $t.createdAt desc }
+}
+
+query recent_decisions($since: DateTime)
+  @description("Decisions made after a given date.")
+{
+    match {
+        $d: Decision
+        $d.decidedAt >= $since
+    }
+    return { $d.slug, $d.summary, $d.decidedAt }
+    order { $d.decidedAt desc }
+}
+
+query error_constraints()
+  @description("All constraints with severity = error.")
+{
+    match {
+        $c: Constraint
+        $c.severity = "error"
+    }
+    return { $c.slug, $c.name, $c.kind, $c.rule }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MUTATIONS
+// ═══════════════════════════════════════════════════════════════
+
+query write_file($slug: String, $path: String, $language: String, $content: String, $description: String, $size: I32, $hash: String) {
+    insert File {
+        slug: $slug,
+        path: $path,
+        language: $language,
+        content: $content,
+        description: $description,
+        size: $size,
+        hash: $hash,
+        createdAt: now(),
+        updatedAt: now()
+    }
+}
+
+query update_file_content($path: String, $content: String, $size: I32, $hash: String) {
+    update File set {
+        content: $content,
+        size: $size,
+        hash: $hash,
+        updatedAt: now()
+    } where path = $path
+}
+
+query delete_file($path: String) {
+    delete File where path = $path
+}
+
+query create_task($slug: String, $title: String, $description: String, $branch: String, $priority: String) {
+    insert Task {
+        slug: $slug,
+        title: $title,
+        description: $description,
+        status: "open",
+        branch: $branch,
+        priority: $priority,
+        createdAt: now(),
+        updatedAt: now()
+    }
+}
+
+query start_task($slug: String) {
+    update Task set { status: "in_progress", updatedAt: now() } where slug = $slug
+}
+
+query submit_for_review($slug: String) {
+    update Task set { status: "in_review", updatedAt: now() } where slug = $slug
+}
+
+query merge_task($slug: String) {
+    update Task set { status: "merged", updatedAt: now() } where slug = $slug
+}
+
+query add_decision($slug: String, $summary: String, $reasoning: String) {
+    insert Decision {
+        slug: $slug,
+        summary: $summary,
+        reasoning: $reasoning,
+        decidedAt: now(),
+        createdAt: now()
+    }
+}
+
+query add_review($slug: String, $outcome: String, $comment: String) {
+    insert Review {
+        slug: $slug,
+        outcome: $outcome,
+        comment: $comment,
+        createdAt: now()
+    }
+}
+
+query add_import($from: String, $to: String, $kind: String) {
+    insert Imports { from: $from, to: $to, kind: $kind }
+}
+
+query assign_task($agent: String, $task: String) {
+    insert Assigned { from: $agent, to: $task }
+}
+
+query record_modification($task: String, $file: String, $changeType: String) {
+    insert Modifies { from: $task, to: $file, changeType: $changeType }
+}
+
+query link_decision_file($decision: String, $file: String) {
+    insert Decides { from: $decision, to: $file }
+}
+
+query link_decision_agent($decision: String, $agent: String) {
+    insert MadeBy { from: $decision, to: $agent }
+}
+
+query link_review_task($review: String, $task: String) {
+    insert Reviews { from: $review, to: $task }
+}
+
+query link_review_agent($review: String, $agent: String) {
+    insert ReviewedBy { from: $review, to: $agent }
+}
