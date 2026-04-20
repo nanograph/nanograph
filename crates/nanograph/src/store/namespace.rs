@@ -1,11 +1,9 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lance::Dataset;
-use lance::dataset::builder::DatasetBuilder;
-use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams};
-use lance_file::version::LanceFileVersion;
+use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_namespace::LanceNamespace;
 use lance_namespace::models::{
@@ -14,15 +12,16 @@ use lance_namespace::models::{
 use lance_namespace_impls::dir::manifest::{ManifestEntry, ObjectType};
 use lance_namespace_impls::{DirectoryNamespaceBuilder, ManifestNamespace};
 use lance_table::io::commit::ManifestNamingScheme;
+use url::Url;
 
 use crate::error::{NanoError, Result};
 use crate::store::graph_types::GraphTableVersion;
 use crate::store::lance_io::{
-    LANCE_INTERNAL_ID_FIELD, cleanup_unpublished_manifest_versions, logical_batch_to_lance,
+    LANCE_INTERNAL_ID_FIELD, append_lance_batch_at_version_for_kind_with_properties,
+    cleanup_unpublished_manifest_versions, logical_batch_to_lance,
+    write_lance_batch_with_mode_for_kind_versioned_and_properties,
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest};
-
-const DEFAULT_NEW_DATASET_STORAGE_VERSION: LanceFileVersion = LanceFileVersion::V2_2;
 
 pub(crate) const GRAPH_TX_TABLE_ID: &str = "__graph_tx";
 pub(crate) const GRAPH_CHANGES_TABLE_ID: &str = "__graph_changes";
@@ -54,8 +53,92 @@ pub(crate) fn table_id_parts(table_id: &str) -> Vec<String> {
         .collect()
 }
 
+fn absolutize_local_path(path: &Path) -> Result<PathBuf> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    Ok(std::env::current_dir()?.join(path))
+}
+
+pub(crate) fn local_path_to_file_uri(path: &Path) -> Result<String> {
+    let absolute = absolutize_local_path(path)?;
+    let url = Url::from_directory_path(&absolute).map_err(|_| {
+        NanoError::Lance(format!(
+            "failed to convert local path to file URI: {}",
+            absolute.display()
+        ))
+    })?;
+    Ok(url.to_string())
+}
+
+fn namespace_location_to_absolute_local_path(location: &str) -> Result<PathBuf> {
+    if let Ok(url) = Url::parse(location) {
+        if url.scheme() == "file" {
+            return url.to_file_path().map_err(|_| {
+                NanoError::Lance(format!(
+                    "failed to convert file URI to local path: {}",
+                    location
+                ))
+            });
+        }
+        return Err(NanoError::Lance(format!(
+            "unsupported namespace location URI scheme {}: {}",
+            url.scheme(),
+            location
+        )));
+    }
+
+    let path = PathBuf::from(location);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+
+    Err(NanoError::Lance(format!(
+        "namespace location is not an absolute local path: {}",
+        location
+    )))
+}
+
+pub(crate) fn namespace_location_to_local_path(
+    db_dir: &Path,
+    location: &str,
+) -> Result<PathBuf> {
+    if let Ok(path) = namespace_location_to_absolute_local_path(location) {
+        return Ok(path);
+    }
+
+    let path = PathBuf::from(location);
+    Ok(absolutize_local_path(db_dir)?.join(path))
+}
+
+pub(crate) fn namespace_location_to_dataset_uri(db_dir: &Path, location: &str) -> Result<String> {
+    if let Ok(url) = Url::parse(location) {
+        return Ok(url.to_string());
+    }
+    let path = if let Ok(path) = namespace_location_to_absolute_local_path(location) {
+        path
+    } else {
+        namespace_location_to_local_path(db_dir, location)?
+    };
+    local_path_to_file_uri(&path)
+}
+
+pub(crate) fn namespace_location_to_manifest_dataset_path(
+    db_dir: &Path,
+    location: &str,
+    fallback: &str,
+) -> Result<String> {
+    let absolute_db_dir = absolutize_local_path(db_dir)?;
+    let path = namespace_location_to_local_path(&absolute_db_dir, location)?;
+    Ok(path
+        .strip_prefix(&absolute_db_dir)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|_| fallback.to_string()))
+}
+
 pub(crate) async fn open_directory_namespace(db_path: &Path) -> Result<Arc<dyn LanceNamespace>> {
-    let namespace = DirectoryNamespaceBuilder::new(db_path.to_string_lossy().to_string())
+    let root_path = absolutize_local_path(db_path)?;
+    let namespace = DirectoryNamespaceBuilder::new(root_path.to_string_lossy().to_string())
         .manifest_enabled(true)
         .dir_listing_enabled(false)
         .table_version_tracking_enabled(true)
@@ -119,32 +202,6 @@ pub(crate) async fn resolve_or_declare_table_location(
     }
 }
 
-fn namespace_write_params(
-    _namespace: Arc<dyn LanceNamespace>,
-    _table_id: &str,
-    mode: WriteMode,
-    transaction_properties: Option<HashMap<String, String>>,
-) -> WriteParams {
-    let mut params = WriteParams::default();
-    params.mode = mode;
-    params.enable_stable_row_ids = true;
-    if let Some(properties) = transaction_properties {
-        params.transaction_properties = Some(Arc::new(properties));
-    }
-    params
-}
-
-fn namespace_create_params(
-    namespace: Arc<dyn LanceNamespace>,
-    table_id: &str,
-    mode: WriteMode,
-    transaction_properties: Option<HashMap<String, String>>,
-) -> WriteParams {
-    let mut params = namespace_write_params(namespace, table_id, mode, transaction_properties);
-    params.data_storage_version = Some(DEFAULT_NEW_DATASET_STORAGE_VERSION);
-    params
-}
-
 pub(crate) async fn write_namespace_batch(
     namespace: Arc<dyn LanceNamespace>,
     table_id: &str,
@@ -159,7 +216,6 @@ pub(crate) async fn write_namespace_batch(
     } else {
         super::lance_io::LanceDatasetKind::Plain
     };
-    let batch = logical_batch_to_lance(&batch, kind)?;
     let table_exists = resolve_table_location(namespace.clone(), table_id)
         .await
         .is_ok();
@@ -168,64 +224,46 @@ pub(crate) async fn write_namespace_batch(
     } else {
         WriteMode::Create
     };
-    let schema = batch.schema();
-    let reader = arrow_array::RecordBatchIterator::new(vec![Ok(batch)], schema);
+    let location = resolve_or_declare_table_location(namespace.clone(), table_id).await?;
+    let location_path = namespace_location_to_absolute_local_path(&location)?;
     match effective_mode {
-        WriteMode::Create => {
-            let params = namespace_create_params(
-                namespace.clone(),
-                table_id,
-                WriteMode::Create,
+        WriteMode::Create | WriteMode::Overwrite => {
+            write_lance_batch_with_mode_for_kind_versioned_and_properties(
+                &location_path,
+                batch,
+                effective_mode,
+                kind,
                 transaction_properties,
-            );
-            let dataset = Dataset::write_into_namespace(
-                reader,
-                namespace,
-                table_id_parts(table_id),
-                Some(params),
             )
             .await
+            .map(|version| GraphTableVersion::new(table_id, version.version))
             .map_err(|err| {
-                NanoError::Lance(format!("namespace create {} error: {}", table_id, err))
-            })?;
-            Ok(GraphTableVersion::new(table_id, dataset.version().version))
+                NanoError::Lance(format!(
+                    "namespace {} {} error: {}",
+                    match effective_mode {
+                        WriteMode::Create => "create",
+                        WriteMode::Overwrite => "overwrite",
+                        _ => unreachable!(),
+                    },
+                    table_id,
+                    err
+                ))
+            })
         }
         WriteMode::Append => {
-            let mut dataset = load_namespace_dataset(namespace.clone(), table_id, None).await?;
-            dataset
-                .append(
-                    reader,
-                    Some(namespace_write_params(
-                        namespace,
-                        table_id,
-                        WriteMode::Append,
-                        transaction_properties,
-                    )),
-                )
-                .await
-                .map_err(|err| {
-                    NanoError::Lance(format!("namespace append {} error: {}", table_id, err))
-                })?;
-            Ok(GraphTableVersion::new(table_id, dataset.version().version))
-        }
-        WriteMode::Overwrite => {
-            let params = namespace_write_params(
-                namespace.clone(),
-                table_id,
-                WriteMode::Overwrite,
+            let pinned_version = namespace_latest_version(namespace, table_id).await?;
+            append_lance_batch_at_version_for_kind_with_properties(
+                &location_path,
+                &pinned_version,
+                batch,
+                kind,
                 transaction_properties,
-            );
-            let dataset = Dataset::write_into_namespace(
-                reader,
-                namespace,
-                table_id_parts(table_id),
-                Some(params),
             )
             .await
+            .map(|version| GraphTableVersion::new(table_id, version.version))
             .map_err(|err| {
-                NanoError::Lance(format!("namespace overwrite {} error: {}", table_id, err))
-            })?;
-            Ok(GraphTableVersion::new(table_id, dataset.version().version))
+                NanoError::Lance(format!("namespace append {} error: {}", table_id, err))
+            })
         }
     }
 }
@@ -268,6 +306,42 @@ pub(crate) async fn namespace_latest_version_optional(
         .map(|version| GraphTableVersion::new(table_id, version.version as u64)))
 }
 
+fn namespace_location_to_absolute_dataset_uri(location: &str) -> Result<String> {
+    if let Ok(url) = Url::parse(location) {
+        return Ok(url.to_string());
+    }
+    local_path_to_file_uri(&namespace_location_to_absolute_local_path(location)?)
+}
+
+async fn load_namespace_dataset(
+    namespace: Arc<dyn LanceNamespace>,
+    table_id: &str,
+    version: Option<u64>,
+) -> Result<Dataset> {
+    let location = resolve_table_location(namespace, table_id).await?;
+    let dataset_uri = namespace_location_to_absolute_dataset_uri(&location)?;
+    let dataset = Dataset::open(&dataset_uri).await.map_err(|err| {
+        NanoError::Lance(format!(
+            "namespace dataset {}{} open error: {}",
+            table_id,
+            version
+                .map(|version| format!(" version {}", version))
+                .unwrap_or_default(),
+            err
+        ))
+    })?;
+    if let Some(version) = version {
+        dataset.checkout_version(version).await.map_err(|err| {
+            NanoError::Lance(format!(
+                "namespace dataset {} version {} load error: {}",
+                table_id, version, err
+            ))
+        })
+    } else {
+        Ok(dataset)
+    }
+}
+
 pub(crate) async fn cleanup_namespace_orphan_versions(
     db_path: &Path,
     snapshot: &GraphManifest,
@@ -278,7 +352,8 @@ pub(crate) async fn cleanup_namespace_orphan_versions(
         let table_id = entry.effective_table_id();
         let location = resolve_table_location(namespace.clone(), table_id).await?;
         let published_version = Some(entry.dataset_version);
-        removed += cleanup_unpublished_manifest_versions(&location, published_version).await?;
+        removed +=
+            cleanup_unpublished_manifest_versions(db_path, &location, published_version).await?;
     }
     if let Ok(location) = resolve_table_location(namespace.clone(), GRAPH_SNAPSHOT_TABLE_ID).await {
         let published_snapshot_version =
@@ -286,7 +361,11 @@ pub(crate) async fn cleanup_namespace_orphan_versions(
                 .await?
                 .version;
         removed +=
-            cleanup_unpublished_manifest_versions(&location, Some(published_snapshot_version))
+            cleanup_unpublished_manifest_versions(
+                db_path,
+                &location,
+                Some(published_snapshot_version),
+            )
                 .await?;
     }
     Ok(removed)
@@ -301,7 +380,8 @@ pub(crate) async fn cleanup_namespace_snapshot_orphan_versions(db_path: &Path) -
     let published_snapshot_version = namespace_latest_version(namespace, GRAPH_SNAPSHOT_TABLE_ID)
         .await?
         .version;
-    cleanup_unpublished_manifest_versions(&location, Some(published_snapshot_version)).await
+    cleanup_unpublished_manifest_versions(db_path, &location, Some(published_snapshot_version))
+        .await
 }
 
 pub(crate) async fn namespace_published_version_for_table(
@@ -319,7 +399,8 @@ pub(crate) async fn namespace_published_version_for_table(
     }
     let namespace = open_directory_namespace(db_path).await?;
     let location = resolve_or_declare_table_location(namespace, table_id).await?;
-    let dataset = Dataset::open(&location)
+    let dataset_uri = namespace_location_to_dataset_uri(db_path, &location)?;
+    let dataset = Dataset::open(&dataset_uri)
         .await
         .map_err(|err| {
             NanoError::Lance(format!("open staged dataset {} error: {}", table_id, err))
@@ -349,7 +430,7 @@ pub(crate) fn dedup_namespace_published_versions(versions: &mut Vec<NamespacePub
 }
 
 pub(crate) async fn open_manifest_namespace(db_path: &Path) -> Result<ManifestNamespace> {
-    let root = db_path.to_string_lossy().to_string();
+    let root = local_path_to_file_uri(db_path)?;
     let registry = Arc::new(ObjectStoreRegistry::default());
     let (object_store, base_path) =
         ObjectStore::from_uri_and_params(registry, &root, &ObjectStoreParams::default())
@@ -428,34 +509,6 @@ pub(crate) async fn batch_publish_namespace_versions(
                 err
             ))
         })
-}
-
-async fn load_namespace_dataset(
-    namespace: Arc<dyn LanceNamespace>,
-    table_id: &str,
-    version: Option<u64>,
-) -> Result<Dataset> {
-    let mut builder = DatasetBuilder::from_namespace(namespace, table_id_parts(table_id))
-        .await
-        .map_err(|err| {
-            NanoError::Lance(format!(
-                "namespace dataset builder {} error: {}",
-                table_id, err
-            ))
-        })?;
-    if let Some(version) = version {
-        builder = builder.with_version(version);
-    }
-    builder.load().await.map_err(|err| {
-        NanoError::Lance(format!(
-            "namespace dataset {}{} load error: {}",
-            table_id,
-            version
-                .map(|version| format!(" version {}", version))
-                .unwrap_or_default(),
-            err
-        ))
-    })
 }
 
 #[allow(dead_code)]

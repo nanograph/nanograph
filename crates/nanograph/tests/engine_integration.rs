@@ -1704,6 +1704,112 @@ query q() {
 }
 
 #[tokio::test]
+async fn test_delete_edge_mutation_query_uses_declared_key_for_endpoint_lookup() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(
+        &db_path,
+        r#"
+node Person {
+    slug: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company
+"#,
+    )
+    .await
+    .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"WorksAt","from":"alice","to":"acme"}"#,
+    )
+    .await
+    .unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "from".to_string(),
+        nanograph::query::ast::Literal::String("alice".to_string()),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query remove_work($from: String) {
+    delete WorksAt where from = $from
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 0);
+    assert_eq!(result.affected_edges, 1);
+    let exported = export_rows_for_db(&db).await;
+    let works_at_count = exported
+        .iter()
+        .filter(|row| row.get("edge").and_then(|value| value.as_str()) == Some("WorksAt"))
+        .count();
+    assert_eq!(works_at_count, 0);
+}
+
+#[tokio::test]
+async fn test_delete_edge_mutation_query_missing_endpoint_is_noop() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(
+        &db_path,
+        r#"
+node Person {
+    slug: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge WorksAt: Person -> Company
+"#,
+    )
+    .await
+    .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"WorksAt","from":"alice","to":"acme"}"#,
+    )
+    .await
+    .unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "from".to_string(),
+        nanograph::query::ast::Literal::String("nobody".to_string()),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query remove_work($from: String) {
+    delete WorksAt where from = $from
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 0);
+    assert_eq!(result.affected_edges, 0);
+    let exported = export_rows_for_db(&db).await;
+    let works_at_count = exported
+        .iter()
+        .filter(|row| row.get("edge").and_then(|value| value.as_str()) == Some("WorksAt"))
+        .count();
+    assert_eq!(works_at_count, 1);
+}
+
+#[tokio::test]
 async fn test_delete_mutation_query_cascades_edges() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");

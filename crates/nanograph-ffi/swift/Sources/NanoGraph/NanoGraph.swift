@@ -121,11 +121,21 @@ public enum LoadRow {
 private struct SchemaDescribeMetadata: Decodable {
     struct TypeDef: Decodable {
         let name: String
+        let keyProperty: String?
+        let endpointKeys: EndpointKeys?
+        let srcType: String?
+        let dstType: String?
         let properties: [Property]
+    }
+
+    struct EndpointKeys: Decodable {
+        let src: String?
+        let dst: String?
     }
 
     struct Property: Decodable {
         let name: String
+        let type: String?
         let mediaMimeProp: String?
     }
 
@@ -133,10 +143,104 @@ private struct SchemaDescribeMetadata: Decodable {
     let edgeTypes: [TypeDef]
 }
 
+public struct MutationResult: Decodable, Sendable {
+    public let affectedNodes: Int
+    public let affectedEdges: Int
+
+    public init(affectedNodes: Int, affectedEdges: Int) {
+        self.affectedNodes = affectedNodes
+        self.affectedEdges = affectedEdges
+    }
+}
+
+/// A single committed mutation in the CDC log.
+///
+/// Mirrors the Rust-side `VisibleChangeRow` in
+/// `crates/nanograph/src/store/txlog.rs`. Field names use snake_case on the
+/// wire; Swift surfaces them as camelCase via `CodingKeys`.
+///
+/// The cursor for resuming a stream is `graphVersion` — monotonic across a
+/// database's lifetime, unique per commit.
+public struct Change: Decodable, Sendable {
+    public enum Kind: String, Decodable, Sendable {
+        case insert, update, delete
+    }
+
+    public enum EntityKind: String, Decodable, Sendable {
+        case node, edge
+    }
+
+    public let graphVersion: UInt64
+    public let txId: String
+    public let committedAt: String
+    public let changeKind: Kind
+    public let entityKind: EntityKind
+    public let typeName: String
+    public let tableId: String
+    public let rowid: UInt64
+    public let entityId: UInt64
+    public let logicalKey: String
+    public let row: JSONValue?
+    public let previousGraphVersion: UInt64?
+
+    private enum CodingKeys: String, CodingKey {
+        case graphVersion = "graph_version"
+        case txId = "tx_id"
+        case committedAt = "committed_at"
+        case changeKind = "change_kind"
+        case entityKind = "entity_kind"
+        case typeName = "type_name"
+        case tableId = "table_id"
+        case rowid
+        case entityId = "entity_id"
+        case logicalKey = "logical_key"
+        case row
+        case previousGraphVersion = "previous_graph_version"
+    }
+}
+
+/// A type-erased JSON value, suitable for exposing opaque payloads (like the
+/// `row` field on a `Change`) to callers without forcing a schema-specific
+/// decoder. Supports `null`, bools, numbers, strings, arrays, and objects.
+public enum JSONValue: Decodable, Sendable {
+    case null
+    case bool(Bool)
+    case int(Int64)
+    case double(Double)
+    case string(String)
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let bool = try? container.decode(Bool.self) {
+            self = .bool(bool)
+        } else if let int = try? container.decode(Int64.self) {
+            self = .int(int)
+        } else if let double = try? container.decode(Double.self) {
+            self = .double(double)
+        } else if let string = try? container.decode(String.self) {
+            self = .string(string)
+        } else if let array = try? container.decode([JSONValue].self) {
+            self = .array(array)
+        } else if let object = try? container.decode([String: JSONValue].self) {
+            self = .object(object)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Unsupported JSON value"
+            )
+        }
+    }
+}
+
 public final class Database {
     // Serializes handle lifecycle/use to avoid close-vs-operation races.
     private let lock = NSLock()
     private var handle: OpaquePointer?
+    private var cachedSchema: SchemaDescribeMetadata?
 
     private init(handle: OpaquePointer) {
         self.handle = handle
@@ -194,7 +298,20 @@ public final class Database {
             }
             nanograph_db_destroy(handle)
             self.handle = nil
+            cachedSchema = nil
         }
+    }
+
+    /// Lazy, per-instance cache of the schema metadata used by mutation
+    /// helpers. Populated on first use; invalidated by `close()`.
+    fileprivate func cachedSchemaMetadata() throws -> SchemaDescribeMetadata {
+        if let cached = lock.withLock({ self.cachedSchema }) {
+            return cached
+        }
+        // Compute outside the lock — `describe` takes its own lock internally.
+        let schema = try describe(SchemaDescribeMetadata.self)
+        lock.withLock { self.cachedSchema = schema }
+        return schema
     }
 
     public func load(dataSource: String, mode: LoadMode) throws {
@@ -407,6 +524,71 @@ public final class Database {
         return try decodeValue(type, from: raw)
     }
 
+    /// Fetch the CDC log since a given `graph_version` cursor. Pass `nil` to
+    /// fetch everything from the beginning.
+    ///
+    /// The returned array is ordered by `graphVersion` ascending (engine
+    /// contract); callers can advance their cursor with `.max(by:)` on the
+    /// returned rows.
+    public func changes(since graphVersion: UInt64? = nil) throws -> [Change] {
+        var options: [String: Any] = [:]
+        if let graphVersion {
+            options["since"] = graphVersion
+        }
+        return try changes([Change].self, options: options.isEmpty ? nil : options)
+    }
+
+    /// Returns the current (highest committed) `graph_version` — useful for
+    /// seeding a CDC stream cursor after an initial hydrate so the first poll
+    /// doesn't replay history.
+    ///
+    /// Implementation: reads the full change log once. Cheap on fresh DBs;
+    /// consider caching this at the call site for high-traffic loops.
+    public func currentGraphVersion() throws -> UInt64? {
+        let allChanges = try changes(since: nil)
+        return allChanges.map(\.graphVersion).max()
+    }
+
+    /// A polling AsyncSequence over the CDC log. Every `interval`, fetches
+    /// any new `Change` rows since the last seen cursor and yields them as a
+    /// batch. Quiet DBs produce empty polls that yield nothing (non-empty
+    /// batches only are yielded).
+    ///
+    /// The sequence terminates when the Task consuming it is cancelled.
+    ///
+    /// `startAt`: seed cursor — typically the `graph_version` of the most
+    /// recent state the consumer has already applied. Pass `nil` to replay
+    /// from the beginning.
+    public func changeStream(
+        interval: Duration = .seconds(1.5),
+        startAt cursor: UInt64? = nil
+    ) -> AsyncThrowingStream<[Change], Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task { [self] in
+                var currentCursor = cursor
+                while !Task.isCancelled {
+                    do {
+                        let batch = try self.changes(since: currentCursor)
+                        if !batch.isEmpty {
+                            continuation.yield(batch)
+                            currentCursor = batch.map(\.graphVersion).max() ?? currentCursor
+                        }
+                    } catch {
+                        continuation.finish(throwing: error)
+                        return
+                    }
+                    do {
+                        try await Task.sleep(for: interval)
+                    } catch {
+                        break
+                    }
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     private func requireHandleLocked() throws -> OpaquePointer {
         guard let handle else {
             throw NanoGraphError.message("Database is closed")
@@ -440,6 +622,309 @@ public final class Database {
             nanograph_bytes_free(bytes)
         }
         return Data(bytes: ptr, count: Int(bytes.len))
+    }
+}
+
+// MARK: - Tier 1 mutation helpers
+//
+// Each helper synthesizes a named .gq query, executes it through the existing
+// `run(querySource:queryName:params:)` FFI entry point, and decodes the
+// `{affectedNodes, affectedEdges}` payload that the engine returns for
+// mutation queries (see `MutationResult::to_sdk_json` in the core crate).
+//
+// Zero-match deletes return `affectedNodes: 0` silently — the engine treats
+// missing rows as a no-op, not an error. See `crates/nanograph/src/store/
+// database/persist.rs:949-966`.
+
+extension Database {
+    /// Insert or fully replace a node keyed by its `@key` property.
+    ///
+    /// **This is a full-row replace**, not a partial merge. Per the core
+    /// loader's keyed-merge semantics (see `crates/nanograph/src/store/loader/
+    /// merge.rs`), the incoming row overwrites every column — unmentioned
+    /// non-null columns that are required by the schema will fail validation.
+    /// For partial edits that preserve existing columns, use `updateNode`.
+    public func upsertNode(type: String, data: [String: Any]) throws {
+        try loadRows([.node(type: type, data: data)], mode: .merge)
+    }
+
+    /// Insert or fully replace an edge keyed by `(from, to)`. Re-writing the
+    /// same `(from, to)` pair with different property values (e.g. a new
+    /// `position` for outline reordering) overwrites the existing row.
+    ///
+    /// Identity is `(from, to)` — this is **not a multigraph**. Two parallel
+    /// edges between the same pair collapse to one.
+    ///
+    /// Edge properties written here cannot currently be projected back through
+    /// `.gq` queries (the grammar lacks an edge-binding form), only through
+    /// the CDC `changes()` stream or raw Lance reads.
+    public func upsertEdge(
+        type: String,
+        from: String,
+        to: String,
+        data: [String: Any] = [:]
+    ) throws {
+        try loadRows([.edge(type: type, from: from, to: to, data: data)], mode: .merge)
+    }
+
+    /// Delete a single node by its `@key`. Cascades all incident edges across
+    /// edge types and directions. Silent no-op on miss.
+    @discardableResult
+    public func deleteNode(type: String, key: Any) throws -> MutationResult {
+        let (nodeDef, keyTypeAnn) = try nodeKeyMetadata(for: type)
+        let keyProperty = try requireKeyProperty(for: nodeDef)
+        let querySource = """
+        query __sdk_delete_node($__key: \(keyTypeAnn)) {
+          delete \(type) where \(keyProperty) = $__key
+        }
+        """
+        return try runMutation(
+            querySource: querySource,
+            queryName: "__sdk_delete_node",
+            params: ["__key": key]
+        )
+    }
+
+    /// Delete every edge of `type` whose source endpoint matches `key`.
+    ///
+    /// Grammar limitation: `.gq` `where` clauses on mutations accept a **single**
+    /// `ident op value` predicate (see `query.pest: mutation_predicate`), so
+    /// there's no single-edge delete-by-(from, to) today. Callers that want
+    /// to sever a specific parent-child link should pair this with a semantic
+    /// model where one endpoint uniquely identifies the edge (e.g. an outline
+    /// where a child has at most one structural parent — `deleteEdgesTo(type:
+    /// "Contains", key: childKey)` cleanly unparents).
+    @discardableResult
+    public func deleteEdgesFrom(type: String, key: Any) throws -> MutationResult {
+        let edgeDef = try edgeTypeDefinition(for: type)
+        let annotations = try edgeEndpointKeyTypeAnnotations(for: edgeDef)
+        let querySource = """
+        query __sdk_delete_edges_from($__from: \(annotations.src)) {
+          delete \(type) where from = $__from
+        }
+        """
+        return try runMutation(
+            querySource: querySource,
+            queryName: "__sdk_delete_edges_from",
+            params: ["__from": key]
+        )
+    }
+
+    /// Delete every edge of `type` whose target endpoint matches `key`.
+    ///
+    /// See `deleteEdgesFrom(type:key:)` for the grammar-limit rationale.
+    @discardableResult
+    public func deleteEdgesTo(type: String, key: Any) throws -> MutationResult {
+        let edgeDef = try edgeTypeDefinition(for: type)
+        let annotations = try edgeEndpointKeyTypeAnnotations(for: edgeDef)
+        let querySource = """
+        query __sdk_delete_edges_to($__to: \(annotations.dst)) {
+          delete \(type) where to = $__to
+        }
+        """
+        return try runMutation(
+            querySource: querySource,
+            queryName: "__sdk_delete_edges_to",
+            params: ["__to": key]
+        )
+    }
+
+    /// Update properties on a single node identified by its `@key`. The key
+    /// itself is immutable — attempting to include it in `set` is rejected
+    /// client-side before hitting the engine.
+    ///
+    /// Unmentioned properties are preserved (the engine reads the full row,
+    /// overlays `set`, writes back — see `persist.rs:758-764`).
+    @discardableResult
+    public func updateNode(
+        type: String,
+        key: Any,
+        set: [String: Any]
+    ) throws -> MutationResult {
+        guard !set.isEmpty else {
+            return MutationResult(affectedNodes: 0, affectedEdges: 0)
+        }
+        let (nodeDef, keyTypeAnn) = try nodeKeyMetadata(for: type)
+        let keyProperty = try requireKeyProperty(for: nodeDef)
+        if set.keys.contains(keyProperty) {
+            throw NanoGraphError.message(
+                "Cannot update the @key property '\(keyProperty)' on type '\(type)'. " +
+                "Use deleteNode + upsertNode to rekey a node."
+            )
+        }
+
+        let assignments = try synthesizeAssignments(set: set, nodeDef: nodeDef)
+        var paramDecls = assignments.paramDecls
+        paramDecls.append("$__key: \(keyTypeAnn)")
+        let querySource = """
+        query __sdk_update_node(\(paramDecls.joined(separator: ", "))) {
+          update \(type) set { \(assignments.setClauses.joined(separator: ", ")) } where \(keyProperty) = $__key
+        }
+        """
+
+        var params = assignments.params
+        params["__key"] = key
+        return try runMutation(
+            querySource: querySource,
+            queryName: "__sdk_update_node",
+            params: params
+        )
+    }
+
+    /// Update properties on every node matching a raw predicate. Escape hatch
+    /// for bulk edits — prefer `updateNode(type:key:set:)` for single-row
+    /// updates in interactive contexts (safer: can't silently rewrite more
+    /// than one row on a typo).
+    ///
+    /// `wherePredicate` is raw `.gq` text inserted after `where`. Param names
+    /// referenced inside it must be declared in `paramTypes`.
+    @discardableResult
+    public func updateNodes(
+        type: String,
+        wherePredicate: String,
+        paramTypes: [String: String] = [:],
+        params: [String: Any] = [:],
+        set: [String: Any]
+    ) throws -> MutationResult {
+        guard !set.isEmpty else {
+            return MutationResult(affectedNodes: 0, affectedEdges: 0)
+        }
+        let nodeDef = try nodeTypeDefinition(for: type)
+        if let keyProperty = nodeDef.keyProperty, set.keys.contains(keyProperty) {
+            throw NanoGraphError.message(
+                "Cannot update the @key property '\(keyProperty)' on type '\(type)'."
+            )
+        }
+
+        let assignments = try synthesizeAssignments(set: set, nodeDef: nodeDef)
+        var paramDecls = assignments.paramDecls
+        for (name, typeAnn) in paramTypes {
+            paramDecls.append("$\(name): \(typeAnn)")
+        }
+        let querySource = """
+        query __sdk_update_nodes(\(paramDecls.joined(separator: ", "))) {
+          update \(type) set { \(assignments.setClauses.joined(separator: ", ")) } where \(wherePredicate)
+        }
+        """
+
+        var allParams = assignments.params
+        for (name, value) in params {
+            allParams[name] = value
+        }
+        return try runMutation(
+            querySource: querySource,
+            queryName: "__sdk_update_nodes",
+            params: allParams
+        )
+    }
+
+    // MARK: - Private synthesis helpers
+
+    private func runMutation(
+        querySource: String,
+        queryName: String,
+        params: [String: Any]?
+    ) throws -> MutationResult {
+        let raw = try run(querySource: querySource, queryName: queryName, params: params)
+        return try decodeValue(MutationResult.self, from: raw)
+    }
+
+    private struct Assignments {
+        var paramDecls: [String]
+        var setClauses: [String]
+        var params: [String: Any]
+    }
+
+    private func synthesizeAssignments(
+        set: [String: Any],
+        nodeDef: SchemaDescribeMetadata.TypeDef
+    ) throws -> Assignments {
+        var paramDecls: [String] = []
+        var setClauses: [String] = []
+        var params: [String: Any] = [:]
+        for propertyName in set.keys.sorted() {
+            let value = set[propertyName]!
+            let typeAnn = try propertyTypeAnnotation(for: nodeDef, propertyName: propertyName)
+            let paramName = "__p_\(propertyName)"
+            paramDecls.append("$\(paramName): \(typeAnn)")
+            setClauses.append("\(propertyName): $\(paramName)")
+            params[paramName] = value
+        }
+        return Assignments(paramDecls: paramDecls, setClauses: setClauses, params: params)
+    }
+
+    private func nodeKeyMetadata(
+        for type: String
+    ) throws -> (SchemaDescribeMetadata.TypeDef, String) {
+        let nodeDef = try nodeTypeDefinition(for: type)
+        let keyProperty = try requireKeyProperty(for: nodeDef)
+        let keyType = try propertyTypeAnnotation(for: nodeDef, propertyName: keyProperty)
+        return (nodeDef, keyType)
+    }
+
+    private func nodeTypeDefinition(
+        for type: String
+    ) throws -> SchemaDescribeMetadata.TypeDef {
+        let schema = try cachedSchemaMetadata()
+        guard let def = schema.nodeTypes.first(where: { $0.name == type }) else {
+            throw NanoGraphError.message("Unknown node type '\(type)'")
+        }
+        return def
+    }
+
+    private func edgeTypeDefinition(
+        for type: String
+    ) throws -> SchemaDescribeMetadata.TypeDef {
+        let schema = try cachedSchemaMetadata()
+        guard let def = schema.edgeTypes.first(where: { $0.name == type }) else {
+            throw NanoGraphError.message("Unknown edge type '\(type)'")
+        }
+        return def
+    }
+
+    private func requireKeyProperty(
+        for nodeDef: SchemaDescribeMetadata.TypeDef
+    ) throws -> String {
+        guard let key = nodeDef.keyProperty, !key.isEmpty else {
+            throw NanoGraphError.message(
+                "Node type '\(nodeDef.name)' has no @key — cannot address rows by key"
+            )
+        }
+        return key
+    }
+
+    private func propertyTypeAnnotation(
+        for typeDef: SchemaDescribeMetadata.TypeDef,
+        propertyName: String
+    ) throws -> String {
+        guard let prop = typeDef.properties.first(where: { $0.name == propertyName }) else {
+            throw NanoGraphError.message(
+                "Unknown property '\(propertyName)' on type '\(typeDef.name)'"
+            )
+        }
+        guard let typeAnn = prop.type, !typeAnn.isEmpty else {
+            throw NanoGraphError.message(
+                "Missing type annotation for '\(typeDef.name).\(propertyName)'"
+            )
+        }
+        return typeAnn
+    }
+
+    private func edgeEndpointKeyTypeAnnotations(
+        for edgeDef: SchemaDescribeMetadata.TypeDef
+    ) throws -> (src: String, dst: String) {
+        guard let srcTypeName = edgeDef.srcType, let dstTypeName = edgeDef.dstType else {
+            throw NanoGraphError.message(
+                "Edge type '\(edgeDef.name)' is missing endpoint type information in describe()"
+            )
+        }
+        let srcDef = try nodeTypeDefinition(for: srcTypeName)
+        let dstDef = try nodeTypeDefinition(for: dstTypeName)
+        let srcKeyProp = try requireKeyProperty(for: srcDef)
+        let dstKeyProp = try requireKeyProperty(for: dstDef)
+        let srcKeyType = try propertyTypeAnnotation(for: srcDef, propertyName: srcKeyProp)
+        let dstKeyType = try propertyTypeAnnotation(for: dstDef, propertyName: dstKeyProp)
+        return (srcKeyType, dstKeyType)
     }
 }
 

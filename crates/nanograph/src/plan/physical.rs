@@ -830,8 +830,11 @@ async fn execute_delete_edge_mutation(
             let endpoint = resolve_mutation_literal(&predicate.value, params)?;
             let endpoint_name = literal_to_endpoint_name(&endpoint, "from")?;
             let metadata = DatabaseMetadata::open(db.path())?;
-            let src_id =
-                resolve_sparse_node_id_by_name(&metadata, &src_type, &endpoint_name).await?;
+            let Some(src_id) =
+                resolve_sparse_node_id_by_name(&metadata, &src_type, &endpoint_name).await?
+            else {
+                return Ok(MutationExecResult::default());
+            };
             DeletePredicate {
                 property: "src".to_string(),
                 op: delete_pred.op,
@@ -842,8 +845,11 @@ async fn execute_delete_edge_mutation(
             let endpoint = resolve_mutation_literal(&predicate.value, params)?;
             let endpoint_name = literal_to_endpoint_name(&endpoint, "to")?;
             let metadata = DatabaseMetadata::open(db.path())?;
-            let dst_id =
-                resolve_sparse_node_id_by_name(&metadata, &dst_type, &endpoint_name).await?;
+            let Some(dst_id) =
+                resolve_sparse_node_id_by_name(&metadata, &dst_type, &endpoint_name).await?
+            else {
+                return Ok(MutationExecResult::default());
+            };
             DeletePredicate {
                 property: "dst".to_string(),
                 op: delete_pred.op,
@@ -943,8 +949,13 @@ fn literal_to_predicate_string(lit: &Literal) -> Result<String> {
 fn literal_to_endpoint_name(lit: &Literal, endpoint: &str) -> Result<String> {
     match lit {
         Literal::String(s) => Ok(s.clone()),
+        Literal::Integer(i) => Ok(i.to_string()),
+        Literal::Float(f) => Ok(f.to_string()),
+        Literal::Bool(b) => Ok(b.to_string()),
+        Literal::Date(s) => Ok(s.clone()),
+        Literal::DateTime(s) => Ok(s.clone()),
         _ => Err(NanoError::Execution(format!(
-            "edge endpoint `{}` must be a String literal or String parameter",
+            "edge endpoint `{}` must be a scalar literal or scalar parameter",
             endpoint
         ))),
     }

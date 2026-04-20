@@ -8,8 +8,8 @@ use lance::Dataset;
 use crate::error::Result;
 use crate::store::manifest::GraphManifest;
 use crate::store::namespace::{
-    GRAPH_SNAPSHOT_TABLE_ID, namespace_latest_version, open_directory_namespace,
-    resolve_table_location,
+    GRAPH_SNAPSHOT_TABLE_ID, namespace_latest_version, namespace_location_to_dataset_uri,
+    open_directory_namespace, resolve_table_location,
 };
 use crate::store::namespace_commit::publish_snapshot_bundle;
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
@@ -76,7 +76,7 @@ async fn read_namespace_snapshot_async(db_dir: &Path) -> Result<GraphManifest> {
         .await?
         .version;
     let location = resolve_table_location(namespace, GRAPH_SNAPSHOT_TABLE_ID).await?;
-    let dataset_uri = normalize_namespace_location(db_dir, &location);
+    let dataset_uri = normalize_namespace_location(db_dir, &location)?;
     let dataset = Dataset::open(&dataset_uri)
         .await
         .map_err(|err| {
@@ -172,14 +172,8 @@ async fn read_namespace_snapshot_async(db_dir: &Path) -> Result<GraphManifest> {
     })
 }
 
-fn normalize_namespace_location(db_dir: &Path, location: &str) -> String {
-    let normalized = location.strip_prefix("file://").unwrap_or(location);
-    let path = std::path::PathBuf::from(normalized);
-    if path.is_absolute() {
-        path.to_string_lossy().to_string()
-    } else {
-        db_dir.join(path).to_string_lossy().to_string()
-    }
+fn normalize_namespace_location(db_dir: &Path, location: &str) -> Result<String> {
+    namespace_location_to_dataset_uri(db_dir, location)
 }
 
 fn read_namespace_snapshot_blocking(db_dir: &Path) -> Result<GraphManifest> {
