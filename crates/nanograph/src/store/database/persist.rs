@@ -39,7 +39,9 @@ use crate::store::loader::{
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::metadata::DatabaseMetadata;
-use crate::store::namespace::{open_directory_namespace, resolve_table_location};
+use crate::store::namespace::{
+    namespace_location_to_manifest_dataset_path, open_directory_namespace, resolve_table_location,
+};
 use crate::store::namespace_lineage_internal::merge_namespace_lineage_internal_dataset_entries;
 use crate::store::runtime::DatabaseRuntime;
 use crate::store::snapshot::read_committed_graph_snapshot;
@@ -1180,11 +1182,7 @@ async fn resolve_manifest_dataset_path(
 
     let namespace = open_directory_namespace(db_path).await?;
     let location = resolve_table_location(namespace, table_id).await?;
-    let normalized = location.strip_prefix("file://").unwrap_or(&location);
-    Ok(std::path::PathBuf::from(normalized)
-        .strip_prefix(db_path)
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|_| fallback_rel_path.to_string()))
+    namespace_location_to_manifest_dataset_path(db_path, &location, fallback_rel_path)
 }
 
 pub(crate) async fn persist_dataset_mutation_plan_at_path(

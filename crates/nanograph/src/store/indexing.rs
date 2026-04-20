@@ -12,6 +12,7 @@ use tracing::debug;
 
 use crate::catalog::schema_ir::NodeTypeDef;
 use crate::error::{NanoError, Result};
+use crate::store::namespace::local_path_to_file_uri;
 use crate::types::ScalarType;
 
 const SCALAR_INDEX_SUFFIX: &str = "_btree_idx";
@@ -63,7 +64,7 @@ pub(crate) async fn rebuild_node_scalar_indexes(
     let build_lock = SCALAR_INDEX_BUILD_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = build_lock.lock().await;
 
-    let uri = dataset_path.to_string_lossy().to_string();
+    let uri = local_path_to_file_uri(dataset_path)?;
     let mut dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
@@ -117,7 +118,7 @@ pub(crate) async fn rebuild_node_text_indexes(
     let build_lock = SCALAR_INDEX_BUILD_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = build_lock.lock().await;
 
-    let uri = dataset_path.to_string_lossy().to_string();
+    let uri = local_path_to_file_uri(dataset_path)?;
     let mut dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
@@ -200,7 +201,7 @@ pub(crate) async fn rebuild_node_vector_indexes(
     let build_lock = VECTOR_INDEX_BUILD_LOCK.get_or_init(|| Mutex::new(()));
     let _guard = build_lock.lock().await;
 
-    let uri = dataset_path.to_string_lossy().to_string();
+    let uri = local_path_to_file_uri(dataset_path)?;
     let mut dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;

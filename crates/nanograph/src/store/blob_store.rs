@@ -17,8 +17,11 @@ use crate::store::lance_io::{
 };
 use crate::store::manifest::DatasetEntry;
 use crate::store::namespace::{
-    BLOB_STORE_TABLE_ID, batch_publish_namespace_versions, namespace_published_version_for_table,
-    open_directory_namespace, resolve_table_location, write_namespace_batch,
+    BLOB_STORE_TABLE_ID, batch_publish_namespace_versions, local_path_to_file_uri,
+    namespace_published_version_for_table, namespace_location_to_dataset_uri,
+    namespace_location_to_local_path,
+    namespace_location_to_manifest_dataset_path, open_directory_namespace,
+    resolve_table_location, write_namespace_batch,
 };
 use crate::store::snapshot::read_committed_graph_snapshot;
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
@@ -231,7 +234,7 @@ pub(crate) async fn ensure_blob_store_table(db_path: &Path) -> Result<DatasetEnt
             let location = resolve_table_location(namespace, BLOB_STORE_TABLE_ID).await?;
             Ok(DatasetEntry::internal(
                 BLOB_STORE_TABLE_ID,
-                manifest_dataset_path(db_path, &location, BLOB_STORE_TABLE_ID),
+                manifest_dataset_path(db_path, &location, BLOB_STORE_TABLE_ID)?,
                 version.version,
                 0,
             ))
@@ -266,9 +269,10 @@ pub(crate) async fn current_blob_store_entry(db_path: &Path) -> Result<Option<Da
                     Ok(location) => location,
                     Err(_) => return Ok(None),
                 };
-            let location_path = PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+            let location_path = namespace_location_to_local_path(db_path, &location)?;
             let version = latest_lance_dataset_version(&location_path).await?;
-            let dataset = Dataset::open(&location).await.map_err(|err| {
+            let dataset_uri = namespace_location_to_dataset_uri(db_path, &location)?;
+            let dataset = Dataset::open(&dataset_uri).await.map_err(|err| {
                 NanoError::Lance(format!("open namespace blob store error: {}", err))
             })?
             .checkout_version(version)
@@ -285,7 +289,7 @@ pub(crate) async fn current_blob_store_entry(db_path: &Path) -> Result<Option<Da
                 })? as u64;
             Ok(Some(DatasetEntry::internal(
                 BLOB_STORE_TABLE_ID,
-                manifest_dataset_path(db_path, &location, BLOB_STORE_TABLE_ID),
+                manifest_dataset_path(db_path, &location, BLOB_STORE_TABLE_ID)?,
                 version,
                 row_count,
             )))
@@ -296,7 +300,8 @@ pub(crate) async fn current_blob_store_entry(db_path: &Path) -> Result<Option<Da
                 return Ok(None);
             }
             let version = latest_lance_dataset_version(&path).await?;
-            let dataset = Dataset::open(path.to_string_lossy().as_ref())
+            let dataset_uri = local_path_to_file_uri(&path)?;
+            let dataset = Dataset::open(&dataset_uri)
                 .await
                 .map_err(|err| NanoError::Lance(format!("open blob store error: {}", err)))?
                 .checkout_version(version)
@@ -352,12 +357,8 @@ fn managed_blob_schema() -> Arc<Schema> {
     ]))
 }
 
-fn manifest_dataset_path(db_path: &Path, location: &str, fallback: &str) -> String {
-    let normalized = location.strip_prefix("file://").unwrap_or(location);
-    PathBuf::from(normalized)
-        .strip_prefix(db_path)
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|_| fallback.to_string())
+fn manifest_dataset_path(db_path: &Path, location: &str, fallback: &str) -> Result<String> {
+    namespace_location_to_manifest_dataset_path(db_path, location, fallback)
 }
 
 async fn open_blob_store_dataset(db_path: &Path, version: u64) -> Result<Dataset> {
@@ -368,7 +369,7 @@ async fn open_blob_store_dataset(db_path: &Path, version: u64) -> Result<Dataset
                 && !entry.dataset_path.is_empty()
             {
                 let path = db_path.join(&entry.dataset_path);
-                let uri = path.to_string_lossy().to_string();
+                let uri = local_path_to_file_uri(&path)?;
                 let dataset = Dataset::open(&uri).await.map_err(|err| {
                     NanoError::Lance(format!(
                         "open committed blob store {} error: {}",
@@ -385,7 +386,8 @@ async fn open_blob_store_dataset(db_path: &Path, version: u64) -> Result<Dataset
             }
             let namespace = open_directory_namespace(db_path).await?;
             let location = resolve_table_location(namespace, BLOB_STORE_TABLE_ID).await?;
-            Dataset::open(&location)
+            let dataset_uri = namespace_location_to_dataset_uri(db_path, &location)?;
+            Dataset::open(&dataset_uri)
                 .await
                 .map_err(|err| {
                     NanoError::Lance(format!("open namespace blob store error: {}", err))
@@ -401,7 +403,7 @@ async fn open_blob_store_dataset(db_path: &Path, version: u64) -> Result<Dataset
         }
         None => {
             let path = blob_store_dataset_path(db_path);
-            let uri = path.to_string_lossy().to_string();
+            let uri = local_path_to_file_uri(&path)?;
             let dataset = Dataset::open(&uri)
                 .await
                 .map_err(|err| NanoError::Lance(format!("open blob store error: {}", err)))?;

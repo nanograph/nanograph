@@ -153,6 +153,89 @@ public struct MutationResult: Decodable, Sendable {
     }
 }
 
+/// A single committed mutation in the CDC log.
+///
+/// Mirrors the Rust-side `VisibleChangeRow` in
+/// `crates/nanograph/src/store/txlog.rs`. Field names use snake_case on the
+/// wire; Swift surfaces them as camelCase via `CodingKeys`.
+///
+/// The cursor for resuming a stream is `graphVersion` — monotonic across a
+/// database's lifetime, unique per commit.
+public struct Change: Decodable, Sendable {
+    public enum Kind: String, Decodable, Sendable {
+        case insert, update, delete
+    }
+
+    public enum EntityKind: String, Decodable, Sendable {
+        case node, edge
+    }
+
+    public let graphVersion: UInt64
+    public let txId: String
+    public let committedAt: String
+    public let changeKind: Kind
+    public let entityKind: EntityKind
+    public let typeName: String
+    public let tableId: String
+    public let rowid: UInt64
+    public let entityId: UInt64
+    public let logicalKey: String
+    public let row: JSONValue?
+    public let previousGraphVersion: UInt64?
+
+    private enum CodingKeys: String, CodingKey {
+        case graphVersion = "graph_version"
+        case txId = "tx_id"
+        case committedAt = "committed_at"
+        case changeKind = "change_kind"
+        case entityKind = "entity_kind"
+        case typeName = "type_name"
+        case tableId = "table_id"
+        case rowid
+        case entityId = "entity_id"
+        case logicalKey = "logical_key"
+        case row
+        case previousGraphVersion = "previous_graph_version"
+    }
+}
+
+/// A type-erased JSON value, suitable for exposing opaque payloads (like the
+/// `row` field on a `Change`) to callers without forcing a schema-specific
+/// decoder. Supports `null`, bools, numbers, strings, arrays, and objects.
+public enum JSONValue: Decodable, Sendable {
+    case null
+    case bool(Bool)
+    case int(Int64)
+    case double(Double)
+    case string(String)
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() {
+            self = .null
+        } else if let bool = try? container.decode(Bool.self) {
+            self = .bool(bool)
+        } else if let int = try? container.decode(Int64.self) {
+            self = .int(int)
+        } else if let double = try? container.decode(Double.self) {
+            self = .double(double)
+        } else if let string = try? container.decode(String.self) {
+            self = .string(string)
+        } else if let array = try? container.decode([JSONValue].self) {
+            self = .array(array)
+        } else if let object = try? container.decode([String: JSONValue].self) {
+            self = .object(object)
+        } else {
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "Unsupported JSON value"
+            )
+        }
+    }
+}
+
 public final class Database {
     // Serializes handle lifecycle/use to avoid close-vs-operation races.
     private let lock = NSLock()
@@ -439,6 +522,71 @@ public final class Database {
     public func changes<T: Decodable>(_ type: T.Type, options: Any? = nil) throws -> T {
         let raw = try changes(options: options)
         return try decodeValue(type, from: raw)
+    }
+
+    /// Fetch the CDC log since a given `graph_version` cursor. Pass `nil` to
+    /// fetch everything from the beginning.
+    ///
+    /// The returned array is ordered by `graphVersion` ascending (engine
+    /// contract); callers can advance their cursor with `.max(by:)` on the
+    /// returned rows.
+    public func changes(since graphVersion: UInt64? = nil) throws -> [Change] {
+        var options: [String: Any] = [:]
+        if let graphVersion {
+            options["since"] = graphVersion
+        }
+        return try changes([Change].self, options: options.isEmpty ? nil : options)
+    }
+
+    /// Returns the current (highest committed) `graph_version` — useful for
+    /// seeding a CDC stream cursor after an initial hydrate so the first poll
+    /// doesn't replay history.
+    ///
+    /// Implementation: reads the full change log once. Cheap on fresh DBs;
+    /// consider caching this at the call site for high-traffic loops.
+    public func currentGraphVersion() throws -> UInt64? {
+        let allChanges = try changes(since: nil)
+        return allChanges.map(\.graphVersion).max()
+    }
+
+    /// A polling AsyncSequence over the CDC log. Every `interval`, fetches
+    /// any new `Change` rows since the last seen cursor and yields them as a
+    /// batch. Quiet DBs produce empty polls that yield nothing (non-empty
+    /// batches only are yielded).
+    ///
+    /// The sequence terminates when the Task consuming it is cancelled.
+    ///
+    /// `startAt`: seed cursor — typically the `graph_version` of the most
+    /// recent state the consumer has already applied. Pass `nil` to replay
+    /// from the beginning.
+    public func changeStream(
+        interval: Duration = .seconds(1.5),
+        startAt cursor: UInt64? = nil
+    ) -> AsyncThrowingStream<[Change], Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task { [self] in
+                var currentCursor = cursor
+                while !Task.isCancelled {
+                    do {
+                        let batch = try self.changes(since: currentCursor)
+                        if !batch.isEmpty {
+                            continuation.yield(batch)
+                            currentCursor = batch.map(\.graphVersion).max() ?? currentCursor
+                        }
+                    } catch {
+                        continuation.finish(throwing: error)
+                        return
+                    }
+                    do {
+                        try await Task.sleep(for: interval)
+                    } catch {
+                        break
+                    }
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
     }
 
     private func requireHandleLocked() throws -> OpaquePointer {

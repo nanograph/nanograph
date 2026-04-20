@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -5,7 +6,6 @@ use arrow_array::{RecordBatch, RecordBatchIterator};
 use async_trait::async_trait;
 use futures::StreamExt;
 use lance::Dataset;
-use lance::dataset::builder::DatasetBuilder;
 use lance::dataset::{
     InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams,
 };
@@ -16,8 +16,9 @@ use crate::error::{NanoError, Result};
 use crate::store::graph_types::{GraphTableId, GraphTableVersion};
 use crate::store::metadata::DatasetLocator;
 use crate::store::namespace::{
-    namespace_latest_version, open_directory_namespace, resolve_or_declare_table_location,
-    table_id_parts,
+    local_path_to_file_uri, namespace_latest_version, namespace_location_to_dataset_uri,
+    namespace_location_to_local_path, open_directory_namespace, resolve_or_declare_table_location,
+    resolve_table_location,
 };
 
 pub(crate) const LANCE_INTERNAL_ID_FIELD: &str = "__ng_id";
@@ -260,6 +261,17 @@ pub(crate) async fn write_lance_batch_with_mode_for_kind_versioned(
     mode: WriteMode,
     kind: LanceDatasetKind,
 ) -> Result<GraphTableVersion> {
+    write_lance_batch_with_mode_for_kind_versioned_and_properties(path, batch, mode, kind, None)
+        .await
+}
+
+pub(crate) async fn write_lance_batch_with_mode_for_kind_versioned_and_properties(
+    path: &Path,
+    batch: RecordBatch,
+    mode: WriteMode,
+    kind: LanceDatasetKind,
+    transaction_properties: Option<HashMap<String, String>>,
+) -> Result<GraphTableVersion> {
     let has_manifest_dir = path.join("_versions").exists();
     let storage_version = if has_manifest_dir || matches!(mode, WriteMode::Append) {
         None
@@ -272,6 +284,7 @@ pub(crate) async fn write_lance_batch_with_mode_for_kind_versioned(
         mode,
         storage_version,
         kind,
+        transaction_properties,
     )
     .await
 }
@@ -305,6 +318,7 @@ async fn write_lance_batch_with_mode_and_storage_version_versioned(
         mode,
         storage_version,
         lance_dataset_kind(path),
+        None,
     )
     .await
 }
@@ -315,6 +329,7 @@ async fn write_lance_batch_with_mode_and_storage_version_for_kind_versioned(
     mode: WriteMode,
     storage_version: Option<LanceFileVersion>,
     kind: LanceDatasetKind,
+    transaction_properties: Option<HashMap<String, String>>,
 ) -> Result<GraphTableVersion> {
     info!(
         dataset_path = %path.display(),
@@ -324,7 +339,7 @@ async fn write_lance_batch_with_mode_and_storage_version_for_kind_versioned(
     );
     let batch = logical_batch_to_lance(&batch, kind)?;
     let schema = batch.schema();
-    let uri = path.to_string_lossy().to_string();
+    let uri = local_path_to_file_uri(path)?;
 
     let reader = RecordBatchIterator::new(vec![Ok(batch)], schema);
     let write_params = match storage_version {
@@ -332,13 +347,22 @@ async fn write_lance_batch_with_mode_and_storage_version_for_kind_versioned(
             let mut params = WriteParams::with_storage_version(version);
             params.mode = mode;
             params.enable_stable_row_ids = true;
+            if let Some(properties) = transaction_properties {
+                params.transaction_properties = Some(Arc::new(properties));
+            }
             params
         }
-        None => WriteParams {
-            mode,
-            enable_stable_row_ids: true,
-            ..Default::default()
-        },
+        None => {
+            let mut params = WriteParams {
+                mode,
+                enable_stable_row_ids: true,
+                ..Default::default()
+            };
+            if let Some(properties) = transaction_properties {
+                params.transaction_properties = Some(Arc::new(properties));
+            }
+            params
+        }
     };
 
     let dataset = Dataset::write(reader, &uri, Some(write_params))
@@ -366,8 +390,25 @@ pub(crate) async fn append_lance_batch_at_version_for_kind(
     batch: RecordBatch,
     kind: LanceDatasetKind,
 ) -> Result<GraphTableVersion> {
+    append_lance_batch_at_version_for_kind_with_properties(
+        path,
+        pinned_version,
+        batch,
+        kind,
+        None,
+    )
+    .await
+}
+
+pub(crate) async fn append_lance_batch_at_version_for_kind_with_properties(
+    path: &Path,
+    pinned_version: &GraphTableVersion,
+    batch: RecordBatch,
+    kind: LanceDatasetKind,
+    transaction_properties: Option<HashMap<String, String>>,
+) -> Result<GraphTableVersion> {
     let batch = logical_batch_to_lance(&batch, kind)?;
-    let uri = path.to_string_lossy().to_string();
+    let uri = local_path_to_file_uri(path)?;
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("append open error: {}", e)))?;
@@ -380,11 +421,14 @@ pub(crate) async fn append_lance_batch_at_version_for_kind(
                 pinned_version.version, e
             ))
         })?;
-    let params = WriteParams {
+    let mut params = WriteParams {
         mode: WriteMode::Append,
         enable_stable_row_ids: true,
         ..Default::default()
     };
+    if let Some(properties) = transaction_properties {
+        params.transaction_properties = Some(Arc::new(properties));
+    }
     let appended = InsertBuilder::new(Arc::new(dataset))
         .with_params(&params)
         .execute(vec![batch])
@@ -436,7 +480,7 @@ async fn run_lance_merge_insert_with_key_versioned_for_kind(
     key_prop: &str,
     kind: LanceDatasetKind,
 ) -> Result<GraphTableVersion> {
-    let uri = dataset_path.to_string_lossy().to_string();
+    let uri = local_path_to_file_uri(dataset_path)?;
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("merge open error: {}", e)))?;
@@ -501,7 +545,7 @@ async fn run_lance_delete_by_ids_versioned(
         return Ok(pinned_version.clone());
     }
 
-    let uri = dataset_path.to_string_lossy().to_string();
+    let uri = local_path_to_file_uri(dataset_path)?;
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("delete open error: {}", e)))?;
@@ -536,7 +580,7 @@ pub(crate) async fn latest_lance_dataset_version(path: &Path) -> Result<u64> {
 }
 
 async fn latest_lance_dataset_graph_version(path: &Path) -> Result<GraphTableVersion> {
-    let uri = path.to_string_lossy().to_string();
+    let uri = local_path_to_file_uri(path)?;
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
@@ -551,17 +595,18 @@ async fn latest_lance_dataset_graph_version(path: &Path) -> Result<GraphTableVer
 }
 
 pub(crate) async fn cleanup_unpublished_manifest_versions(
-    dataset_uri: &str,
+    db_dir: &Path,
+    dataset_location: &str,
     published_version: Option<u64>,
 ) -> Result<usize> {
-    match Dataset::open(dataset_uri).await {
+    let dataset_uri = namespace_location_to_dataset_uri(db_dir, dataset_location)?;
+    match Dataset::open(&dataset_uri).await {
         Ok(_dataset) => {}
         Err(_err) if published_version.is_none() => return Ok(0),
         Err(err) => return Err(NanoError::Lance(format!("cleanup open error: {}", err))),
     };
-    let unpublished = std::fs::read_dir(
-        PathBuf::from(dataset_uri.strip_prefix("file://").unwrap_or(dataset_uri)).join("_versions"),
-    )?
+    let versions_dir = namespace_location_to_local_path(db_dir, dataset_location)?.join("_versions");
+    let unpublished = std::fs::read_dir(versions_dir)?
     .filter_map(|entry| entry.ok())
     .filter_map(|entry| {
         let path = entry.path();
@@ -592,16 +637,18 @@ pub(crate) async fn cleanup_unpublished_manifest_versions(
 pub(crate) async fn open_dataset_for_locator(locator: &DatasetLocator) -> Result<Dataset> {
     if locator.namespace_managed {
         let namespace = open_directory_namespace(&locator.db_path).await?;
-        return DatasetBuilder::from_namespace(namespace, table_id_parts(&locator.table_id))
+        let location = resolve_table_location(namespace, &locator.table_id).await?;
+        let dataset_uri = namespace_location_to_dataset_uri(&locator.db_path, &location)?;
+        let dataset = Dataset::open(&dataset_uri)
             .await
             .map_err(|e| {
                 NanoError::Lance(format!(
-                    "namespace dataset builder {} error: {}",
+                    "namespace dataset {} open error: {}",
                     locator.table_id, e
                 ))
-            })?
-            .with_version(locator.dataset_version)
-            .load()
+            })?;
+        return dataset
+            .checkout_version(locator.dataset_version)
             .await
             .map_err(|e| {
                 NanoError::Lance(format!(
@@ -610,7 +657,7 @@ pub(crate) async fn open_dataset_for_locator(locator: &DatasetLocator) -> Result
                 ))
             });
     } else {
-        let uri = locator.dataset_path.to_string_lossy().to_string();
+        let uri = local_path_to_file_uri(&locator.dataset_path)?;
         let dataset = Dataset::open(&uri)
             .await
             .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
@@ -704,7 +751,7 @@ async fn read_lance_batches_versioned(version: &GraphTableVersion) -> Result<Vec
         "reading Lance dataset"
     );
     let path = Path::new(version.table_id.as_str());
-    let uri = path.to_string_lossy().to_string();
+    let uri = local_path_to_file_uri(path)?;
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
@@ -753,7 +800,7 @@ pub(crate) async fn read_lance_projected_batches(
         projection = ?columns,
         "reading projected Lance dataset"
     );
-    let uri = path.to_string_lossy().to_string();
+    let uri = local_path_to_file_uri(path)?;
     let dataset = Dataset::open(&uri)
         .await
         .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
@@ -838,7 +885,7 @@ impl TableStore for V4NamespaceTableStore {
         let namespace = open_directory_namespace(&self.db_path).await?;
         let table_id = self.table_id_for_path(path)?;
         let location = resolve_or_declare_table_location(namespace, &table_id).await?;
-        let location_path = PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+        let location_path = namespace_location_to_local_path(&self.db_path, &location)?;
         write_lance_batch_with_mode_for_kind_versioned(
             &location_path,
             batch,
@@ -853,8 +900,9 @@ impl TableStore for V4NamespaceTableStore {
         let table_id = self.table_id_for_path(path)?;
         let published = namespace_latest_version(namespace.clone(), &table_id).await?;
         let location = resolve_or_declare_table_location(namespace, &table_id).await?;
-        cleanup_unpublished_manifest_versions(&location, Some(published.version)).await?;
-        let location_path = PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+        cleanup_unpublished_manifest_versions(&self.db_path, &location, Some(published.version))
+            .await?;
+        let location_path = namespace_location_to_local_path(&self.db_path, &location)?;
         append_lance_batch_at_version_for_kind(
             &location_path,
             &published,
@@ -874,8 +922,9 @@ impl TableStore for V4NamespaceTableStore {
         let table_id = self.table_id_for_path(path)?;
         let namespace = open_directory_namespace(&self.db_path).await?;
         let location = resolve_or_declare_table_location(namespace, &table_id).await?;
-        cleanup_unpublished_manifest_versions(&location, Some(pinned_version.version)).await?;
-        let location_path = PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+        cleanup_unpublished_manifest_versions(&self.db_path, &location, Some(pinned_version.version))
+            .await?;
+        let location_path = namespace_location_to_local_path(&self.db_path, &location)?;
         run_lance_merge_insert_with_key_versioned_for_kind(
             &location_path,
             pinned_version,
@@ -895,8 +944,9 @@ impl TableStore for V4NamespaceTableStore {
         let table_id = self.table_id_for_path(path)?;
         let namespace = open_directory_namespace(&self.db_path).await?;
         let location = resolve_or_declare_table_location(namespace, &table_id).await?;
-        cleanup_unpublished_manifest_versions(&location, Some(pinned_version.version)).await?;
-        let location_path = PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+        cleanup_unpublished_manifest_versions(&self.db_path, &location, Some(pinned_version.version))
+            .await?;
+        let location_path = namespace_location_to_local_path(&self.db_path, &location)?;
         run_lance_delete_by_ids_versioned(&location_path, pinned_version, ids).await
     }
 

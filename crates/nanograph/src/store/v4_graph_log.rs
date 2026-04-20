@@ -16,16 +16,14 @@ use crate::store::manifest::{DatasetEntry, GraphManifest};
 use crate::store::metadata::DatasetLocator;
 use crate::store::namespace::{
     GRAPH_CHANGES_TABLE_ID, GRAPH_TX_TABLE_ID, StagedNamespaceTable, namespace_latest_version,
-    namespace_published_version_for_table, open_directory_namespace,
-    resolve_or_declare_table_location, resolve_table_location, write_namespace_batch,
+    namespace_location_to_dataset_uri, namespace_location_to_local_path,
+    namespace_location_to_manifest_dataset_path, namespace_published_version_for_table,
+    open_directory_namespace, resolve_or_declare_table_location, resolve_table_location,
+    write_namespace_batch,
 };
 
-fn manifest_dataset_path(db_path: &Path, location: &str, fallback: &str) -> String {
-    let normalized = location.strip_prefix("file://").unwrap_or(location);
-    std::path::PathBuf::from(normalized)
-        .strip_prefix(db_path)
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|_| fallback.to_string())
+fn manifest_dataset_path(db_path: &Path, location: &str, fallback: &str) -> Result<String> {
+    namespace_location_to_manifest_dataset_path(db_path, location, fallback)
 }
 
 pub(crate) async fn stage_graph_commit_record(
@@ -52,9 +50,8 @@ pub(crate) async fn stage_graph_commit_record(
         pinned_version
     };
     let location = resolve_or_declare_table_location(namespace.clone(), table_id).await?;
-    cleanup_unpublished_manifest_versions(&location, Some(pinned_version.version)).await?;
-    let location_path =
-        std::path::PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+    cleanup_unpublished_manifest_versions(db_path, &location, Some(pinned_version.version)).await?;
+    let location_path = namespace_location_to_local_path(db_path, &location)?;
     let version = append_lance_batch_at_version(&location_path, &pinned_version, batch).await?;
     let row_count = manifest
         .datasets
@@ -66,7 +63,7 @@ pub(crate) async fn stage_graph_commit_record(
     let location = resolve_table_location(namespace, table_id).await?;
     let entry = DatasetEntry::internal(
         table_id,
-        manifest_dataset_path(db_path, &location, table_id),
+        manifest_dataset_path(db_path, &location, table_id)?,
         version.version,
         row_count,
     );
@@ -103,7 +100,7 @@ pub(crate) async fn ensure_graph_tx_table(db_path: &Path) -> Result<DatasetEntry
     let location = resolve_table_location(namespace, GRAPH_TX_TABLE_ID).await?;
     Ok(DatasetEntry::internal(
         GRAPH_TX_TABLE_ID,
-        manifest_dataset_path(db_path, &location, GRAPH_TX_TABLE_ID),
+        manifest_dataset_path(db_path, &location, GRAPH_TX_TABLE_ID)?,
         version.version,
         0,
     ))
@@ -127,7 +124,7 @@ pub(crate) async fn ensure_graph_changes_table(db_path: &Path) -> Result<Dataset
     let location = resolve_table_location(namespace, GRAPH_CHANGES_TABLE_ID).await?;
     Ok(DatasetEntry::internal(
         GRAPH_CHANGES_TABLE_ID,
-        manifest_dataset_path(db_path, &location, GRAPH_CHANGES_TABLE_ID),
+        manifest_dataset_path(db_path, &location, GRAPH_CHANGES_TABLE_ID)?,
         version.version,
         0,
     ))
@@ -151,7 +148,7 @@ pub(crate) async fn rewrite_graph_commit_records(
     let location = resolve_table_location(namespace, table_id).await?;
     let entry = DatasetEntry::internal(
         table_id,
-        manifest_dataset_path(db_path, &location, table_id),
+        manifest_dataset_path(db_path, &location, table_id)?,
         version.version,
         records.len() as u64,
     );
@@ -188,7 +185,7 @@ pub(crate) async fn rewrite_graph_change_records(
     let location = resolve_table_location(namespace, table_id).await?;
     let entry = DatasetEntry::internal(
         table_id,
-        manifest_dataset_path(db_path, &location, table_id),
+        manifest_dataset_path(db_path, &location, table_id)?,
         version.version,
         records.len() as u64,
     );
@@ -234,9 +231,8 @@ pub(crate) async fn stage_graph_change_records(
         pinned_version
     };
     let location = resolve_or_declare_table_location(namespace.clone(), table_id).await?;
-    cleanup_unpublished_manifest_versions(&location, Some(pinned_version.version)).await?;
-    let location_path =
-        std::path::PathBuf::from(location.strip_prefix("file://").unwrap_or(&location));
+    cleanup_unpublished_manifest_versions(db_path, &location, Some(pinned_version.version)).await?;
+    let location_path = namespace_location_to_local_path(db_path, &location)?;
     let version = append_lance_batch_at_version(&location_path, &pinned_version, batch).await?;
     let row_count = manifest
         .datasets
@@ -248,7 +244,7 @@ pub(crate) async fn stage_graph_change_records(
     let location = resolve_table_location(namespace, table_id).await?;
     let entry = DatasetEntry::internal(
         table_id,
-        manifest_dataset_path(db_path, &location, table_id),
+        manifest_dataset_path(db_path, &location, table_id)?,
         version.version,
         row_count,
     );
@@ -361,7 +357,8 @@ async fn load_existing_internal_entry(
     let version = namespace_latest_version(namespace.clone(), table_id)
         .await?
         .version;
-    let dataset = Dataset::open(&location)
+    let dataset_uri = namespace_location_to_dataset_uri(db_path, &location)?;
+    let dataset = Dataset::open(&dataset_uri)
         .await
         .map_err(|err| NanoError::Lance(format!("open {} error: {}", table_id, err)))?
         .checkout_version(version)
@@ -379,7 +376,7 @@ async fn load_existing_internal_entry(
         as u64;
     Ok(Some(DatasetEntry::internal(
         table_id,
-        manifest_dataset_path(db_path, &location, table_id),
+        manifest_dataset_path(db_path, &location, table_id)?,
         version,
         row_count,
     )))

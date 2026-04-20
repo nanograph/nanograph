@@ -20,7 +20,8 @@ use crate::store::lance_io::{latest_lance_dataset_version, read_lance_batches_fo
 use crate::store::manifest::DatasetEntry;
 use crate::store::metadata::DatabaseMetadata;
 use crate::store::namespace::{
-    open_directory_namespace, resolve_table_location, write_namespace_batch,
+    namespace_location_to_manifest_dataset_path, open_directory_namespace,
+    resolve_table_location, write_namespace_batch,
 };
 use crate::store::namespace_lineage_internal::merge_namespace_lineage_internal_dataset_entries;
 use crate::store::snapshot::read_committed_graph_snapshot;
@@ -508,11 +509,7 @@ async fn resolve_manifest_dataset_path(
     table_id: &str,
 ) -> Result<String> {
     let location = resolve_table_location(namespace, table_id).await?;
-    let normalized = location.strip_prefix("file://").unwrap_or(&location);
-    Ok(PathBuf::from(normalized)
-        .strip_prefix(db_path)
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|_| table_id.to_string()))
+    namespace_location_to_manifest_dataset_path(db_path, &location, table_id)
 }
 
 fn backup_db_path(db_path: &Path) -> Result<PathBuf> {
