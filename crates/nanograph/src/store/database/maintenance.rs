@@ -29,8 +29,8 @@ use crate::store::manifest::GraphManifest;
 use crate::store::metadata::{DatabaseMetadata, DatasetLocator};
 use crate::store::namespace::{
     BLOB_STORE_TABLE_ID, GRAPH_CHANGES_TABLE_ID, GRAPH_DELETES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID,
-    GRAPH_TX_TABLE_ID,
-    cleanup_namespace_orphan_versions, open_directory_namespace, resolve_table_location,
+    GRAPH_TX_TABLE_ID, cleanup_namespace_orphan_versions, local_path_to_file_uri,
+    open_directory_namespace, resolve_table_location,
 };
 use crate::store::namespace_commit::publish_snapshot_bundle_with_staged_entries;
 use crate::store::namespace_lineage_graph_log::{
@@ -67,7 +67,7 @@ pub async fn compact_database(db_path: &Path, options: CompactOptions) -> Result
 
     for entry in &mut next_manifest.datasets {
         let dataset_path = db_path.join(&entry.dataset_path);
-        let uri = dataset_path.to_string_lossy().to_string();
+        let uri = local_path_to_file_uri(&dataset_path)?;
         let dataset = Dataset::open(&uri)
             .await
             .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
@@ -227,7 +227,7 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
 
     for entry in &manifest.datasets {
         let dataset_path = db_path.join(&entry.dataset_path);
-        let uri = dataset_path.to_string_lossy().to_string();
+        let uri = local_path_to_file_uri(&dataset_path)?;
         let dataset = Dataset::open(&uri)
             .await
             .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
@@ -365,7 +365,7 @@ async fn cleanup_database_namespace_lineage(
 
     for entry in &manifest.datasets {
         let dataset_path = db_path.join(&entry.dataset_path);
-        let uri = dataset_path.to_string_lossy().to_string();
+        let uri = local_path_to_file_uri(&dataset_path)?;
         let dataset = Dataset::open(&uri)
             .await
             .map_err(|e| NanoError::Lance(format!("open error: {}", e)))?;
@@ -747,7 +747,7 @@ impl Database {
                 issues.push(format!("dataset path missing: {}", dataset_path.display()));
                 continue;
             }
-            let uri = dataset_path.to_string_lossy().to_string();
+            let uri = local_path_to_file_uri(&dataset_path)?;
             match Dataset::open(&uri).await {
                 Ok(dataset) => match dataset.checkout_version(entry.dataset_version).await {
                     Ok(dataset) => {

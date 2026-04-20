@@ -30,7 +30,8 @@ use crate::store::metadata::{DatabaseMetadata, DatasetLocator};
 use crate::store::namespace::{
     BLOB_STORE_TABLE_ID, GRAPH_CHANGES_TABLE_ID, GRAPH_DELETES_TABLE_ID, GRAPH_TX_TABLE_ID,
     batch_publish_namespace_versions, namespace_published_version_for_table,
-    open_directory_namespace, resolve_table_location, write_namespace_batch,
+    namespace_location_to_manifest_dataset_path, open_directory_namespace,
+    resolve_table_location, write_namespace_batch,
 };
 use crate::store::namespace_lineage_graph_log::{
     ensure_graph_deletes_table, ensure_namespace_lineage_graph_tx_table,
@@ -2827,8 +2828,11 @@ async fn write_staged_db(
                         committed_at: manifest.committed_at.clone(),
                         op_summary: "schema_migration".to_string(),
                         schema_identity_version: manifest.schema_identity_version,
-                        touched_tables: build_touched_table_windows_for_migration(
-                            manifest_seed,
+                        // NamespaceLineage schema migration writes a fresh staged database root,
+                        // so pre-migration dataset versions are not reachable after the swap.
+                        // Treat the migrated tables as a fresh CDC epoch instead of referencing
+                        // versions from the prior root.
+                        touched_tables: build_namespace_lineage_touched_table_windows_for_migration(
                             &manifest,
                         ),
                         tx_props: BTreeMap::from([
@@ -3088,33 +3092,21 @@ async fn rewrite_blob_store_entry_for_migration(
     ))
 }
 
-fn build_touched_table_windows_for_migration(
-    previous_manifest: &GraphManifest,
+fn build_namespace_lineage_touched_table_windows_for_migration(
     next_manifest: &GraphManifest,
 ) -> Vec<GraphTouchedTableWindow> {
-    let previous_by_key = previous_manifest
-        .datasets
-        .iter()
-        .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
-        .map(|entry| (format!("{}:{}", entry.kind, entry.type_name), entry))
-        .collect::<HashMap<_, _>>();
     let mut windows = next_manifest
         .datasets
         .iter()
         .filter(|entry| matches!(entry.kind.as_str(), "node" | "edge"))
-        .filter_map(|entry| {
-            let previous = previous_by_key.get(&format!("{}:{}", entry.kind, entry.type_name));
-            let before_version = previous.map(|entry| entry.dataset_version).unwrap_or(0);
-            if before_version == entry.dataset_version {
-                return None;
-            }
-            Some(GraphTouchedTableWindow::new(
+        .map(|entry| {
+            GraphTouchedTableWindow::new(
                 entry.effective_table_id().to_string(),
                 entry.kind.clone(),
                 entry.type_name.clone(),
-                before_version,
+                0,
                 entry.dataset_version,
-            ))
+            )
         })
         .collect::<Vec<_>>();
     windows.sort_by(|a, b| {
@@ -3132,11 +3124,7 @@ async fn resolve_manifest_dataset_path(
     table_id: &str,
 ) -> Result<String> {
     let location = resolve_table_location(namespace, table_id).await?;
-    let normalized = location.strip_prefix("file://").unwrap_or(&location);
-    Ok(PathBuf::from(normalized)
-        .strip_prefix(db_path)
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|_| table_id.to_string()))
+    namespace_location_to_manifest_dataset_path(db_path, &location, table_id)
 }
 
 fn now_unix_seconds_string() -> String {

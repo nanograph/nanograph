@@ -18,9 +18,11 @@ use crate::store::lance_io::{
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest};
 use crate::store::namespace::{
-    BLOB_STORE_TABLE_ID, GRAPH_CHANGES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID, GRAPH_TX_TABLE_ID,
+    GRAPH_CHANGES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID, GRAPH_TX_TABLE_ID,
     NamespacePublishedVersion, StagedNamespaceTable, batch_publish_namespace_versions,
     dedup_namespace_published_versions, namespace_latest_version,
+    namespace_location_to_dataset_uri, namespace_location_to_local_path,
+    namespace_location_to_manifest_dataset_path,
     namespace_published_version_for_table, open_directory_namespace,
     resolve_or_declare_table_location,
 };
@@ -482,9 +484,6 @@ async fn build_snapshot_bundle_with_staged_entries_async(
     let mut published_versions = Vec::new();
     for entry in &snapshot.datasets {
         let table_id = entry.effective_table_id();
-        if table_id == BLOB_STORE_TABLE_ID {
-            continue;
-        }
         if let Some(staged) = staged_entries_by_id.get(table_id) {
             published_versions.push(staged.published_version.clone());
             continue;
@@ -562,7 +561,7 @@ async fn stage_graph_snapshot_entry(
             err
         ))
     })?;
-    let location_path = normalize_namespace_location_path(db_dir, &location);
+    let location_path = normalize_namespace_location_path(db_dir, &location)?;
     match namespace_latest_version(namespace.clone(), GRAPH_SNAPSHOT_TABLE_ID).await {
         Ok(published) => {
             let versioned =
@@ -593,7 +592,7 @@ async fn staged_snapshot_entry(
 ) -> Result<StagedNamespaceTable> {
     let entry = DatasetEntry::internal(
         GRAPH_SNAPSHOT_TABLE_ID,
-        manifest_dataset_path(db_dir, location, GRAPH_SNAPSHOT_TABLE_ID),
+        manifest_dataset_path(db_dir, location, GRAPH_SNAPSHOT_TABLE_ID)?,
         version,
         row_count,
     );
@@ -613,9 +612,7 @@ async fn staged_snapshot_entry(
 }
 
 async fn row_count_for_version(db_dir: &Path, location: &str, version: u64) -> Result<u64> {
-    let dataset_uri = normalize_namespace_location_path(db_dir, location)
-        .to_string_lossy()
-        .to_string();
+    let dataset_uri = namespace_location_to_dataset_uri(db_dir, location)?;
     let dataset = lance::Dataset::open(&dataset_uri)
         .await
         .map_err(|err| {
@@ -644,22 +641,12 @@ async fn row_count_for_version(db_dir: &Path, location: &str, version: u64) -> R
         })
 }
 
-fn normalize_namespace_location_path(db_dir: &Path, location: &str) -> PathBuf {
-    let normalized = location.strip_prefix("file://").unwrap_or(location);
-    let path = PathBuf::from(normalized);
-    if path.is_absolute() {
-        path
-    } else {
-        db_dir.join(path)
-    }
+fn normalize_namespace_location_path(db_dir: &Path, location: &str) -> Result<PathBuf> {
+    namespace_location_to_local_path(db_dir, location)
 }
 
-fn manifest_dataset_path(db_path: &Path, location: &str, fallback: &str) -> String {
-    let normalized = location.strip_prefix("file://").unwrap_or(location);
-    PathBuf::from(normalized)
-        .strip_prefix(db_path)
-        .map(|path| path.to_string_lossy().to_string())
-        .unwrap_or_else(|_| fallback.to_string())
+fn manifest_dataset_path(db_path: &Path, location: &str, fallback: &str) -> Result<String> {
+    namespace_location_to_manifest_dataset_path(db_path, location, fallback)
 }
 
 fn graph_snapshot_schema() -> Arc<Schema> {

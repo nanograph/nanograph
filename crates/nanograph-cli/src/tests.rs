@@ -2143,7 +2143,7 @@ query remove_work($from: String) {
     let results = execute_run_query_batches(
         &db_path,
         &queries.queries[0],
-        &ParamMap::from([("from".to_string(), Literal::String("Alice".to_string()))]),
+        &ParamMap::from([("from".to_string(), Literal::String("alice".to_string()))]),
     )
     .await
     .unwrap();
@@ -2163,6 +2163,83 @@ query remove_work($from: String) {
     let delete_row = change_rows.last().unwrap();
     assert_eq!(delete_row.change_kind, "delete");
     assert_eq!(delete_row.type_name, "WorksAt");
+}
+
+#[tokio::test]
+async fn run_delete_edge_missing_endpoint_returns_zero_affected_without_error() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let schema_path = dir.path().join("schema.pg");
+    let data_path = dir.path().join("data.jsonl");
+    let query_path = dir.path().join("delete-edge.gq");
+
+    write_file(
+        &schema_path,
+        r#"node Person {
+    slug: String @key
+    name: String
+}
+node Company {
+    slug: String @key
+    name: String
+}
+edge Knows: Person -> Person
+edge WorksAt: Person -> Company"#,
+    );
+    write_file(
+        &data_path,
+        r#"{"type":"Person","data":{"slug":"alice","name":"Alice"}}
+{"type":"Person","data":{"slug":"bob","name":"Bob"}}
+{"type":"Company","data":{"slug":"acme","name":"Acme"}}
+{"edge":"Knows","from":"alice","to":"bob"}
+{"edge":"WorksAt","from":"alice","to":"acme"}"#,
+    );
+    write_file(
+        &query_path,
+        r#"
+query remove_work($from: String) {
+    delete WorksAt where from = $from
+}
+"#,
+    );
+
+    cmd_init(&db_path, &schema_path, false, false)
+        .await
+        .unwrap();
+    cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
+        .await
+        .unwrap();
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let knows_dataset_path = metadata
+        .manifest()
+        .datasets
+        .iter()
+        .find(|entry| entry.kind == "edge" && entry.type_name == "Knows")
+        .map(|entry| entry.dataset_path.clone())
+        .unwrap();
+    std::fs::remove_dir_all(db_path.join(knows_dataset_path)).unwrap();
+
+    let query_src = std::fs::read_to_string(&query_path).unwrap();
+    let queries = parse_query_or_report(&query_path, &query_src).unwrap();
+    let results = execute_run_query_batches(
+        &db_path,
+        &queries.queries[0],
+        &ParamMap::from([("from".to_string(), Literal::String("nobody".to_string()))]),
+    )
+    .await
+    .unwrap();
+    let affected_edges = results[0]
+        .column_by_name("affected_edges")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::UInt64Array>()
+        .unwrap();
+    assert_eq!(affected_edges.value(0), 0);
+
+    let metadata = DatabaseMetadata::open(&db_path).unwrap();
+    let works_at = build_describe_payload(&db_path, &metadata, Some("WorksAt")).unwrap();
+    assert_eq!(works_at["edges"][0]["rows"].as_u64(), Some(1));
 }
 
 #[tokio::test]

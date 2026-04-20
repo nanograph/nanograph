@@ -16,8 +16,8 @@ use crate::store::metadata::DatabaseMetadata;
 use crate::store::migration::{MigrationStatus, execute_schema_migration};
 use crate::store::namespace::{
     GRAPH_CHANGES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID, GRAPH_TX_TABLE_ID,
-    cleanup_namespace_orphan_versions, open_directory_namespace, resolve_table_location,
-    write_namespace_batch,
+    cleanup_namespace_orphan_versions, namespace_location_to_local_path,
+    open_directory_namespace, resolve_table_location, write_namespace_batch,
 };
 use crate::store::namespace_commit::{build_graph_update_bundle, publish_graph_commit_bundle};
 use crate::store::snapshot::{
@@ -469,6 +469,28 @@ fn write_data_file(dir: &TempDir, name: &str, data: &str) -> std::path::PathBuf 
     path
 }
 
+async fn assert_database_path_supported(db_path: &std::path::Path) {
+    std::fs::create_dir_all(db_path.parent().unwrap()).unwrap();
+    let db = Database::init(db_path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+    drop(db);
+
+    let reopened = Database::open(db_path).await.unwrap();
+    let changes = reopened.changes(0, None).await.unwrap();
+    assert!(
+        !changes.is_empty(),
+        "expected committed CDC rows for {}",
+        db_path.display()
+    );
+    let report = reopened.doctor().await.unwrap();
+    assert!(
+        report.healthy,
+        "expected healthy database for {}: {:?}",
+        db_path.display(),
+        report.issues
+    );
+}
+
 async fn manifest_file_for_table_version(
     db_path: &std::path::Path,
     table_id: &str,
@@ -476,9 +498,9 @@ async fn manifest_file_for_table_version(
 ) -> std::path::PathBuf {
     let namespace = open_directory_namespace(db_path).await.unwrap();
     let location = resolve_table_location(namespace, table_id).await.unwrap();
-    let versions_dir =
-        std::path::PathBuf::from(location.strip_prefix("file://").unwrap_or(&location))
-            .join("_versions");
+    let versions_dir = namespace_location_to_local_path(db_path, &location)
+        .unwrap()
+        .join("_versions");
     std::fs::read_dir(&versions_dir)
         .unwrap()
         .filter_map(|entry| entry.ok())
@@ -2470,6 +2492,20 @@ async fn test_doctor_reports_healthy_database() {
 }
 
 #[tokio::test]
+async fn test_namespace_lineage_database_path_with_spaces() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("my folder").join("db.nano");
+    assert_database_path_supported(&db_path).await;
+}
+
+#[tokio::test]
+async fn test_namespace_lineage_database_path_with_reserved_chars() {
+    let dir = TempDir::new().unwrap();
+    let db_path = dir.path().join("hash#percent%db").join("db.nano");
+    assert_database_path_supported(&db_path).await;
+}
+
+#[tokio::test]
 async fn test_v4_doctor_reports_graph_change_rowid_mismatches() {
     let dir = test_dir("doctor_v4_rowid_mismatch");
     let path = dir.path();
@@ -2734,6 +2770,86 @@ async fn test_v4_schema_migration_preserves_internal_tables() {
 
     let tx_rows = read_tx_catalog_entries(path).unwrap();
     assert_eq!(tx_rows.last().unwrap().op_summary, "schema_migration");
+}
+
+#[tokio::test]
+async fn test_namespace_lineage_schema_migration_starts_fresh_cdc_epoch() {
+    let dir = test_dir("namespace_lineage_schema_migration_cdc_epoch");
+    let path = dir.path();
+
+    let db = Database::init(path, test_schema_src()).await.unwrap();
+    db.load(test_data_src()).await.unwrap();
+    db.load_with_mode(
+        r#"{"type":"Person","data":{"name":"Alice","age":31}}"#,
+        LoadMode::Merge,
+    )
+    .await
+    .unwrap();
+    drop(db);
+
+    std::fs::write(
+        path.join("schema.pg"),
+        r#"node Person {
+    name: String @key
+    age: I32?
+    city: String?
+}
+node Company {
+    name: String @key
+}
+edge Knows: Person -> Person {
+    since: Date?
+}
+edge WorksAt: Person -> Company
+"#,
+    )
+    .unwrap();
+    let result = execute_schema_migration(path, None, false, true)
+        .await
+        .unwrap();
+    assert_eq!(result.status, MigrationStatus::Applied);
+
+    let manifest = read_committed_graph_snapshot(path).unwrap();
+    let tx_rows = read_visible_graph_commit_records(path).unwrap();
+    assert_eq!(tx_rows.len(), 1);
+    let migration_tx = tx_rows.last().unwrap();
+    assert_eq!(migration_tx.op_summary, "schema_migration");
+    assert!(
+        migration_tx
+            .touched_tables
+            .iter()
+            .all(|window| window.before_version == 0 && window.after_version > 0),
+        "expected fresh CDC epoch windows after schema migration: {:?}",
+        migration_tx.touched_tables
+    );
+
+    let change_rows = read_visible_change_rows(path, 0, Some(manifest.db_version)).unwrap();
+    assert!(!change_rows.is_empty(), "expected migration CDC rows");
+    assert!(
+        change_rows
+            .iter()
+            .all(|row| row.graph_version == manifest.db_version && row.change_kind == "insert"),
+        "expected migration CDC rows to be fresh inserts: {:?}",
+        change_rows
+    );
+
+    let reopened = Database::open(path).await.unwrap();
+    let report = reopened.doctor().await.unwrap();
+    assert!(
+        report.healthy,
+        "expected healthy doctor report after schema migration: {:?}",
+        report.issues
+    );
+
+    let cleanup = reopened
+        .cleanup(CleanupOptions {
+            retain_tx_versions: 1,
+            ..CleanupOptions::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(cleanup.tx_rows_kept, 1);
+    assert_eq!(cleanup.cdc_rows_kept, change_rows.len());
 }
 
 #[tokio::test]

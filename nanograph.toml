@@ -1,0 +1,30 @@
+# Shared nanograph project defaults.
+# Keep secrets in .env.nano, not in this file.
+
+[db]
+default_path = "/tmp/no-space.nano"
+
+[schema]
+default_path = "crates/nanograph/tests/fixtures/test.pg"
+
+[query]
+roots = ["queries"]
+
+[embedding]
+provider = "openai"
+model = "text-embedding-3-small"
+batch_size = 64
+chunk_size = 0
+chunk_overlap_chars = 128
+
+[cli]
+table_max_column_width = 80
+
+table_cell_layout = "truncate"
+
+# Example:
+# [query_aliases.search]
+# query = "queries/search.gq"
+# name = "semantic_search"
+# args = ["q"]
+# format = "table"
