@@ -1,6 +1,6 @@
 [package]
 name = "nanograph-cli"
-version = "1.2.1"
+version = "1.2.2"
 edition = "2024"
 description = "CLI for NanoGraph — the embedded property graph database. No server, schema-as-code."
 repository = "https://github.com/nanograph/nanograph"
@@ -12,7 +12,7 @@ name = "nanograph"
 path = "src/main.rs"
 
 [dependencies]
-nanograph = { path = "../nanograph", version = "1.2.1" }
+nanograph = { path = "../nanograph", version = "1.2.2" }
 arrow-array = { workspace = true }
 arrow-schema = { workspace = true }
 arrow-cast = { workspace = true }

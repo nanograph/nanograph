@@ -4051,7 +4051,7 @@ checksum = "2195bf6aa996a481483b29d62a7663eed3fe39600c460e323f8ff41e90bdd89b"
 
 [[package]]
 name = "nanograph"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "ahash",
  "arrow-array",
@@ -4094,7 +4094,7 @@ dependencies = [
 
 [[package]]
 name = "nanograph-cli"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "ariadne",
  "arrow-array",
@@ -4116,7 +4116,7 @@ dependencies = [
 
 [[package]]
 name = "nanograph-ffi"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "arrow-ipc",
  "nanograph",
@@ -4126,7 +4126,7 @@ dependencies = [
 
 [[package]]
 name = "nanograph-ts"
-version = "1.2.1"
+version = "1.2.2"
 dependencies = [
  "nanograph",
  "napi",
