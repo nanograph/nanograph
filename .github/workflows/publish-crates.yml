@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       dry_run:
-        description: 'Run cargo publish with --dry-run (no upload)'
+        description: 'Run cargo publish with --dry-run (no upload). Note: dry-run only validates `nanograph`; dependents are skipped because they cannot resolve an unpublished version.'
         required: false
         default: 'false'
 
@@ -67,6 +67,21 @@ jobs:
             exit 1
           fi
 
+      - name: Check which crates are already published
+        id: check
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          for crate in nanograph nanograph-cli nanograph-ffi nanograph-ts; do
+            key=$(echo "$crate" | tr - _)
+            if curl -fsS "https://crates.io/api/v1/crates/$crate/$version" >/dev/null 2>&1; then
+              echo "${key}=true" >> "$GITHUB_OUTPUT"
+              echo "$crate $version is already on crates.io — will skip"
+            else
+              echo "${key}=false" >> "$GITHUB_OUTPUT"
+              echo "$crate $version is not on crates.io — will publish"
+            fi
+          done
+
       - name: Set publish flags
         id: flags
         run: |
@@ -77,6 +92,7 @@ jobs:
           fi
 
       - name: Publish nanograph
+        if: steps.check.outputs.nanograph != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
         run: cargo publish -p nanograph ${{ steps.flags.outputs.args }}
@@ -85,28 +101,33 @@ jobs:
         if: github.event.inputs.dry_run != 'true'
         run: |
           version="${{ steps.version.outputs.version }}"
-          for i in $(seq 1 60); do
+          # crates.io index propagation can take 10+ minutes after publish.
+          # 240 × 5s = 20 min budget; exits early once visible.
+          for i in $(seq 1 240); do
             if curl -fsS "https://crates.io/api/v1/crates/nanograph/$version" >/dev/null 2>&1; then
               echo "nanograph $version visible on crates.io"
               exit 0
             fi
-            echo "Waiting for nanograph $version on crates.io (attempt $i/60)..."
+            echo "Waiting for nanograph $version on crates.io (attempt $i/240)..."
             sleep 5
           done
           echo "::error::Timed out waiting for nanograph $version on crates.io"
           exit 1
 
       - name: Publish nanograph-cli
+        if: steps.check.outputs.nanograph_cli != 'true' && github.event.inputs.dry_run != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p nanograph-cli ${{ steps.flags.outputs.args }}
+        run: cargo publish -p nanograph-cli
 
       - name: Publish nanograph-ffi
+        if: steps.check.outputs.nanograph_ffi != 'true' && github.event.inputs.dry_run != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p nanograph-ffi ${{ steps.flags.outputs.args }}
+        run: cargo publish -p nanograph-ffi
 
       - name: Publish nanograph-ts
+        if: steps.check.outputs.nanograph_ts != 'true' && github.event.inputs.dry_run != 'true'
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-        run: cargo publish -p nanograph-ts ${{ steps.flags.outputs.args }}
+        run: cargo publish -p nanograph-ts
