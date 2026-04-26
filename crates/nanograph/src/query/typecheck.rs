@@ -929,6 +929,28 @@ fn resolve_expr_type(
                 ));
             }
 
+            match query.as_ref() {
+                Expr::Literal(_) => {}
+                Expr::Variable(name) if params.contains_key(name) => {}
+                Expr::Variable(name) => {
+                    return Err(NanoError::Type(format!(
+                        "T15: nearest query `${}` must be a declared parameter or literal; \
+                         row-bound variables and property access are not supported \
+                         (fetch the value in a prior query and pass it as a parameter)",
+                        name
+                    )));
+                }
+                _ => {
+                    return Err(NanoError::Type(
+                        "T15: nearest query must be a literal or declared parameter; \
+                         expressions like property access (`$var.prop`) are not supported \
+                         because the query vector must be resolved once, not per row \
+                         (fetch the value in a prior query and pass it as a parameter)"
+                            .to_string(),
+                    ));
+                }
+            }
+
             if let Expr::Literal(lit) = query.as_ref()
                 && let Some(dim) = numeric_vector_literal_dim(lit)
             {
@@ -2003,6 +2025,58 @@ query q($q: String) {
         .unwrap();
         let ctx = typecheck_query(&catalog, &qf.queries[0]).unwrap();
         assert!(ctx.bindings.contains_key("d"));
+    }
+
+    // Regression test for issue #9: `nearest()` query argument must be a literal or
+    // declared parameter. Property access (`$s.text`) parses and resolves to a String,
+    // so it used to slip past lint and only fail at runtime. Reject it statically here.
+    #[test]
+    fn test_nearest_rejects_prop_access_query() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q($seed: String) {
+    match {
+        $s: Doc { id_str: $seed }
+        $d: Doc
+    }
+    return { $d.id_str }
+    order { nearest($d.embedding, $s.id_str) }
+    limit 3
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("T15"), "expected T15 error, got: {msg}");
+        assert!(
+            msg.contains("nearest query") && msg.contains("literal or declared parameter"),
+            "expected message about literal-or-param, got: {msg}"
+        );
+    }
+
+    // Regression test for issue #9: a row-bound variable (not a declared param) is also
+    // rejected statically — the runtime can't resolve a single query vector from it.
+    #[test]
+    fn test_nearest_rejects_bound_variable_query() {
+        let catalog = setup_vector();
+        let qf = parse_query(
+            r#"
+query q() {
+    match {
+        $s: Doc
+        $d: Doc
+    }
+    return { $d.id_str }
+    order { nearest($d.embedding, $s) }
+    limit 3
+}
+"#,
+        )
+        .unwrap();
+        let err = typecheck_query(&catalog, &qf.queries[0]).unwrap_err();
+        assert!(err.to_string().contains("T15"));
     }
 
     #[test]

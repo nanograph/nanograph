@@ -1940,3 +1940,142 @@ async fn test_schema_typecheck_all_valid() {
         );
     }
 }
+
+fn fan_in_schema() -> &'static str {
+    r#"
+node A { slug: String @key }
+node B { slug: String @key }
+node C { slug: String @key }
+
+edge AToB: A -> B
+edge CToB: C -> B
+"#
+}
+
+fn fan_in_data() -> &'static str {
+    r#"{"type":"A","data":{"slug":"a1"}}
+{"type":"A","data":{"slug":"a2"}}
+{"type":"B","data":{"slug":"b1"}}
+{"type":"B","data":{"slug":"b2"}}
+{"type":"C","data":{"slug":"c1"}}
+{"type":"C","data":{"slug":"c2"}}
+{"edge":"AToB","from":"a1","to":"b1"}
+{"edge":"AToB","from":"a2","to":"b2"}
+{"edge":"CToB","from":"c1","to":"b1"}
+{"edge":"CToB","from":"c2","to":"b2"}
+"#
+}
+
+// Regression test for issue #8: two edges landing on the same destination variable
+// previously failed at execution with `number of columns(N) must match number of fields(M)`
+// because the cycle-closing lowering reused a single `__temp_b` name across both
+// traversals, producing duplicate destination columns in the Expand schema.
+#[tokio::test]
+async fn test_fan_in_two_edges_same_destination() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, fan_in_schema()).await.unwrap();
+    db.load(fan_in_data()).await.unwrap();
+
+    let results = run_db_query_test_with_params(
+        r#"
+query fan_in() {
+    match {
+        $a: A
+        $b: B
+        $c: C
+        $a aToB $b
+        $c cToB $b
+    }
+    return { $a.slug as a_slug, $c.slug as c_slug }
+    order { $a.slug asc }
+}
+"#,
+        &db,
+        &ParamMap::new(),
+    )
+    .await;
+
+    let pairs = extract_string_pairs(&results, "a_slug", "c_slug");
+    assert_eq!(
+        pairs,
+        vec![
+            ("a1".to_string(), "c1".to_string()),
+            ("a2".to_string(), "c2".to_string()),
+        ]
+    );
+}
+
+// Regression test for issue #8 (not{} variant): a `not { }` clause containing a
+// traversal whose destination is an outer-bound variable hit the same column-count
+// bug because the inner pipeline's temp var name collided with whatever the outer
+// match emitted for the same destination.
+#[tokio::test]
+async fn test_fan_in_with_negation_on_shared_destination() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, fan_in_schema()).await.unwrap();
+    db.load(fan_in_data()).await.unwrap();
+
+    // Find A nodes that point at a B which is NOT pointed at by any C.
+    // With the fixture, every B has a corresponding C, so this should return zero rows
+    // — the test is about the query *executing* without an Arrow schema error.
+    let results = run_db_query_test_with_params(
+        r#"
+query fan_in_neg() {
+    match {
+        $a: A
+        $b: B
+        $a aToB $b
+        not {
+            $c: C
+            $c cToB $b
+        }
+    }
+    return { $a.slug as a_slug }
+}
+"#,
+        &db,
+        &ParamMap::new(),
+    )
+    .await;
+
+    let names = extract_string_column(&results, "a_slug");
+    assert!(
+        names.is_empty(),
+        "expected zero rows (every B has a matching C), got {names:?}"
+    );
+
+    // Insert an orphan B with no incoming CToB edge and verify the query now finds it.
+    db.load(
+        r#"{"type":"A","data":{"slug":"a3"}}
+{"type":"B","data":{"slug":"b3"}}
+{"edge":"AToB","from":"a3","to":"b3"}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let results = run_db_query_test_with_params(
+        r#"
+query fan_in_neg() {
+    match {
+        $a: A
+        $b: B
+        $a aToB $b
+        not {
+            $c: C
+            $c cToB $b
+        }
+    }
+    return { $a.slug as a_slug }
+}
+"#,
+        &db,
+        &ParamMap::new(),
+    )
+    .await;
+
+    let names = extract_string_column(&results, "a_slug");
+    assert_eq!(names, vec!["a3"]);
+}
