@@ -13,7 +13,8 @@
   - render + smoke test of a publishable Swift package from monorepo sources on `macos-14`
   - GitHub Release creation on Blacksmith Linux
   - Homebrew tap update dispatch on Blacksmith Linux
-- `Release` does **not** currently publish crates.io packages, npm, or an external `nanograph-swift` repo. Those remain manual.
+- `Publish Crates` runs on tag pushes (and supports `workflow_dispatch` for manual / dry-run triggers) via [publish-crates.yml](/Users/andrew/code/nanograph/.github/workflows/publish-crates.yml). It publishes `nanograph` first, waits for the crates.io index to surface the new version, then publishes `nanograph-cli`, `nanograph-ffi`, and `nanograph-ts`. Requires the `CARGO_REGISTRY_TOKEN` repo secret.
+- `Release` does **not** currently publish npm or update the external `nanograph-swift` repo. Those remain manual.
 
 ## Pre-release
 
@@ -61,16 +62,26 @@ This automatically:
 - Creates GitHub Release with `nanograph-vX.Y.Z-aarch64-apple-darwin.tar.gz` + `.sha256` on Blacksmith Linux
 - Dispatches formula update to `nanograph/homebrew-tap` on Blacksmith Linux
 
-### 2. crates.io (publish `nanograph` first, then the dependents)
+### 2. crates.io
+
+Automated by the `Publish Crates` workflow on tag push. It publishes `nanograph` first, polls the crates.io index until the new version is visible, then publishes `nanograph-cli`, `nanograph-ffi`, and `nanograph-ts`.
+
+To dry-run or re-trigger manually:
+
+```bash
+gh workflow run publish-crates.yml -f dry_run=true   # dry run, no upload
+gh workflow run publish-crates.yml                   # real publish from current main
+```
+
+If you ever need to fall back to manual:
 
 ```bash
 cargo publish -p nanograph
+# wait for the new version to be searchable on crates.io
 cargo publish -p nanograph-cli
 cargo publish -p nanograph-ffi
 cargo publish -p nanograph-ts
 ```
-
-Wait for the new `nanograph` version to become visible in the crates.io index before publishing `nanograph-cli`, `nanograph-ffi`, and `nanograph-ts`.
 
 ### 3. npm
 
