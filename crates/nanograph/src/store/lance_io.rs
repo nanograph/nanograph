@@ -390,14 +390,8 @@ pub(crate) async fn append_lance_batch_at_version_for_kind(
     batch: RecordBatch,
     kind: LanceDatasetKind,
 ) -> Result<GraphTableVersion> {
-    append_lance_batch_at_version_for_kind_with_properties(
-        path,
-        pinned_version,
-        batch,
-        kind,
-        None,
-    )
-    .await
+    append_lance_batch_at_version_for_kind_with_properties(path, pinned_version, batch, kind, None)
+        .await
 }
 
 pub(crate) async fn append_lance_batch_at_version_for_kind_with_properties(
@@ -605,24 +599,25 @@ pub(crate) async fn cleanup_unpublished_manifest_versions(
         Err(_err) if published_version.is_none() => return Ok(0),
         Err(err) => return Err(NanoError::Lance(format!("cleanup open error: {}", err))),
     };
-    let versions_dir = namespace_location_to_local_path(db_dir, dataset_location)?.join("_versions");
+    let versions_dir =
+        namespace_location_to_local_path(db_dir, dataset_location)?.join("_versions");
     let unpublished = std::fs::read_dir(versions_dir)?
-    .filter_map(|entry| entry.ok())
-    .filter_map(|entry| {
-        let path = entry.path();
-        let file_name = path.file_name()?.to_str()?;
-        let version = lance_table::io::commit::ManifestNamingScheme::detect_scheme(file_name)
-            .and_then(|scheme| scheme.parse_version(file_name))
-            .or_else(|| {
-                lance_table::io::commit::ManifestNamingScheme::parse_detached_version(file_name)
-            })?;
-        let should_remove = match published_version {
-            Some(published_version) => version > published_version,
-            None => true,
-        };
-        should_remove.then_some((path, version))
-    })
-    .collect::<Vec<_>>();
+        .filter_map(|entry| entry.ok())
+        .filter_map(|entry| {
+            let path = entry.path();
+            let file_name = path.file_name()?.to_str()?;
+            let version = lance_table::io::commit::ManifestNamingScheme::detect_scheme(file_name)
+                .and_then(|scheme| scheme.parse_version(file_name))
+                .or_else(|| {
+                    lance_table::io::commit::ManifestNamingScheme::parse_detached_version(file_name)
+                })?;
+            let should_remove = match published_version {
+                Some(published_version) => version > published_version,
+                None => true,
+            };
+            should_remove.then_some((path, version))
+        })
+        .collect::<Vec<_>>();
     if unpublished.is_empty() {
         return Ok(0);
     }
@@ -639,14 +634,12 @@ pub(crate) async fn open_dataset_for_locator(locator: &DatasetLocator) -> Result
         let namespace = open_directory_namespace(&locator.db_path).await?;
         let location = resolve_table_location(namespace, &locator.table_id).await?;
         let dataset_uri = namespace_location_to_dataset_uri(&locator.db_path, &location)?;
-        let dataset = Dataset::open(&dataset_uri)
-            .await
-            .map_err(|e| {
-                NanoError::Lance(format!(
-                    "namespace dataset {} open error: {}",
-                    locator.table_id, e
-                ))
-            })?;
+        let dataset = Dataset::open(&dataset_uri).await.map_err(|e| {
+            NanoError::Lance(format!(
+                "namespace dataset {} open error: {}",
+                locator.table_id, e
+            ))
+        })?;
         return dataset
             .checkout_version(locator.dataset_version)
             .await
@@ -922,8 +915,12 @@ impl TableStore for V4NamespaceTableStore {
         let table_id = self.table_id_for_path(path)?;
         let namespace = open_directory_namespace(&self.db_path).await?;
         let location = resolve_or_declare_table_location(namespace, &table_id).await?;
-        cleanup_unpublished_manifest_versions(&self.db_path, &location, Some(pinned_version.version))
-            .await?;
+        cleanup_unpublished_manifest_versions(
+            &self.db_path,
+            &location,
+            Some(pinned_version.version),
+        )
+        .await?;
         let location_path = namespace_location_to_local_path(&self.db_path, &location)?;
         run_lance_merge_insert_with_key_versioned_for_kind(
             &location_path,
@@ -944,8 +941,12 @@ impl TableStore for V4NamespaceTableStore {
         let table_id = self.table_id_for_path(path)?;
         let namespace = open_directory_namespace(&self.db_path).await?;
         let location = resolve_or_declare_table_location(namespace, &table_id).await?;
-        cleanup_unpublished_manifest_versions(&self.db_path, &location, Some(pinned_version.version))
-            .await?;
+        cleanup_unpublished_manifest_versions(
+            &self.db_path,
+            &location,
+            Some(pinned_version.version),
+        )
+        .await?;
         let location_path = namespace_location_to_local_path(&self.db_path, &location)?;
         run_lance_delete_by_ids_versioned(&location_path, pinned_version, ids).await
     }

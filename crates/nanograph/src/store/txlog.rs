@@ -587,7 +587,9 @@ fn collect_namespace_lineage_change_rows_internal(
             let mut out = Vec::new();
             for commit in &commits {
                 for window in &commit.touched_tables {
-                    let entry = if let Some(entry) = data_entries_by_table_id.get(window.table_id.as_str()) {
+                    let entry = if let Some(entry) =
+                        data_entries_by_table_id.get(window.table_id.as_str())
+                    {
                         entry.clone()
                     } else {
                         let namespace = open_directory_namespace(&db_dir).await?;
@@ -609,7 +611,11 @@ fn collect_namespace_lineage_change_rows_internal(
                     );
                 }
                 if let Some(rows) = delete_map.get(&commit.graph_version.value()) {
-                    out.extend(rows.iter().cloned().map(namespace_lineage_delete_to_internal_change));
+                    out.extend(
+                        rows.iter()
+                            .cloned()
+                            .map(namespace_lineage_delete_to_internal_change),
+                    );
                 }
             }
             sort_namespace_lineage_internal_change_rows(&mut out);
@@ -648,14 +654,8 @@ async fn collect_namespace_lineage_rows_for_window(
         BTreeMap::new()
     };
 
-    let mut inserts = actual
-        .inserts
-        .into_iter()
-        .collect::<BTreeMap<u64, u64>>();
-    let mut updates = actual
-        .updates
-        .into_iter()
-        .collect::<BTreeMap<u64, u64>>();
+    let mut inserts = actual.inserts.into_iter().collect::<BTreeMap<u64, u64>>();
+    let mut updates = actual.updates.into_iter().collect::<BTreeMap<u64, u64>>();
 
     for (entity_id, rowid) in inserts.clone() {
         if previous_rows.contains_key(&entity_id) {
@@ -818,9 +818,7 @@ fn namespace_lineage_logical_key(
     format!("id={}", entity_id)
 }
 
-fn sort_namespace_lineage_internal_change_rows(
-    rows: &mut [NamespaceLineageInternalChangeRow],
-) {
+fn sort_namespace_lineage_internal_change_rows(rows: &mut [NamespaceLineageInternalChangeRow]) {
     rows.sort_by(|a, b| {
         a.visible
             .graph_version
@@ -1029,11 +1027,10 @@ pub(crate) fn commit_graph_records_and_manifest_namespace_lineage(
                 ))
             })?;
         runtime.block_on(async move {
-            let mut staged_entries =
-                vec![
-                    stage_namespace_lineage_graph_commit_record(&db_dir, &manifest, &graph_commit)
-                        .await?,
-                ];
+            let mut staged_entries = vec![
+                stage_namespace_lineage_graph_commit_record(&db_dir, &manifest, &graph_commit)
+                    .await?,
+            ];
             if !graph_deletes.is_empty() {
                 staged_entries
                     .push(stage_graph_delete_records(&db_dir, &manifest, &graph_deletes).await?);

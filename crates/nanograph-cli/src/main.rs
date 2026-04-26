@@ -1584,8 +1584,8 @@ fn render_visible_change_rows(format: &str, rows: &[VisibleChangeRow]) -> Result
     match format {
         "jsonl" => {
             for row in rows {
-                let line =
-                    serde_json::to_string(row).wrap_err("failed to serialize visible change row")?;
+                let line = serde_json::to_string(row)
+                    .wrap_err("failed to serialize visible change row")?;
                 println!("{}", line);
             }
         }
@@ -1908,7 +1908,11 @@ fn record_property_query(
 fn load_lint_schema(
     db_path: Option<&Path>,
     schema_path: Option<&Path>,
-) -> Result<(PathBuf, nanograph::schema::ast::SchemaFile, Option<SchemaDriftSummary>)> {
+) -> Result<(
+    PathBuf,
+    nanograph::schema::ast::SchemaFile,
+    Option<SchemaDriftSummary>,
+)> {
     let (schema_path, schema_source, drift) = match (db_path, schema_path) {
         (Some(db_path), Some(schema_path)) => (
             schema_path.to_path_buf(),
@@ -1954,7 +1958,11 @@ fn collect_type_mutation_coverage(
                 let entry = coverage.entry(update.type_name.clone()).or_default();
                 push_unique(&mut entry.update_queries, query_name);
                 for assignment in &update.assignments {
-                    record_property_query(&mut entry.update_props, &assignment.property, query_name);
+                    record_property_query(
+                        &mut entry.update_props,
+                        &assignment.property,
+                        query_name,
+                    );
                 }
             }
             Mutation::Insert(_) | Mutation::Delete(_) => {}

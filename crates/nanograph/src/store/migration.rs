@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use arrow_array::cast::AsArray;
 use arrow_array::types::UInt64Type;
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray, UInt64Array, new_null_array};
+use arrow_schema::DataType;
 use serde::{Deserialize, Serialize};
 
 use crate::catalog::Catalog;
@@ -15,9 +16,12 @@ use crate::catalog::schema_ir::{
 use crate::error::{NanoError, Result};
 use crate::schema::ast::{PropDecl, SchemaDecl, SchemaFile, annotation_value, has_annotation};
 use crate::schema::parser::parse_schema;
+use crate::store::blob_store::{
+    ManagedBlobRow, current_blob_store_entry, managed_blob_batch, read_managed_blob_bytes,
+};
 use crate::store::graph::DatasetAccumulator;
-use crate::store::graph_types::{GraphCommitRecord, GraphTableVersion, GraphTouchedTableWindow};
 use crate::store::graph_mirror::rebuild_graph_mirror_from_wal;
+use crate::store::graph_types::{GraphCommitRecord, GraphTableVersion, GraphTouchedTableWindow};
 use crate::store::indexing::{
     rebuild_node_scalar_indexes, rebuild_node_text_indexes, rebuild_node_vector_indexes,
 };
@@ -25,13 +29,17 @@ use crate::store::lance_io::{
     latest_lance_dataset_version, read_lance_batches_for_locator,
     read_lance_projected_batches_for_locator, write_lance_batch,
 };
+use crate::store::loader::{
+    key_value_string, load_node_constraint_annotations, unique_value_string,
+    validate_storage_against_schema,
+};
 use crate::store::manifest::{DatasetEntry, GraphManifest, hash_string};
 use crate::store::metadata::{DatabaseMetadata, DatasetLocator};
 use crate::store::namespace::{
     BLOB_STORE_TABLE_ID, GRAPH_CHANGES_TABLE_ID, GRAPH_DELETES_TABLE_ID, GRAPH_TX_TABLE_ID,
-    batch_publish_namespace_versions, namespace_published_version_for_table,
-    namespace_location_to_manifest_dataset_path, open_directory_namespace,
-    resolve_table_location, write_namespace_batch,
+    batch_publish_namespace_versions, namespace_location_to_manifest_dataset_path,
+    namespace_published_version_for_table, open_directory_namespace, resolve_table_location,
+    write_namespace_batch,
 };
 use crate::store::namespace_lineage_graph_log::{
     ensure_graph_deletes_table, ensure_namespace_lineage_graph_tx_table,
@@ -43,9 +51,6 @@ use crate::store::txlog::{
 };
 use crate::store::v4_graph_log::{ensure_graph_changes_table, ensure_graph_tx_table};
 use crate::types::ScalarType;
-use crate::store::blob_store::{
-    ManagedBlobRow, current_blob_store_entry, managed_blob_batch, read_managed_blob_bytes,
-};
 
 const SCHEMA_PG_FILENAME: &str = "schema.pg";
 const SCHEMA_IR_FILENAME: &str = "schema.ir.json";
@@ -469,6 +474,9 @@ async fn plan_schema_migration(
         &mut warnings,
         &mut blocked,
     )?;
+    if let Err(err) = load_node_constraint_annotations(&new_ir) {
+        blocked.push(err.to_string());
+    }
     manifest.next_type_id = next_type_id;
     manifest.next_prop_id = next_prop_id;
 
@@ -1466,6 +1474,23 @@ fn classify_enum_value_change(
     let old_values = old_prop.enum_values.iter().cloned().collect::<HashSet<_>>();
     let new_values = new_prop.enum_values.iter().cloned().collect::<HashSet<_>>();
 
+    if !old_values.is_empty() && new_values.is_empty() {
+        return (
+            SchemaCompatibility::Additive,
+            format!(
+                "enum constraint removed for `{}`.`{}`",
+                type_name, prop_name
+            ),
+            None,
+        );
+    }
+    if old_values.is_empty() && !new_values.is_empty() {
+        return (
+            SchemaCompatibility::Breaking,
+            format!("enum constraint added for `{}`.`{}`", type_name, prop_name),
+            None,
+        );
+    }
     if old_values.is_subset(&new_values) && !new_values.is_subset(&old_values) {
         return (
             SchemaCompatibility::Additive,
@@ -1759,6 +1784,30 @@ async fn diff_schema(
                         reason: "id-preserving node rename".to_string(),
                     });
                 }
+                plan_metadata_change(
+                    PlannedMetadataTarget {
+                        target_kind: "node",
+                        type_name: &new_node.name,
+                        type_id: new_node.type_id,
+                        prop: None,
+                    },
+                    "description",
+                    old_node.description.as_deref(),
+                    new_node.description.as_deref(),
+                    steps,
+                );
+                plan_metadata_change(
+                    PlannedMetadataTarget {
+                        target_kind: "node",
+                        type_name: &new_node.name,
+                        type_id: new_node.type_id,
+                        prop: None,
+                    },
+                    "instruction",
+                    old_node.instruction.as_deref(),
+                    new_node.instruction.as_deref(),
+                    steps,
+                );
                 diff_properties(
                     PropertyDiffTarget {
                         source_type_name: &old_node.name,
@@ -1817,6 +1866,30 @@ async fn diff_schema(
                         reason: "id-preserving edge rename".to_string(),
                     });
                 }
+                plan_metadata_change(
+                    PlannedMetadataTarget {
+                        target_kind: "edge",
+                        type_name: &new_edge.name,
+                        type_id: new_edge.type_id,
+                        prop: None,
+                    },
+                    "description",
+                    old_edge.description.as_deref(),
+                    new_edge.description.as_deref(),
+                    steps,
+                );
+                plan_metadata_change(
+                    PlannedMetadataTarget {
+                        target_kind: "edge",
+                        type_name: &new_edge.name,
+                        type_id: new_edge.type_id,
+                        prop: None,
+                    },
+                    "instruction",
+                    old_edge.instruction.as_deref(),
+                    new_edge.instruction.as_deref(),
+                    steps,
+                );
 
                 if old_edge.src_type_id != new_edge.src_type_id
                     || old_edge.dst_type_id != new_edge.dst_type_id
@@ -1881,6 +1954,39 @@ struct PropertyDiffTarget<'a> {
     storage_kind: PropertyStorageKind,
 }
 
+struct PlannedMetadataTarget<'a> {
+    target_kind: &'a str,
+    type_name: &'a str,
+    type_id: u32,
+    prop: Option<(&'a str, u32)>,
+}
+
+fn plan_metadata_change(
+    target: PlannedMetadataTarget<'_>,
+    annotation: &str,
+    old_value: Option<&str>,
+    new_value: Option<&str>,
+    steps: &mut Vec<PlannedStep>,
+) {
+    if old_value == new_value {
+        return;
+    }
+    let prop_name = target.prop.map(|(name, _)| name.to_string());
+    steps.push(PlannedStep {
+        step: MigrationStep::AlterMetadata {
+            target_kind: target.target_kind.to_string(),
+            type_name: target.type_name.to_string(),
+            type_id: target.type_id,
+            prop_name,
+            annotation: annotation.to_string(),
+            old_value: old_value.map(str::to_string),
+            new_value: new_value.map(str::to_string),
+        },
+        safety: MigrationSafety::Safe,
+        reason: format!("{} metadata updated", annotation),
+    });
+}
+
 async fn diff_properties(
     target: PropertyDiffTarget<'_>,
     old_props: &[PropDef],
@@ -1901,14 +2007,23 @@ async fn diff_properties(
     for new_p in new_props {
         match old_by_id.get(&new_p.prop_id) {
             None => {
-                let safety = if new_p.nullable {
-                    MigrationSafety::Safe
-                } else {
+                let existing_rows =
+                    existing_row_count(data_view, target.storage_kind, target.source_type_name)
+                        .await?;
+                let safety = if !new_p.nullable && existing_rows > 0 {
                     blocked.push(format!(
                         "type `{}` adds non-nullable property `{}` without a default/backfill",
                         target.display_type_name, new_p.name
                     ));
                     MigrationSafety::Blocked
+                } else if new_p.key && existing_rows > 0 {
+                    blocked.push(format!(
+                        "type `{}` adds @key property `{}` without a value source for {} existing row(s)",
+                        target.display_type_name, new_p.name, existing_rows
+                    ));
+                    MigrationSafety::Blocked
+                } else {
+                    MigrationSafety::Safe
                 };
                 steps.push(PlannedStep {
                     step: MigrationStep::AddProperty {
@@ -1916,7 +2031,7 @@ async fn diff_properties(
                         type_id: target.type_id,
                         prop_name: new_p.name.clone(),
                         prop_id: new_p.prop_id,
-                        data_type: new_p.scalar_type.clone(),
+                        data_type: prop_display_type(new_p),
                         nullable: new_p.nullable,
                     },
                     safety,
@@ -1937,14 +2052,52 @@ async fn diff_properties(
                         reason: "id-preserving property rename".to_string(),
                     });
                 }
-                if old_p.scalar_type != new_p.scalar_type {
+                plan_metadata_change(
+                    PlannedMetadataTarget {
+                        target_kind: "property",
+                        type_name: target.display_type_name,
+                        type_id: target.type_id,
+                        prop: Some((&new_p.name, new_p.prop_id)),
+                    },
+                    "description",
+                    old_p.description.as_deref(),
+                    new_p.description.as_deref(),
+                    steps,
+                );
+                if old_p.enum_values != new_p.enum_values {
+                    let (safety, reason) = classify_enum_change(
+                        data_view,
+                        target.storage_kind,
+                        target.source_type_name,
+                        target.display_type_name,
+                        old_p,
+                        new_p,
+                    )
+                    .await?;
+                    if safety == MigrationSafety::Blocked {
+                        blocked.push(reason.clone());
+                    }
+                    steps.push(PlannedStep {
+                        step: MigrationStep::AlterPropertyEnumValues {
+                            type_name: target.display_type_name.to_string(),
+                            type_id: target.type_id,
+                            prop_name: new_p.name.clone(),
+                            prop_id: new_p.prop_id,
+                            old_values: old_p.enum_values.clone(),
+                            new_values: new_p.enum_values.clone(),
+                        },
+                        safety,
+                        reason,
+                    });
+                }
+                if old_p.list != new_p.list || old_p.scalar_type != new_p.scalar_type {
                     let (safety, reason) = classify_type_change(
                         data_view,
                         target.storage_kind,
                         target.source_type_name,
                         target.display_type_name,
-                        &old_p.name,
-                        &new_p.scalar_type,
+                        old_p,
+                        new_p,
                     )
                     .await?;
                     if safety == MigrationSafety::Blocked {
@@ -1956,8 +2109,8 @@ async fn diff_properties(
                             type_id: target.type_id,
                             prop_name: new_p.name.clone(),
                             prop_id: new_p.prop_id,
-                            old_type: old_p.scalar_type.clone(),
-                            new_type: new_p.scalar_type.clone(),
+                            old_type: prop_display_type(old_p),
+                            new_type: prop_display_type(new_p),
                         },
                         safety,
                         reason,
@@ -1989,6 +2142,77 @@ async fn diff_properties(
                         reason,
                     });
                 }
+                if old_p.key != new_p.key {
+                    let (safety, reason) = classify_key_change(
+                        data_view,
+                        target.storage_kind,
+                        target.source_type_name,
+                        target.display_type_name,
+                        old_p,
+                        new_p,
+                    )
+                    .await?;
+                    if safety == MigrationSafety::Blocked {
+                        blocked.push(reason.clone());
+                    }
+                    steps.push(PlannedStep {
+                        step: MigrationStep::AlterPropertyKey {
+                            type_name: target.display_type_name.to_string(),
+                            type_id: target.type_id,
+                            prop_name: new_p.name.clone(),
+                            prop_id: new_p.prop_id,
+                            keyed: new_p.key,
+                        },
+                        safety,
+                        reason,
+                    });
+                }
+                if old_p.unique != new_p.unique {
+                    let (safety, reason) = classify_unique_change(
+                        data_view,
+                        target.storage_kind,
+                        target.source_type_name,
+                        target.display_type_name,
+                        old_p,
+                        new_p,
+                    )
+                    .await?;
+                    if safety == MigrationSafety::Blocked {
+                        blocked.push(reason.clone());
+                    }
+                    steps.push(PlannedStep {
+                        step: MigrationStep::AlterPropertyUnique {
+                            type_name: target.display_type_name.to_string(),
+                            type_id: target.type_id,
+                            prop_name: new_p.name.clone(),
+                            prop_id: new_p.prop_id,
+                            unique: new_p.unique,
+                        },
+                        safety,
+                        reason,
+                    });
+                }
+                if old_p.index != new_p.index {
+                    steps.push(PlannedStep {
+                        step: MigrationStep::AlterPropertyIndex {
+                            type_name: target.display_type_name.to_string(),
+                            type_id: target.type_id,
+                            prop_name: new_p.name.clone(),
+                            prop_id: new_p.prop_id,
+                            indexed: new_p.index,
+                        },
+                        safety: if new_p.index {
+                            MigrationSafety::Safe
+                        } else {
+                            MigrationSafety::Confirm
+                        },
+                        reason: if new_p.index {
+                            "index added".to_string()
+                        } else {
+                            "index removed".to_string()
+                        },
+                    });
+                }
             }
         }
     }
@@ -2016,34 +2240,318 @@ async fn classify_type_change(
     storage_kind: PropertyStorageKind,
     source_type_name: &str,
     display_type_name: &str,
-    old_prop_name: &str,
-    target_scalar: &str,
+    old_prop: &PropDef,
+    new_prop: &PropDef,
 ) -> Result<(MigrationSafety, String)> {
-    let target = ScalarType::from_str_name(target_scalar)
-        .ok_or_else(|| NanoError::Catalog(format!("unknown scalar type: {}", target_scalar)))?
-        .to_arrow();
+    if old_prop.list != new_prop.list {
+        let non_null_values = existing_non_null_value_count(
+            data_view,
+            storage_kind,
+            source_type_name,
+            &old_prop.name,
+        )
+        .await?;
+        if non_null_values == 0 {
+            return Ok((
+                MigrationSafety::Confirm,
+                "list/scalar shape changed with no existing non-null values".to_string(),
+            ));
+        }
+        return Ok((
+            MigrationSafety::Blocked,
+            format!(
+                "cannot change list/scalar shape for `{}`.`{}` with {} existing non-null value(s)",
+                display_type_name, old_prop.name, non_null_values
+            ),
+        ));
+    }
 
-    match get_property_column(data_view, storage_kind, source_type_name, old_prop_name).await? {
+    let old_scalar = ScalarType::from_str_name(&old_prop.scalar_type).ok_or_else(|| {
+        NanoError::Catalog(format!("unknown scalar type: {}", old_prop.scalar_type))
+    })?;
+    let new_scalar = ScalarType::from_str_name(&new_prop.scalar_type).ok_or_else(|| {
+        NanoError::Catalog(format!("unknown scalar type: {}", new_prop.scalar_type))
+    })?;
+    let target = propdef_to_arrow(new_prop)?;
+
+    match get_property_column(data_view, storage_kind, source_type_name, &old_prop.name).await? {
         None => Ok((
-            MigrationSafety::Confirm,
-            "type change requires data cast".to_string(),
+            MigrationSafety::Safe,
+            "type changed on empty type".to_string(),
         )),
         Some(col) => {
-            if arrow_cast::cast(col.as_ref(), &target).is_ok() {
-                Ok((
+            let non_null_values = col.len().saturating_sub(col.null_count());
+            if !is_lossless_scalar_change(old_scalar, new_scalar) {
+                if non_null_values == 0 {
+                    return Ok((
+                        MigrationSafety::Confirm,
+                        "non-lossless type change has no existing non-null values".to_string(),
+                    ));
+                }
+                return Ok((
+                    MigrationSafety::Blocked,
+                    format!(
+                        "non-lossless type change for `{}`.`{}` would rewrite {} existing non-null value(s)",
+                        display_type_name, old_prop.name, non_null_values
+                    ),
+                ));
+            }
+
+            let casted = arrow_cast::cast(col.as_ref(), &target);
+            match casted {
+                Ok(casted) if casted.null_count() == col.null_count() => Ok((
                     MigrationSafety::Confirm,
-                    "type change requires data cast".to_string(),
-                ))
-            } else {
-                Ok((
+                    "lossless type widening requires data cast".to_string(),
+                )),
+                Ok(casted) => Ok((
+                    MigrationSafety::Blocked,
+                    format!(
+                        "cannot cast `{}`.`{}` to {} without introducing nulls ({} -> {})",
+                        display_type_name,
+                        old_prop.name,
+                        prop_display_type(new_prop),
+                        col.null_count(),
+                        casted.null_count()
+                    ),
+                )),
+                Err(_) => Ok((
                     MigrationSafety::Blocked,
                     format!(
                         "cannot cast existing data for `{}`.`{}` to {}",
-                        display_type_name, old_prop_name, target_scalar
+                        display_type_name,
+                        old_prop.name,
+                        prop_display_type(new_prop)
                     ),
-                ))
+                )),
             }
         }
+    }
+}
+
+async fn classify_enum_change(
+    data_view: &mut MigrationDataView,
+    storage_kind: PropertyStorageKind,
+    source_type_name: &str,
+    display_type_name: &str,
+    old_prop: &PropDef,
+    new_prop: &PropDef,
+) -> Result<(MigrationSafety, String)> {
+    let old_values = old_prop.enum_values.iter().cloned().collect::<HashSet<_>>();
+    let new_values = new_prop.enum_values.iter().cloned().collect::<HashSet<_>>();
+
+    if !old_values.is_empty() && new_values.is_empty() {
+        return Ok((MigrationSafety::Safe, "enum constraint removed".to_string()));
+    }
+    if !old_values.is_empty() && old_values.is_subset(&new_values) {
+        return Ok((MigrationSafety::Safe, "enum domain expanded".to_string()));
+    }
+
+    let Some(col) =
+        get_property_column(data_view, storage_kind, source_type_name, &old_prop.name).await?
+    else {
+        return Ok((
+            MigrationSafety::Safe,
+            "enum domain tightened on empty type".to_string(),
+        ));
+    };
+    let invalid = count_values_outside_enum(col.as_ref(), &new_values)?;
+    if invalid > 0 {
+        return Ok((
+            MigrationSafety::Blocked,
+            format!(
+                "enum domain change for `{}`.`{}` would invalidate {} existing value(s)",
+                display_type_name, old_prop.name, invalid
+            ),
+        ));
+    }
+    Ok((
+        MigrationSafety::Confirm,
+        "enum domain tightened after data validation".to_string(),
+    ))
+}
+
+async fn classify_key_change(
+    data_view: &mut MigrationDataView,
+    storage_kind: PropertyStorageKind,
+    source_type_name: &str,
+    display_type_name: &str,
+    old_prop: &PropDef,
+    new_prop: &PropDef,
+) -> Result<(MigrationSafety, String)> {
+    if !new_prop.key {
+        return Ok((
+            MigrationSafety::Confirm,
+            "key constraint removed; identity semantics change".to_string(),
+        ));
+    }
+    if !matches!(storage_kind, PropertyStorageKind::Node) {
+        return Ok((
+            MigrationSafety::Blocked,
+            format!("only node properties can be @key: `{}`", display_type_name),
+        ));
+    }
+    let Some(col) =
+        get_property_column(data_view, storage_kind, source_type_name, &old_prop.name).await?
+    else {
+        return Ok((
+            MigrationSafety::Safe,
+            "key constraint added on empty type".to_string(),
+        ));
+    };
+    let mut seen = HashSet::new();
+    for row in 0..col.len() {
+        let value = match key_value_string(&col, row, &new_prop.name) {
+            Ok(value) => value,
+            Err(err) => {
+                return Ok((
+                    MigrationSafety::Blocked,
+                    format!(
+                        "cannot add @key to `{}`.`{}`: {}",
+                        display_type_name, new_prop.name, err
+                    ),
+                ));
+            }
+        };
+        if !seen.insert(value.clone()) {
+            return Ok((
+                MigrationSafety::Blocked,
+                format!(
+                    "cannot add @key to `{}`.`{}`: duplicate value `{}` exists",
+                    display_type_name, new_prop.name, value
+                ),
+            ));
+        }
+    }
+    Ok((
+        MigrationSafety::Confirm,
+        "key constraint added after data validation".to_string(),
+    ))
+}
+
+async fn classify_unique_change(
+    data_view: &mut MigrationDataView,
+    storage_kind: PropertyStorageKind,
+    source_type_name: &str,
+    display_type_name: &str,
+    old_prop: &PropDef,
+    new_prop: &PropDef,
+) -> Result<(MigrationSafety, String)> {
+    if !new_prop.unique {
+        return Ok((
+            MigrationSafety::Confirm,
+            "unique constraint removed".to_string(),
+        ));
+    }
+    if !matches!(storage_kind, PropertyStorageKind::Node) {
+        return Ok((
+            MigrationSafety::Blocked,
+            format!(
+                "only node properties can be @unique: `{}`",
+                display_type_name
+            ),
+        ));
+    }
+    let Some(col) =
+        get_property_column(data_view, storage_kind, source_type_name, &old_prop.name).await?
+    else {
+        return Ok((
+            MigrationSafety::Safe,
+            "unique constraint added on empty type".to_string(),
+        ));
+    };
+    let mut seen = HashSet::new();
+    for row in 0..col.len() {
+        let Some(value) = unique_value_string(&col, row, display_type_name, &new_prop.name)? else {
+            continue;
+        };
+        if !seen.insert(value.clone()) {
+            return Ok((
+                MigrationSafety::Blocked,
+                format!(
+                    "cannot add @unique to `{}`.`{}`: duplicate value `{}` exists",
+                    display_type_name, new_prop.name, value
+                ),
+            ));
+        }
+    }
+    Ok((
+        MigrationSafety::Confirm,
+        "unique constraint added after data validation".to_string(),
+    ))
+}
+
+async fn existing_non_null_value_count(
+    data_view: &mut MigrationDataView,
+    storage_kind: PropertyStorageKind,
+    source_type_name: &str,
+    prop_name: &str,
+) -> Result<usize> {
+    Ok(
+        get_property_column(data_view, storage_kind, source_type_name, prop_name)
+            .await?
+            .map(|col| col.len().saturating_sub(col.null_count()))
+            .unwrap_or(0),
+    )
+}
+
+async fn existing_row_count(
+    data_view: &mut MigrationDataView,
+    storage_kind: PropertyStorageKind,
+    source_type_name: &str,
+) -> Result<usize> {
+    let batch = match storage_kind {
+        PropertyStorageKind::Node => data_view.node_batch(source_type_name).await?,
+        PropertyStorageKind::Edge => data_view.edge_batch(source_type_name).await?,
+    };
+    Ok(batch.map(|batch| batch.num_rows()).unwrap_or(0))
+}
+
+fn count_values_outside_enum(array: &dyn Array, allowed: &HashSet<String>) -> Result<usize> {
+    match array.data_type() {
+        DataType::Utf8 => {
+            let values = array
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| NanoError::Storage("enum column is not Utf8".to_string()))?;
+            let mut invalid = 0usize;
+            for row in 0..values.len() {
+                if !values.is_null(row) && !allowed.contains(values.value(row)) {
+                    invalid += 1;
+                }
+            }
+            Ok(invalid)
+        }
+        DataType::List(field) if field.data_type() == &DataType::Utf8 => {
+            let lists = array
+                .as_any()
+                .downcast_ref::<arrow_array::ListArray>()
+                .ok_or_else(|| {
+                    NanoError::Storage("enum list column is not List<Utf8>".to_string())
+                })?;
+            let mut invalid = 0usize;
+            for row in 0..lists.len() {
+                if lists.is_null(row) {
+                    continue;
+                }
+                let items = lists.value(row);
+                let values = items
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| {
+                        NanoError::Storage("enum list values are not Utf8".to_string())
+                    })?;
+                for item_idx in 0..values.len() {
+                    if !values.is_null(item_idx) && !allowed.contains(values.value(item_idx)) {
+                        invalid += 1;
+                    }
+                }
+            }
+            Ok(invalid)
+        }
+        other => Err(NanoError::Storage(format!(
+            "unsupported enum storage type {:?}",
+            other
+        ))),
     }
 }
 
@@ -2586,6 +3094,7 @@ async fn transform_storage_for_new_schema(
         out.load_edge_batch(&new_edge.name, batch)?;
     }
 
+    validate_storage_against_schema(new_ir, &out)?;
     out.build_indices()?;
     Ok(out)
 }
@@ -2690,9 +3199,20 @@ fn cast_array_if_needed(col: ArrayRef, target_prop: &PropDef) -> Result<ArrayRef
     let target = propdef_to_arrow(target_prop)?;
     if col.data_type() == &target {
         Ok(col)
+    } else if col.len() == 0 {
+        Ok(new_null_array(&target, 0))
     } else {
-        arrow_cast::cast(col.as_ref(), &target)
-            .map_err(|e| NanoError::Execution(format!("cast error: {}", e)))
+        let original_nulls = col.null_count();
+        let casted = arrow_cast::cast(col.as_ref(), &target)
+            .map_err(|e| NanoError::Execution(format!("cast error: {}", e)))?;
+        if casted.null_count() > original_nulls {
+            return Err(NanoError::Execution(format!(
+                "cast to {:?} introduced {} null value(s)",
+                target,
+                casted.null_count().saturating_sub(original_nulls)
+            )));
+        }
+        Ok(casted)
     }
 }
 
@@ -2709,9 +3229,12 @@ async fn write_staged_db(
         .map_err(|e| NanoError::Manifest(format!("serialize IR error: {}", e)))?;
     match storage_generation {
         Some(generation) if generation.is_namespace_managed() => {
-            let db =
-                crate::store::database::Database::init_with_generation(path, schema_source, generation)
-                    .await?;
+            let db = crate::store::database::Database::init_with_generation(
+                path,
+                schema_source,
+                generation,
+            )
+            .await?;
             drop(db);
             std::fs::write(path.join(SCHEMA_PG_FILENAME), schema_source)?;
             std::fs::write(path.join(SCHEMA_IR_FILENAME), &ir_json)?;

@@ -99,10 +99,7 @@ fn namespace_location_to_absolute_local_path(location: &str) -> Result<PathBuf> 
     )))
 }
 
-pub(crate) fn namespace_location_to_local_path(
-    db_dir: &Path,
-    location: &str,
-) -> Result<PathBuf> {
+pub(crate) fn namespace_location_to_local_path(db_dir: &Path, location: &str) -> Result<PathBuf> {
     if let Ok(path) = namespace_location_to_absolute_local_path(location) {
         return Ok(path);
     }
@@ -360,13 +357,12 @@ pub(crate) async fn cleanup_namespace_orphan_versions(
             namespace_latest_version(namespace, GRAPH_SNAPSHOT_TABLE_ID)
                 .await?
                 .version;
-        removed +=
-            cleanup_unpublished_manifest_versions(
-                db_path,
-                &location,
-                Some(published_snapshot_version),
-            )
-                .await?;
+        removed += cleanup_unpublished_manifest_versions(
+            db_path,
+            &location,
+            Some(published_snapshot_version),
+        )
+        .await?;
     }
     Ok(removed)
 }

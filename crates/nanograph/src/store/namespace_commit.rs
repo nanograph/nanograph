@@ -18,13 +18,11 @@ use crate::store::lance_io::{
 };
 use crate::store::manifest::{DatasetEntry, GraphManifest};
 use crate::store::namespace::{
-    GRAPH_CHANGES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID, GRAPH_TX_TABLE_ID,
-    NamespacePublishedVersion, StagedNamespaceTable, batch_publish_namespace_versions,
-    dedup_namespace_published_versions, namespace_latest_version,
-    namespace_location_to_dataset_uri, namespace_location_to_local_path,
-    namespace_location_to_manifest_dataset_path,
-    namespace_published_version_for_table, open_directory_namespace,
-    resolve_or_declare_table_location,
+    GRAPH_CHANGES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID, GRAPH_TX_TABLE_ID, NamespacePublishedVersion,
+    StagedNamespaceTable, batch_publish_namespace_versions, dedup_namespace_published_versions,
+    namespace_latest_version, namespace_location_to_dataset_uri, namespace_location_to_local_path,
+    namespace_location_to_manifest_dataset_path, namespace_published_version_for_table,
+    open_directory_namespace, resolve_or_declare_table_location,
 };
 use crate::store::v4_graph_log::{stage_graph_change_records, stage_graph_commit_record};
 
@@ -230,14 +228,20 @@ pub(crate) fn publish_snapshot_bundle_with_staged_entries(
     let db_dir = db_dir.to_path_buf();
     let snapshot = snapshot.clone();
     let staged_entries = staged_entries.to_vec();
-    run_namespace_commit_task("publish v4 snapshot bundle with staged entries", move || async move {
-        let bundle =
-            build_snapshot_bundle_with_staged_entries_async(&db_dir, &snapshot, &staged_entries)
-                .await?;
-        GraphCommitBundlePublisher
-            .publish_bundle_async(&db_dir, &bundle)
-            .await
-    })
+    run_namespace_commit_task(
+        "publish v4 snapshot bundle with staged entries",
+        move || async move {
+            let bundle = build_snapshot_bundle_with_staged_entries_async(
+                &db_dir,
+                &snapshot,
+                &staged_entries,
+            )
+            .await?;
+            GraphCommitBundlePublisher
+                .publish_bundle_async(&db_dir, &bundle)
+                .await
+        },
+    )
 }
 
 async fn build_graph_update_bundle_async(

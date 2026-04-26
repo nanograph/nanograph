@@ -139,7 +139,11 @@ pub fn parse_changes_options(opts: Option<&serde_json::Value>) -> napi::Result<C
                 to_graph_version_inclusive: None,
             });
         }
-        Some(_) => return Err(napi::Error::from_reason("changes options must be an object")),
+        Some(_) => {
+            return Err(napi::Error::from_reason(
+                "changes options must be an object",
+            ));
+        }
     };
 
     for key in obj.keys() {

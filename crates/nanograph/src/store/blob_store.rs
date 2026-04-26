@@ -18,10 +18,9 @@ use crate::store::lance_io::{
 use crate::store::manifest::DatasetEntry;
 use crate::store::namespace::{
     BLOB_STORE_TABLE_ID, batch_publish_namespace_versions, local_path_to_file_uri,
-    namespace_published_version_for_table, namespace_location_to_dataset_uri,
-    namespace_location_to_local_path,
-    namespace_location_to_manifest_dataset_path, open_directory_namespace,
-    resolve_table_location, write_namespace_batch,
+    namespace_location_to_dataset_uri, namespace_location_to_local_path,
+    namespace_location_to_manifest_dataset_path, namespace_published_version_for_table,
+    open_directory_namespace, resolve_table_location, write_namespace_batch,
 };
 use crate::store::snapshot::read_committed_graph_snapshot;
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
@@ -272,17 +271,19 @@ pub(crate) async fn current_blob_store_entry(db_path: &Path) -> Result<Option<Da
             let location_path = namespace_location_to_local_path(db_path, &location)?;
             let version = latest_lance_dataset_version(&location_path).await?;
             let dataset_uri = namespace_location_to_dataset_uri(db_path, &location)?;
-            let dataset = Dataset::open(&dataset_uri).await.map_err(|err| {
-                NanoError::Lance(format!("open namespace blob store error: {}", err))
-            })?
-            .checkout_version(version)
-            .await
-            .map_err(|err| {
-                NanoError::Lance(format!(
-                    "checkout namespace blob store version {} error: {}",
-                    version, err
-                ))
-            })?;
+            let dataset = Dataset::open(&dataset_uri)
+                .await
+                .map_err(|err| {
+                    NanoError::Lance(format!("open namespace blob store error: {}", err))
+                })?
+                .checkout_version(version)
+                .await
+                .map_err(|err| {
+                    NanoError::Lance(format!(
+                        "checkout namespace blob store version {} error: {}",
+                        version, err
+                    ))
+                })?;
             let row_count =
                 dataset.count_rows(None).await.map_err(|err| {
                     NanoError::Lance(format!("count blob store rows error: {}", err))
@@ -588,7 +589,11 @@ node Note {
         let fixture_dir = temp.path().join("fixtures");
         std::fs::create_dir_all(&fixture_dir).unwrap();
         let image_path = fixture_dir.join("space.png");
-        std::fs::write(&image_path, b"\x89PNG\r\n\x1a\nblob-store-visible-after-load").unwrap();
+        std::fs::write(
+            &image_path,
+            b"\x89PNG\r\n\x1a\nblob-store-visible-after-load",
+        )
+        .unwrap();
         let data_path = fixture_dir.join("data.jsonl");
         std::fs::write(
             &data_path,
@@ -736,8 +741,11 @@ query asset_uri($slug: String) {
             RunResult::Query(rows) => rows.to_rust_json(),
             other => panic!("expected query rows, got {:?}", other),
         };
-        let blob_id_before = parse_managed_blob_id(rows_before[0]["uri"].as_str().unwrap()).unwrap();
-        let bytes_before = read_managed_blob_bytes(&db_path, blob_id_before).await.unwrap();
+        let blob_id_before =
+            parse_managed_blob_id(rows_before[0]["uri"].as_str().unwrap()).unwrap();
+        let bytes_before = read_managed_blob_bytes(&db_path, blob_id_before)
+            .await
+            .unwrap();
         assert_eq!(bytes_before, b"\x89PNG\r\n\x1a\nblob-store-after-migration");
 
         std::fs::write(db_path.join("schema.pg"), embed_schema).unwrap();
@@ -758,11 +766,9 @@ query asset_uri($slug: String) {
             committed_blob_after
         );
         assert_eq!(
-            committed_blob_after.dataset_version,
-            committed_blob_before.dataset_version,
+            committed_blob_after.dataset_version, committed_blob_before.dataset_version,
             "blob store version changed across schema migration: before={} after={}",
-            committed_blob_before.dataset_version,
-            committed_blob_after.dataset_version
+            committed_blob_before.dataset_version, committed_blob_after.dataset_version
         );
 
         let reopened = Database::open(&db_path).await.unwrap();

@@ -1479,8 +1479,7 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             merge_v4_internal_dataset_entries(db_path, &mut dataset_entries).await?;
         }
         Some(StorageGeneration::NamespaceLineage) => {
-            merge_namespace_lineage_internal_dataset_entries(db_path, &mut dataset_entries)
-                .await?;
+            merge_namespace_lineage_internal_dataset_entries(db_path, &mut dataset_entries).await?;
         }
         None => {}
     }
@@ -1525,7 +1524,10 @@ pub(crate) async fn persist_dataset_mutation_plan_at_path(
             ("op_summary".to_string(), plan.op_summary.clone()),
         ]),
     };
-    if matches!(storage_generation, Some(StorageGeneration::NamespaceLineage)) {
+    if matches!(
+        storage_generation,
+        Some(StorageGeneration::NamespaceLineage)
+    ) {
         let graph_deletes = build_namespace_lineage_delete_records_from_delta(
             db_path,
             &previous_manifest,
@@ -1820,7 +1822,7 @@ async fn map_sparse_edge_delete_predicate(
                 .get(edge_type_name)
                 .ok_or_else(|| {
                     NanoError::Execution(format!("unknown edge type `{}`", edge_type_name))
-            })?;
+                })?;
             let endpoint = resolve_mutation_match_value(value, params)?;
             let endpoint_name = literal_to_endpoint_name(&endpoint, "from")?;
             let Some(src_id) =
@@ -1842,7 +1844,7 @@ async fn map_sparse_edge_delete_predicate(
                 .get(edge_type_name)
                 .ok_or_else(|| {
                     NanoError::Execution(format!("unknown edge type `{}`", edge_type_name))
-            })?;
+                })?;
             let endpoint = resolve_mutation_match_value(value, params)?;
             let endpoint_name = literal_to_endpoint_name(&endpoint, "to")?;
             let Some(dst_id) =
@@ -1889,14 +1891,12 @@ pub(crate) async fn resolve_sparse_node_id_by_name(
         .as_any()
         .downcast_ref::<UInt64Array>()
         .ok_or_else(|| NanoError::Execution("node id column is not UInt64".to_string()))?;
-    let key_col = batch
-        .column_by_name(key_prop)
-        .ok_or_else(|| {
-            NanoError::Execution(format!(
-                "edge endpoint lookup requires node type `{}` to materialize @key property `{}`",
-                node_type, key_prop
-            ))
-        })?;
+    let key_col = batch.column_by_name(key_prop).ok_or_else(|| {
+        NanoError::Execution(format!(
+            "edge endpoint lookup requires node type `{}` to materialize @key property `{}`",
+            node_type, key_prop
+        ))
+    })?;
 
     for row in 0..batch.num_rows() {
         if edge_endpoint_lookup_value(key_col, row).as_deref() == Some(node_name) {
@@ -2359,7 +2359,8 @@ async fn build_namespace_lineage_delete_records_for_batch(
         .find(|entry| entry.kind == entity_kind && entry.type_name == type_name)
         .map(|entry| entry.effective_table_id().to_string())
         .unwrap_or_else(|| locator.table_id.clone());
-    let previous_graph_version = (previous_manifest.db_version > 0).then_some(previous_manifest.db_version);
+    let previous_graph_version =
+        (previous_manifest.db_version > 0).then_some(previous_manifest.db_version);
 
     let mut out = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {

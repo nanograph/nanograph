@@ -17,10 +17,11 @@ use crate::store::lance_io::{
 use crate::store::manifest::{DatasetEntry, GraphManifest};
 use crate::store::metadata::DatasetLocator;
 use crate::store::namespace::{
-    GRAPH_DELETES_TABLE_ID, GRAPH_TX_TABLE_ID, StagedNamespaceTable, namespace_published_version_for_table,
+    GRAPH_DELETES_TABLE_ID, GRAPH_TX_TABLE_ID, StagedNamespaceTable,
     namespace_location_to_dataset_uri, namespace_location_to_local_path,
-    namespace_location_to_manifest_dataset_path, open_directory_namespace,
-    resolve_or_declare_table_location, resolve_table_location, write_namespace_batch,
+    namespace_location_to_manifest_dataset_path, namespace_published_version_for_table,
+    open_directory_namespace, resolve_or_declare_table_location, resolve_table_location,
+    write_namespace_batch,
 };
 
 fn manifest_dataset_path(db_path: &Path, location: &str, fallback: &str) -> Result<String> {
@@ -120,8 +121,8 @@ pub(crate) async fn stage_namespace_lineage_graph_commit_record(
     let table_id = GRAPH_TX_TABLE_ID;
     let batch = namespace_lineage_graph_commit_records_to_batch(std::slice::from_ref(record))?
         .ok_or_else(|| {
-        NanoError::Storage("graph tx append expected at least one record".to_string())
-    })?;
+            NanoError::Storage("graph tx append expected at least one record".to_string())
+        })?;
     let pinned_version = manifest
         .datasets
         .iter()
@@ -469,12 +470,7 @@ fn namespace_lineage_graph_commit_records_to_batch(
         ],
     )
     .map(Some)
-    .map_err(|err| {
-        NanoError::Storage(format!(
-            "build namespace-lineage graph tx batch: {}",
-            err
-        ))
-    })
+    .map_err(|err| NanoError::Storage(format!("build namespace-lineage graph tx batch: {}", err)))
 }
 
 fn graph_delete_records_to_batch(records: &[GraphDeleteRecord]) -> Result<Option<RecordBatch>> {
@@ -518,7 +514,12 @@ fn graph_delete_records_to_batch(records: &[GraphDeleteRecord]) -> Result<Option
             .map(|record| record.table_id.as_str().to_string())
             .collect::<Vec<_>>(),
     );
-    let rowid = UInt64Array::from(records.iter().map(|record| record.rowid).collect::<Vec<_>>());
+    let rowid = UInt64Array::from(
+        records
+            .iter()
+            .map(|record| record.rowid)
+            .collect::<Vec<_>>(),
+    );
     let entity_id = UInt64Array::from(
         records
             .iter()
@@ -595,12 +596,13 @@ fn namespace_lineage_graph_commit_records_from_batch(
 
     let mut out = Vec::with_capacity(batch.num_rows());
     for row in 0..batch.num_rows() {
-        let table_versions = serde_json::from_str(table_versions_json.value(row)).map_err(|err| {
-            NanoError::Manifest(format!(
-                "parse namespace-lineage graph tx table_versions_json error: {}",
-                err
-            ))
-        })?;
+        let table_versions =
+            serde_json::from_str(table_versions_json.value(row)).map_err(|err| {
+                NanoError::Manifest(format!(
+                    "parse namespace-lineage graph tx table_versions_json error: {}",
+                    err
+                ))
+            })?;
         let touched_tables: Vec<GraphTouchedTableWindow> =
             serde_json::from_str(touched_tables_json.value(row)).map_err(|err| {
                 NanoError::Manifest(format!(

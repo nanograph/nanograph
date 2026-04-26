@@ -17,8 +17,8 @@ use nanograph::query::typecheck::{CheckedQuery, typecheck_query_decl};
 use nanograph::store::database::Database;
 
 use convert::{
-    js_object_to_param_map, parse_changes_options, parse_cleanup_options,
-    parse_compact_options, parse_embed_options, parse_load_mode,
+    js_object_to_param_map, parse_changes_options, parse_cleanup_options, parse_compact_options,
+    parse_embed_options, parse_load_mode,
 };
 
 fn to_napi_err(e: NanoError) -> napi::Error {

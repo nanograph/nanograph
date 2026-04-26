@@ -29,11 +29,7 @@ fn version_dataset_entries(payload: &serde_json::Value) -> Vec<&serde_json::Valu
         .collect()
 }
 
-fn version_data_dataset_path(
-    payload: &serde_json::Value,
-    kind: &str,
-    type_name: &str,
-) -> String {
+fn version_data_dataset_path(payload: &serde_json::Value, kind: &str, type_name: &str) -> String {
     version_dataset_entries(payload)
         .into_iter()
         .find(|entry| entry["kind"] == kind && entry["type_name"] == type_name)
@@ -1537,9 +1533,13 @@ async fn changes_no_embeddings_still_requires_visible_cdc_history() {
         r#"{"type":"Person","data":{"slug":"alice","summary":"Alpha","embedding":[1.0,0.0,0.0]}}"#,
     );
 
-    Database::init_with_generation(&db_path, &std::fs::read_to_string(&schema_path).unwrap(), StorageGeneration::V4Namespace)
-        .await
-        .unwrap();
+    Database::init_with_generation(
+        &db_path,
+        &std::fs::read_to_string(&schema_path).unwrap(),
+        StorageGeneration::V4Namespace,
+    )
+    .await
+    .unwrap();
     cmd_load(&db_path, &data_path, LoadModeArg::Overwrite, false, false)
         .await
         .unwrap();

@@ -20,8 +20,8 @@ use crate::store::lance_io::{latest_lance_dataset_version, read_lance_batches_fo
 use crate::store::manifest::DatasetEntry;
 use crate::store::metadata::DatabaseMetadata;
 use crate::store::namespace::{
-    namespace_location_to_manifest_dataset_path, open_directory_namespace,
-    resolve_table_location, write_namespace_batch,
+    namespace_location_to_manifest_dataset_path, open_directory_namespace, resolve_table_location,
+    write_namespace_batch,
 };
 use crate::store::namespace_lineage_internal::merge_namespace_lineage_internal_dataset_entries;
 use crate::store::snapshot::read_committed_graph_snapshot;
@@ -239,8 +239,12 @@ pub async fn migrate_storage_to_lineage_native(db_path: &Path) -> Result<Storage
         let node_table_count = source.schema_ir().node_types().count();
         let edge_table_count = source.schema_ir().edge_types().count();
 
-        Database::init_with_generation(db_path, &schema_source, StorageGeneration::NamespaceLineage)
-            .await?;
+        Database::init_with_generation(
+            db_path,
+            &schema_source,
+            StorageGeneration::NamespaceLineage,
+        )
+        .await?;
 
         let mut dataset_entries = Vec::new();
         let mut media_uris_rewritten = 0usize;

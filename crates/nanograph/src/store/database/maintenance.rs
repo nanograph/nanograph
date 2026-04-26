@@ -21,7 +21,9 @@ use super::{
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
 use crate::store::graph_mirror::{inspect_graph_mirror, rebuild_graph_mirror_from_wal};
-use crate::store::graph_types::{GraphChangeRecord, GraphCommitRecord, GraphDeleteRecord, GraphTouchedTableWindow};
+use crate::store::graph_types::{
+    GraphChangeRecord, GraphCommitRecord, GraphDeleteRecord, GraphTouchedTableWindow,
+};
 use crate::store::lance_io::{
     LANCE_INTERNAL_ID_FIELD, open_dataset_for_locator, write_lance_batch,
 };
@@ -39,11 +41,11 @@ use crate::store::namespace_lineage_graph_log::{
 use crate::store::snapshot::{graph_snapshot_table_present, read_committed_graph_snapshot};
 use crate::store::storage_generation::{StorageGeneration, detect_storage_generation};
 use crate::store::txlog::{
-    CdcLogEntry, collect_visible_lineage_shadow_cdc_entries, commit_manifest_and_logs,
-    commit_graph_records_and_manifest_namespace_lineage, prune_logs_for_replay_window,
-    read_cdc_log_entries, read_tx_catalog_entries, read_visible_change_rows,
-    read_visible_graph_delete_records_namespace_lineage,
-    read_visible_cdc_entries, read_visible_graph_change_records, read_visible_graph_commit_records,
+    CdcLogEntry, collect_visible_lineage_shadow_cdc_entries,
+    commit_graph_records_and_manifest_namespace_lineage, commit_manifest_and_logs,
+    prune_logs_for_replay_window, read_cdc_log_entries, read_tx_catalog_entries,
+    read_visible_cdc_entries, read_visible_change_rows, read_visible_graph_change_records,
+    read_visible_graph_commit_records, read_visible_graph_delete_records_namespace_lineage,
     reconcile_logs_to_manifest,
 };
 use crate::store::v4_graph_log::{rewrite_graph_change_records, rewrite_graph_commit_records};
@@ -131,7 +133,10 @@ pub async fn compact_database(db_path: &Path, options: CompactOptions) -> Result
                         &next_manifest,
                     ),
                     tx_props: BTreeMap::from([
-                        ("graph_version".to_string(), next_manifest.db_version.to_string()),
+                        (
+                            "graph_version".to_string(),
+                            next_manifest.db_version.to_string(),
+                        ),
                         ("tx_id".to_string(), next_manifest.last_tx_id.clone()),
                         ("op_summary".to_string(), "maintenance:compact".to_string()),
                     ]),
@@ -170,7 +175,10 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
             "retain_tx_versions must be >= 1".to_string(),
         ));
     }
-    if matches!(storage_generation, Some(StorageGeneration::NamespaceLineage)) {
+    if matches!(
+        storage_generation,
+        Some(StorageGeneration::NamespaceLineage)
+    ) {
         return cleanup_database_namespace_lineage(db_path, options).await;
     }
     if options.retain_dataset_versions == 0 {
@@ -192,26 +200,29 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
     let v4_retained_window = v4_all_commits
         .as_ref()
         .map(|commits| select_retained_v4_graph_window(commits, options.retain_tx_versions));
-    let v4_lineage_required_versions = v4_all_commits
-        .as_ref()
-        .map(|commits| compute_v4_lineage_required_versions(&manifest, commits, options.retain_tx_versions));
+    let v4_lineage_required_versions = v4_all_commits.as_ref().map(|commits| {
+        compute_v4_lineage_required_versions(&manifest, commits, options.retain_tx_versions)
+    });
     let log_prune = prune_logs_for_replay_window(db_path, options.retain_tx_versions)?;
     let mut result = if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
         let retained = v4_retained_window.as_ref().expect("v4 retained window");
-        let retained_changes =
-            read_visible_graph_change_records(
-                db_path,
-                retained.lower_bound_exclusive,
-                Some(manifest.db_version),
-            )?;
+        let retained_changes = read_visible_graph_change_records(
+            db_path,
+            retained.lower_bound_exclusive,
+            Some(manifest.db_version),
+        )?;
         CleanupResult {
             tx_rows_removed: read_tx_catalog_entries(db_path)?
                 .len()
                 .saturating_sub(retained.logical_commits.len()),
             tx_rows_kept: retained.logical_commits.len(),
-            cdc_rows_removed: read_visible_graph_change_records(db_path, 0, Some(manifest.db_version))?
-                .len()
-                .saturating_sub(retained_changes.len()),
+            cdc_rows_removed: read_visible_graph_change_records(
+                db_path,
+                0,
+                Some(manifest.db_version),
+            )?
+            .len()
+            .saturating_sub(retained_changes.len()),
             cdc_rows_kept: retained_changes.len(),
             ..Default::default()
         }
@@ -253,23 +264,24 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
                 options.retain_dataset_versions.max(needed_for_manifest)
             })
             .unwrap_or(options.retain_dataset_versions);
-        let effective_retain_n = if matches!(storage_generation, Some(StorageGeneration::V4Namespace))
-            && matches!(entry.kind.as_str(), "node" | "edge")
-        {
-            v4_lineage_required_versions
-                .as_ref()
-                .and_then(|required| required.get(entry.effective_table_id()))
-                .and_then(|oldest_required| {
-                    versions
-                        .iter()
-                        .position(|version| version.version == *oldest_required)
-                        .map(|idx| versions.len().saturating_sub(idx))
-                })
-                .map(|needed_for_lineage| effective_retain_n.max(needed_for_lineage))
-                .unwrap_or(effective_retain_n)
-        } else {
-            effective_retain_n
-        };
+        let effective_retain_n =
+            if matches!(storage_generation, Some(StorageGeneration::V4Namespace))
+                && matches!(entry.kind.as_str(), "node" | "edge")
+            {
+                v4_lineage_required_versions
+                    .as_ref()
+                    .and_then(|required| required.get(entry.effective_table_id()))
+                    .and_then(|oldest_required| {
+                        versions
+                            .iter()
+                            .position(|version| version.version == *oldest_required)
+                            .map(|idx| versions.len().saturating_sub(idx))
+                    })
+                    .map(|needed_for_lineage| effective_retain_n.max(needed_for_lineage))
+                    .unwrap_or(effective_retain_n)
+            } else {
+                effective_retain_n
+            };
         let policy = CleanupPolicyBuilder::default()
             .retain_n_versions(&dataset, effective_retain_n)
             .await
@@ -288,12 +300,11 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
 
     if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) {
         let retained = v4_retained_window.as_ref().expect("v4 retained window");
-        let retained_changes =
-            read_visible_graph_change_records(
-                db_path,
-                retained.lower_bound_exclusive,
-                Some(manifest.db_version),
-            )?;
+        let retained_changes = read_visible_graph_change_records(
+            db_path,
+            retained.lower_bound_exclusive,
+            Some(manifest.db_version),
+        )?;
         let staged_tx = rewrite_graph_commit_records(db_path, &retained.staged_commits).await?;
         let staged_changes = rewrite_graph_change_records(db_path, &retained_changes).await?;
         let mut next_snapshot = manifest.clone();
@@ -303,12 +314,8 @@ pub async fn cleanup_database(db_path: &Path, options: CleanupOptions) -> Result
         next_snapshot
             .datasets
             .retain(|entry| !replaced_ids.contains(entry.effective_table_id()));
-        next_snapshot
-            .datasets
-            .push(staged_tx.entry.clone());
-        next_snapshot
-            .datasets
-            .push(staged_changes.entry.clone());
+        next_snapshot.datasets.push(staged_tx.entry.clone());
+        next_snapshot.datasets.push(staged_changes.entry.clone());
         publish_snapshot_bundle_with_staged_entries(
             db_path,
             &next_snapshot,
@@ -337,10 +344,8 @@ async fn cleanup_database_namespace_lineage(
     cleanup_namespace_orphan_versions(db_path, &manifest).await?;
 
     let all_commits = read_visible_graph_commit_records(db_path)?;
-    let retained = select_retained_namespace_lineage_graph_window(
-        &all_commits,
-        options.retain_tx_versions,
-    );
+    let retained =
+        select_retained_namespace_lineage_graph_window(&all_commits, options.retain_tx_versions);
     let retained_deletes = read_visible_graph_delete_records_namespace_lineage(
         db_path,
         retained.lower_bound_exclusive,
@@ -352,13 +357,16 @@ async fn cleanup_database_namespace_lineage(
         retained.lower_bound_exclusive,
         Some(manifest.db_version),
     )?;
-    let required_versions =
-        compute_namespace_lineage_required_versions(&retained.logical_commits);
+    let required_versions = compute_namespace_lineage_required_versions(&retained.logical_commits);
 
     let mut result = CleanupResult {
-        tx_rows_removed: all_commits.len().saturating_sub(retained.logical_commits.len()),
+        tx_rows_removed: all_commits
+            .len()
+            .saturating_sub(retained.logical_commits.len()),
         tx_rows_kept: retained.logical_commits.len(),
-        cdc_rows_removed: total_change_rows.len().saturating_sub(retained_change_rows.len()),
+        cdc_rows_removed: total_change_rows
+            .len()
+            .saturating_sub(retained_change_rows.len()),
         cdc_rows_kept: retained_change_rows.len(),
         ..Default::default()
     };
@@ -413,11 +421,8 @@ async fn cleanup_database_namespace_lineage(
         result.dataset_bytes_removed += stats.bytes_removed;
     }
 
-    let staged_tx = rewrite_namespace_lineage_graph_commit_records(
-        db_path,
-        &retained.logical_commits,
-    )
-    .await?;
+    let staged_tx =
+        rewrite_namespace_lineage_graph_commit_records(db_path, &retained.logical_commits).await?;
     let staged_deletes = rewrite_graph_delete_records(db_path, &retained_deletes).await?;
     let mut next_snapshot = manifest.clone();
     let replaced_ids = [GRAPH_TX_TABLE_ID, GRAPH_DELETES_TABLE_ID]
@@ -464,7 +469,10 @@ fn select_retained_v4_graph_window(
     let logical_start = commits.len().saturating_sub(retain_count);
     let logical_commits = commits[logical_start..].to_vec();
     let mut staged_commits = logical_commits.clone();
-    if let Some(predecessor) = logical_start.checked_sub(1).and_then(|idx| commits.get(idx)) {
+    if let Some(predecessor) = logical_start
+        .checked_sub(1)
+        .and_then(|idx| commits.get(idx))
+    {
         staged_commits.insert(0, predecessor.clone());
     }
     let lower_bound_exclusive = logical_commits
@@ -562,7 +570,9 @@ fn compute_namespace_lineage_required_versions(
         for window in &commit.touched_tables {
             if window.before_version > 0 {
                 out.entry(window.table_id.as_str().to_string())
-                    .and_modify(|version: &mut u64| *version = (*version).min(window.before_version))
+                    .and_modify(|version: &mut u64| {
+                        *version = (*version).min(window.before_version)
+                    })
                     .or_insert(window.before_version);
             }
             if window.after_version > 0 {
@@ -823,7 +833,10 @@ impl Database {
             }
         }
 
-        if matches!(storage_generation, Some(StorageGeneration::NamespaceLineage)) {
+        if matches!(
+            storage_generation,
+            Some(StorageGeneration::NamespaceLineage)
+        ) {
             let namespace = open_directory_namespace(&self.path).await?;
             for required in [
                 GRAPH_TX_TABLE_ID,
@@ -901,17 +914,15 @@ impl Database {
         }
 
         let cdc_rows = match storage_generation {
-            Some(StorageGeneration::NamespaceLineage) => match read_visible_change_rows(
-                &self.path,
-                0,
-                Some(manifest.db_version),
-            ) {
-                Ok(rows) => rows.len(),
-                Err(err) => {
-                    issues.push(format!("NamespaceLineage CDC read failed: {}", err));
-                    0
+            Some(StorageGeneration::NamespaceLineage) => {
+                match read_visible_change_rows(&self.path, 0, Some(manifest.db_version)) {
+                    Ok(rows) => rows.len(),
+                    Err(err) => {
+                        issues.push(format!("NamespaceLineage CDC read failed: {}", err));
+                        0
+                    }
                 }
-            },
+            }
             _ => match read_cdc_log_entries(&self.path) {
                 Ok(rows) => rows.len(),
                 Err(err) if matches!(storage_generation, Some(StorageGeneration::V4Namespace)) => {
@@ -1005,12 +1016,11 @@ async fn validate_namespace_lineage_state(
         }
     }
 
-    let deletes =
-        read_visible_graph_delete_records_namespace_lineage(
-            metadata.path(),
-            0,
-            Some(manifest.db_version),
-        )?;
+    let deletes = read_visible_graph_delete_records_namespace_lineage(
+        metadata.path(),
+        0,
+        Some(manifest.db_version),
+    )?;
     validate_namespace_lineage_delete_records(&deletes, issues, warnings);
 
     if let Err(err) = read_visible_change_rows(metadata.path(), 0, Some(manifest.db_version)) {

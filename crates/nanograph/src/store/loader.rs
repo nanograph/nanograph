@@ -19,6 +19,10 @@ mod embeddings;
 mod jsonl;
 mod merge;
 
+pub(crate) use constraints::{
+    key_value_string, load_node_constraint_annotations, unique_value_string,
+    validate_storage_against_schema,
+};
 pub(crate) use embeddings::{
     EmbedInput, EmbedSourceKind, EmbedSpec, EmbedValueRequest, collect_embed_specs,
     resolve_embedding_requests,

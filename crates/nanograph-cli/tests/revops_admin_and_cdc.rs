@@ -242,13 +242,17 @@ query delete_task() {
             .any(|row| row["change_kind"].as_str() == Some("delete"))
     );
     assert!(
-        changes_range.iter().all(|row| row.get("db_version").is_none())
-            && changes_range.iter().all(|row| row.get("seq_in_tx").is_none())
+        changes_range
+            .iter()
+            .all(|row| row.get("db_version").is_none())
+            && changes_range
+                .iter()
+                .all(|row| row.get("seq_in_tx").is_none())
     );
     assert!(
-        changes_range.iter().any(|row| {
-            row["type_name"] == "Signal" && row["row"]["urgency"] == "critical"
-        })
+        changes_range
+            .iter()
+            .any(|row| { row["type_name"] == "Signal" && row["row"]["urgency"] == "critical" })
     );
 
     let changes_since = workspace.jsonl_rows(&[

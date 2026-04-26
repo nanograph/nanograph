@@ -16,8 +16,8 @@ use crate::store::metadata::DatabaseMetadata;
 use crate::store::migration::{MigrationStatus, execute_schema_migration};
 use crate::store::namespace::{
     GRAPH_CHANGES_TABLE_ID, GRAPH_SNAPSHOT_TABLE_ID, GRAPH_TX_TABLE_ID,
-    cleanup_namespace_orphan_versions, namespace_location_to_local_path,
-    open_directory_namespace, resolve_table_location, write_namespace_batch,
+    cleanup_namespace_orphan_versions, namespace_location_to_local_path, open_directory_namespace,
+    resolve_table_location, write_namespace_batch,
 };
 use crate::store::namespace_commit::{build_graph_update_bundle, publish_graph_commit_bundle};
 use crate::store::snapshot::{
@@ -27,8 +27,7 @@ use crate::store::storage_generation::{StorageGeneration, storage_metadata_path}
 use crate::store::txlog::{
     VisibleCdcSource, append_tx_catalog_entry, collect_visible_lineage_shadow_cdc_entries,
     read_tx_catalog_entries, read_visible_cdc_entries, read_visible_cdc_entries_with_source,
-    read_visible_change_rows, read_visible_graph_change_records,
-    read_visible_graph_commit_records,
+    read_visible_change_rows, read_visible_graph_change_records, read_visible_graph_commit_records,
 };
 use arrow_array::{Array, StringArray, UInt32Array, UInt64Array};
 use arrow_schema::{Field, Schema};
@@ -1117,8 +1116,7 @@ async fn test_v4_staged_internal_bundle_is_invisible_until_publish() {
     let committed_after_stage = read_committed_graph_snapshot(path).unwrap();
     let tx_after_stage = read_tx_catalog_entries(path).unwrap();
     let changes_after_stage =
-        read_visible_graph_change_records(path, 0, Some(committed_after_stage.db_version))
-            .unwrap();
+        read_visible_graph_change_records(path, 0, Some(committed_after_stage.db_version)).unwrap();
     let exported_before_publish = build_export_rows_at_path(path, false, true).await.unwrap();
 
     assert_eq!(
@@ -1668,9 +1666,7 @@ async fn test_v5_changes_returns_lineage_native_rows_for_merge() {
     assert_eq!(update.entity_id, alice_id);
     assert!(
         rows.iter().any(|row| {
-            row.change_kind == "insert"
-                && row.entity_kind == "edge"
-                && row.type_name == "Knows"
+            row.change_kind == "insert" && row.entity_kind == "edge" && row.type_name == "Knows"
         }),
         "expected lineage-native rows to include the new Knows edge: {rows:?}"
     );
@@ -3110,11 +3106,9 @@ async fn test_delete_nodes_cascades_edges() {
     assert_eq!(tx_rows[1].op_summary, "mutation:delete_nodes");
 
     let change_rows = read_visible_change_rows(path, 1, Some(2)).unwrap();
-    assert!(
-        change_rows
-            .iter()
-            .any(|row| row.change_kind == "delete" && row.entity_kind == "node" && row.type_name == "Person")
-    );
+    assert!(change_rows.iter().any(|row| row.change_kind == "delete"
+        && row.entity_kind == "node"
+        && row.type_name == "Person"));
     assert!(
         change_rows
             .iter()

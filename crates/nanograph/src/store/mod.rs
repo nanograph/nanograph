@@ -9,6 +9,8 @@ pub mod metadata;
 pub mod migration;
 pub(crate) mod namespace;
 pub(crate) mod namespace_commit;
+pub(crate) mod namespace_lineage_graph_log;
+pub(crate) mod namespace_lineage_internal;
 pub(crate) mod runtime;
 #[doc(hidden)]
 pub mod snapshot;
@@ -17,8 +19,6 @@ pub mod storage_migrate;
 pub mod txlog;
 pub(crate) mod v4_graph_log;
 pub(crate) mod v4_internal;
-pub(crate) mod namespace_lineage_graph_log;
-pub(crate) mod namespace_lineage_internal;
 
 pub use indexing::{scalar_index_name, text_index_name, vector_index_name};
 

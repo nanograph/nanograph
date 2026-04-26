@@ -151,6 +151,71 @@ edge Knows: User -> User
 "#
 }
 
+fn schema_with_added_unique_email() -> &'static str {
+    r#"
+node User {
+    name: String @key
+    email: String @unique
+}
+"#
+}
+
+fn schema_without_unique_email() -> &'static str {
+    r#"
+node User {
+    name: String @key
+    email: String
+}
+"#
+}
+
+fn duplicate_email_data() -> &'static str {
+    r#"
+{"type":"User","data":{"name":"Alice","email":"dupe@example.com"}}
+{"type":"User","data":{"name":"Bob","email":"dupe@example.com"}}
+"#
+}
+
+fn schema_with_role_enum() -> &'static str {
+    r#"
+node User {
+    name: String @key
+    role: enum(admin, member, guest)
+}
+"#
+}
+
+fn schema_with_narrowed_role_enum() -> &'static str {
+    r#"
+node User {
+    name: String @key
+    role: enum(admin, member)
+}
+"#
+}
+
+fn role_enum_data_with_guest() -> &'static str {
+    r#"
+{"type":"User","data":{"name":"Alice","role":"guest"}}
+"#
+}
+
+fn schema_with_added_email_key() -> &'static str {
+    r#"
+node User {
+    name: String
+    email: String? @key
+}
+"#
+}
+
+fn nullable_email_data() -> &'static str {
+    r#"
+{"type":"User","data":{"name":"Alice","email":null}}
+{"type":"User","data":{"name":"Bob","email":"bob@example.com"}}
+"#
+}
+
 fn drop_type_base_schema() -> &'static str {
     r#"
 node User {
@@ -529,7 +594,7 @@ async fn migration_blocks_invalid_type_cast() {
         .await
         .expect("dry run");
 
-    assert_eq!(exec.status, MigrationStatus::NeedsConfirmation);
+    assert_eq!(exec.status, MigrationStatus::Blocked);
     assert!(
         exec.plan.steps.iter().any(|s| {
             matches!(
@@ -543,7 +608,14 @@ async fn migration_blocks_invalid_type_cast() {
         }),
         "expected AlterPropertyType step for User.name"
     );
-    assert!(exec.plan.blocked.is_empty());
+    assert!(
+        exec.plan
+            .blocked
+            .iter()
+            .any(|r| r.contains("non-lossless type change")),
+        "expected blocked reason for non-lossless type change: {:?}",
+        exec.plan.blocked
+    );
 }
 
 #[tokio::test]
@@ -576,6 +648,118 @@ async fn migration_blocks_nullable_to_non_nullable_when_nulls_exist() {
             .iter()
             .any(|r| r.contains("non-nullable") && r.contains("null value")),
         "expected blocked reason for existing nulls"
+    );
+}
+
+#[tokio::test]
+async fn migration_blocks_added_unique_constraint_with_duplicate_existing_values() {
+    let (_dir, db_path) =
+        init_db_with_custom_data(schema_without_unique_email(), duplicate_email_data()).await;
+    write_schema(&db_path, schema_with_added_unique_email());
+
+    let exec = execute_schema_migration(&db_path, None, true, false)
+        .await
+        .expect("dry run");
+
+    assert_eq!(exec.status, MigrationStatus::Blocked);
+    assert!(
+        exec.plan.steps.iter().any(|s| {
+            matches!(
+                s.step,
+                MigrationStep::AlterPropertyUnique {
+                    ref type_name,
+                    ref prop_name,
+                    unique,
+                    ..
+                } if type_name == "User" && prop_name == "email" && unique
+            )
+        }),
+        "expected AlterPropertyUnique step for User.email"
+    );
+    assert!(
+        exec.plan
+            .blocked
+            .iter()
+            .any(|r| r.contains("duplicate value `dupe@example.com`")),
+        "expected duplicate unique blocked reason: {:?}",
+        exec.plan.blocked
+    );
+}
+
+#[tokio::test]
+async fn migration_blocks_enum_narrowing_with_invalid_existing_values() {
+    let (_dir, db_path) =
+        init_db_with_custom_data(schema_with_role_enum(), role_enum_data_with_guest()).await;
+    write_schema(&db_path, schema_with_narrowed_role_enum());
+
+    let exec = execute_schema_migration(&db_path, None, true, false)
+        .await
+        .expect("dry run");
+
+    assert_eq!(exec.status, MigrationStatus::Blocked);
+    assert!(
+        exec.plan.steps.iter().any(|s| {
+            matches!(
+                s.step,
+                MigrationStep::AlterPropertyEnumValues {
+                    ref type_name,
+                    ref prop_name,
+                    ..
+                } if type_name == "User" && prop_name == "role"
+            )
+        }),
+        "expected AlterPropertyEnumValues step for User.role"
+    );
+    assert!(
+        exec.plan
+            .blocked
+            .iter()
+            .any(|r| r.contains("enum domain change") && r.contains("invalidate")),
+        "expected enum blocked reason: {:?}",
+        exec.plan.blocked
+    );
+}
+
+#[tokio::test]
+async fn migration_blocks_added_key_with_existing_null_values() {
+    let (_dir, db_path) = init_db_with_custom_data(
+        r#"
+node User {
+    name: String
+    email: String?
+}
+"#,
+        nullable_email_data(),
+    )
+    .await;
+    write_schema(&db_path, schema_with_added_email_key());
+
+    let exec = execute_schema_migration(&db_path, None, true, false)
+        .await
+        .expect("dry run");
+
+    assert_eq!(exec.status, MigrationStatus::Blocked);
+    assert!(
+        exec.plan.steps.iter().any(|s| {
+            matches!(
+                s.step,
+                MigrationStep::AlterPropertyKey {
+                    ref type_name,
+                    ref prop_name,
+                    keyed,
+                    ..
+                } if type_name == "User" && prop_name == "email" && keyed
+            )
+        }),
+        "expected AlterPropertyKey step for User.email"
+    );
+    assert!(
+        exec.plan
+            .blocked
+            .iter()
+            .any(|r| r.contains("cannot add @key") && r.contains("cannot be null")),
+        "expected key null blocked reason: {:?}",
+        exec.plan.blocked
     );
 }
 
@@ -681,7 +865,7 @@ async fn migration_preserves_index_annotations_in_schema_ir() {
     let (_dir, db_path) = init_db_with_data(base_schema()).await;
     write_schema(&db_path, schema_with_index_annotation());
 
-    let exec = execute_schema_migration(&db_path, None, false, false)
+    let exec = execute_schema_migration(&db_path, None, false, true)
         .await
         .expect("apply migration");
     assert_eq!(exec.status, MigrationStatus::Applied);
@@ -727,7 +911,7 @@ async fn migration_builds_scalar_indexes_for_indexed_properties() {
     let (_dir, db_path) = init_db_with_data(base_schema()).await;
     write_schema(&db_path, schema_with_index_annotation());
 
-    let exec = execute_schema_migration(&db_path, None, false, false)
+    let exec = execute_schema_migration(&db_path, None, false, true)
         .await
         .expect("apply migration");
     assert_eq!(exec.status, MigrationStatus::Applied);
@@ -785,7 +969,7 @@ async fn migration_bootstraps_identity_counters_from_legacy_manifest() {
         &db_path,
         r#"
 node User {
-    name: String
+    name: String @key
     age: I32?
 }
 node Team {

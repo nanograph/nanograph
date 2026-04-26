@@ -1066,9 +1066,11 @@ async fn resolve_pending_stream_batch(
                     immediate_source,
                 } => unique_media_entries.push((
                     cache_key,
-                    immediate_source
-                        .clone()
-                        .unwrap_or(media_source_from_uri(runtime.db_path, uri, mime_type)?),
+                    immediate_source.clone().unwrap_or(media_source_from_uri(
+                        runtime.db_path,
+                        uri,
+                        mime_type,
+                    )?),
                 )),
             }
         }

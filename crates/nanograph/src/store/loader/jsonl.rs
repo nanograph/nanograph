@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
@@ -290,8 +290,13 @@ fn flush_node_rows(
         .collect();
     let mut builders: Vec<Vec<serde_json::Value>> =
         vec![Vec::with_capacity(rows.len()); prop_fields.len()];
+    let allowed_fields = prop_fields
+        .iter()
+        .map(|field| field.name().as_str())
+        .collect::<HashSet<_>>();
 
     for row in rows.iter() {
+        reject_unknown_data_fields("node", type_name, row.row_idx, &row.data, &allowed_fields)?;
         for (idx, field) in prop_fields.iter().enumerate() {
             let value = row
                 .data
@@ -464,7 +469,7 @@ fn load_spooled_edges(
                 e
             ))
         })?;
-        let resolved = resolve_edge_object(storage, &obj, key_props, key_to_id)?;
+        let resolved = resolve_edge_object(storage, &obj, key_props, key_to_id, line_no)?;
         edges_by_pair.insert((resolved.from_id, resolved.to_id), resolved);
     }
 
@@ -546,6 +551,7 @@ fn resolve_edge_object(
     edge_obj: &serde_json::Value,
     key_props: &HashMap<String, String>,
     key_to_id: &HashMap<(String, String), u64>,
+    row_idx: usize,
 ) -> Result<ResolvedEdge> {
     let edge_type = edge_obj
         .get("edge")
@@ -631,14 +637,50 @@ fn resolve_edge_object(
             ))
         })?;
 
+    let data = match edge_obj.get("data") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::Object(data)) => Some(data.clone()),
+        Some(other) => {
+            return Err(NanoError::Storage(format!(
+                "edge {}: data must be an object on row {}, got {}",
+                edge_name,
+                row_idx,
+                describe_json_value(other)
+            )));
+        }
+    };
+    if let Some(data) = data.as_ref() {
+        let allowed_fields = et
+            .properties
+            .keys()
+            .map(String::as_str)
+            .collect::<HashSet<_>>();
+        reject_unknown_data_fields("edge", &edge_name, row_idx, data, &allowed_fields)?;
+    }
+
     Ok(ResolvedEdge {
         from_id,
         to_id,
-        data: edge_obj
-            .get("data")
-            .and_then(|value| value.as_object())
-            .cloned(),
+        data,
     })
+}
+
+fn reject_unknown_data_fields(
+    kind: &str,
+    type_name: &str,
+    row_idx: usize,
+    data: &serde_json::Map<String, serde_json::Value>,
+    allowed_fields: &HashSet<&str>,
+) -> Result<()> {
+    for key in data.keys() {
+        if !allowed_fields.contains(key.as_str()) {
+            return Err(NanoError::Storage(format!(
+                "{} {}: unknown property '{}' on row {}",
+                kind, type_name, key, row_idx
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn resolve_edge_name(storage: &DatasetAccumulator, edge_type: &str) -> Result<String> {
@@ -1656,6 +1698,48 @@ edge WorksWith: Person -> Person {
         assert_eq!(
             err.to_string(),
             r#"storage error: type mismatch for Person.age: expected I32, got String "not-a-number""#
+        );
+    }
+
+    #[test]
+    fn load_jsonl_rejects_unknown_node_properties() {
+        let schema = r#"node Person {
+    name: String @key
+}"#;
+        let mut storage = build_storage(schema);
+        let err = load_jsonl_data(
+            &mut storage,
+            r#"{"type":"Person","data":{"name":"Alice","naem":"typo"}}"#,
+            &HashMap::from([("Person".to_string(), "name".to_string())]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown property 'naem'"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn load_jsonl_rejects_unknown_edge_properties() {
+        let schema = r#"node Person {
+    name: String @key
+}
+edge Knows: Person -> Person {
+    since: Date?
+}"#;
+        let mut storage = build_storage(schema);
+        let data = r#"{"type":"Person","data":{"name":"Alice"}}
+{"type":"Person","data":{"name":"Bob"}}
+{"edge":"Knows","from":"Alice","to":"Bob","data":{"sicne":"2026-01-01"}}"#;
+        let err = load_jsonl_data(
+            &mut storage,
+            data,
+            &HashMap::from([("Person".to_string(), "name".to_string())]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("unknown property 'sicne'"),
+            "unexpected error: {err}"
         );
     }
 

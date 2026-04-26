@@ -75,15 +75,20 @@ fn namespace_lineage_changes_have_full_shape_and_deterministic_ordering() {
     assert!(rows.iter().all(|row| row.get("db_version").is_none()));
     assert!(rows.iter().all(|row| row.get("seq_in_tx").is_none()));
     assert!(
-        rows.iter().all(|row| row["graph_version"].as_u64() == Some(graph_version))
+        rows.iter()
+            .all(|row| row["graph_version"].as_u64() == Some(graph_version))
     );
     assert!(
-        rows.iter().all(|row| row["previous_graph_version"].as_u64() == Some(before_version))
+        rows.iter()
+            .all(|row| row["previous_graph_version"].as_u64() == Some(before_version))
     );
     assert!(rows.iter().all(|row| row["tx_id"].is_string()));
     assert!(rows.iter().all(|row| row["table_id"].is_string()));
     assert!(rows.iter().all(|row| row["rowid"].is_u64()));
-    assert!(rows.iter().all(|row| row["entity_id"].as_u64().unwrap_or(0) > 0));
+    assert!(
+        rows.iter()
+            .all(|row| row["entity_id"].as_u64().unwrap_or(0) > 0)
+    );
     assert!(rows.iter().all(|row| row["logical_key"].is_string()));
     assert!(rows.iter().all(|row| row["row"].is_object()));
 
