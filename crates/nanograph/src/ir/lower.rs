@@ -22,6 +22,7 @@ pub fn lower_query(
 
     let mut pipeline = Vec::new();
     let mut bound_vars = HashSet::new();
+    let mut temp_counter = 0usize;
 
     lower_clauses(
         catalog,
@@ -30,6 +31,7 @@ pub fn lower_query(
         &mut pipeline,
         &mut bound_vars,
         &param_names,
+        &mut temp_counter,
     )?;
 
     let return_exprs: Vec<IRProjection> = query
@@ -118,6 +120,7 @@ fn lower_clauses(
     pipeline: &mut Vec<IROp>,
     bound_vars: &mut HashSet<String>,
     param_names: &HashSet<String>,
+    temp_counter: &mut usize,
 ) -> Result<()> {
     // Separate clause types for ordering: bindings first, then traversals, then filters
     let mut bindings = Vec::new();
@@ -220,8 +223,12 @@ fn lower_clauses(
         };
 
         if bound_vars.contains(&traversal.src) && bound_vars.contains(&traversal.dst) {
-            // Cycle closing: emit expand to a temp var, then filter temp.id = dst.id
-            let temp_var = format!("__temp_{}", traversal.dst);
+            // Cycle closing / fan-in: emit expand to a fresh temp var, then filter temp.id = dst.id.
+            // The counter keeps the temp var unique across multiple traversals that target the
+            // same already-bound destination (e.g. `$a aToB $b` + `$c cToB $b`), and across
+            // nested AntiJoin pipelines whose schemas merge with the outer.
+            let temp_var = format!("__temp_{}_{}", traversal.dst, *temp_counter);
+            *temp_counter += 1;
             pipeline.push(IROp::Expand {
                 src_var: traversal.src.clone(),
                 dst_var: temp_var.clone(),
@@ -304,6 +311,7 @@ fn lower_clauses(
             &mut inner_pipeline,
             &mut inner_bound,
             param_names,
+            temp_counter,
         )?;
 
         pipeline.push(IROp::AntiJoin {
