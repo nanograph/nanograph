@@ -14,7 +14,8 @@
   - GitHub Release creation on Blacksmith Linux
   - Homebrew tap update dispatch on Blacksmith Linux
 - `Publish Crates` runs on tag pushes (and supports `workflow_dispatch` for manual / dry-run triggers) via [publish-crates.yml](/Users/andrew/code/nanograph/.github/workflows/publish-crates.yml). It publishes `nanograph` first, waits for the crates.io index to surface the new version, then publishes `nanograph-cli`, `nanograph-ffi`, and `nanograph-ts`. Requires the `CARGO_REGISTRY_TOKEN` repo secret.
-- `Release` does **not** currently publish npm or update the external `nanograph-swift` repo. Those remain manual.
+- `Publish NPM` runs on tag pushes (and supports `workflow_dispatch` for manual / dry-run triggers) via [publish-npm.yml](/Users/andrew/code/nanograph/.github/workflows/publish-npm.yml). Matrix-builds `.node` binaries for all five supported targets (macOS arm64/x64, Linux x64/arm64, Windows x64), then publishes the bundled `nanograph-db` package to npm. Skips the publish step when the version is already on npm. Requires the `NPM_TOKEN` repo secret (a Granular Access Token scoped to publish `nanograph-db`).
+- The external `nanograph-swift` repo update is **not** automated. Pushing the release commit + binaryTarget URL/checksum bump remains manual.
 
 ## Pre-release
 
@@ -85,8 +86,22 @@ cargo publish -p nanograph-ts
 
 ### 3. npm
 
+Automated by the `Publish NPM` workflow on tag push. It matrix-builds the five platform `.node` binaries and publishes the bundled `nanograph-db` package. Already-published versions are skipped.
+
+To dry-run or re-trigger manually:
+
+```bash
+gh workflow run publish-npm.yml -f dry_run=true   # dry run (build + npm publish --dry-run)
+gh workflow run publish-npm.yml                   # real publish from current main
+```
+
+If you ever need to fall back to manual:
+
 ```bash
 cd crates/nanograph-ts
+# Build all five platform binaries first (or copy from release artifacts):
+#   napi build --platform --js index.js --release --target aarch64-apple-darwin
+#   ...repeat for each target...
 npm publish --otp=<code>
 ```
 
