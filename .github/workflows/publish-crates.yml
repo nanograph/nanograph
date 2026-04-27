@@ -71,9 +71,23 @@ jobs:
         id: check
         run: |
           version="${{ steps.version.outputs.version }}"
+          # Use the sparse index (what cargo itself reads) instead of the
+          # crates.io HTTP API. The HTTP API rejects requests without a
+          # User-Agent header from cloud IPs (returns 403), while the sparse
+          # index is CDN-served and has no such restriction.
+          index_path() {
+            local c="$1"
+            case ${#c} in
+              1) echo "1/$c" ;;
+              2) echo "2/$c" ;;
+              3) echo "3/${c:0:1}/$c" ;;
+              *) echo "${c:0:2}/${c:2:2}/$c" ;;
+            esac
+          }
           for crate in nanograph nanograph-cli nanograph-ffi nanograph-ts; do
             key=$(echo "$crate" | tr - _)
-            if curl -fsS "https://crates.io/api/v1/crates/$crate/$version" >/dev/null 2>&1; then
+            url="https://index.crates.io/$(index_path "$crate")"
+            if curl -fsS "$url" 2>/dev/null | grep -q "\"vers\":\"$version\""; then
               echo "${key}=true" >> "$GITHUB_OUTPUT"
               echo "$crate $version is already on crates.io — will skip"
             else
@@ -101,10 +115,11 @@ jobs:
         if: github.event.inputs.dry_run != 'true'
         run: |
           version="${{ steps.version.outputs.version }}"
-          # crates.io index propagation can take 10+ minutes after publish.
+          # Sparse-index URL — same rationale as the check step above.
           # 240 × 5s = 20 min budget; exits early once visible.
           for i in $(seq 1 240); do
-            if curl -fsS "https://crates.io/api/v1/crates/nanograph/$version" >/dev/null 2>&1; then
+            if curl -fsS "https://index.crates.io/na/no/nanograph" 2>/dev/null \
+                | grep -q "\"vers\":\"$version\""; then
               echo "nanograph $version visible on crates.io"
               exit 0
             fi
