@@ -1,0 +1,193 @@
+name: Publish NPM
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run npm publish with --dry-run (no upload)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NODE_VERSION: '20'
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-arm64
+            runner: macos-14
+            target: aarch64-apple-darwin
+            binary: nanograph.darwin-arm64.node
+          - name: darwin-x64
+            runner: macos-13
+            target: x86_64-apple-darwin
+            binary: nanograph.darwin-x64.node
+          - name: linux-x64-gnu
+            runner: blacksmith-2vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-gnu
+            binary: nanograph.linux-x64-gnu.node
+          - name: linux-arm64-gnu
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            binary: nanograph.linux-arm64-gnu.node
+          - name: win32-x64-msvc
+            runner: windows-2022
+            target: x86_64-pc-windows-msvc
+            binary: nanograph.win32-x64-msvc.node
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          version: '27.x'
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --target ${{ matrix.target }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: npm-${{ matrix.target }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: npm-${{ matrix.target }}-
+
+      - name: Install npm deps
+        working-directory: crates/nanograph-ts
+        run: npm install
+
+      - name: Build .node binary
+        working-directory: crates/nanograph-ts
+        run: npx napi build --platform --js index.js --release --target ${{ matrix.target }}
+
+      - name: Verify binary exists
+        working-directory: crates/nanograph-ts
+        shell: bash
+        run: |
+          if [ ! -f "${{ matrix.binary }}" ]; then
+            echo "::error::Expected ${{ matrix.binary }} to exist after build"
+            ls -la *.node || true
+            exit 1
+          fi
+          ls -la "${{ matrix.binary }}"
+
+      - name: Upload .node artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.binary }}
+          path: crates/nanograph-ts/${{ matrix.binary }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Resolve package version
+        id: version
+        working-directory: crates/nanograph-ts
+        run: |
+          version=$(node -p "require('./package.json').version")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Publishing nanograph-db@$version"
+
+      - name: Verify version matches tag
+        if: github.event_name == 'push'
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          expected="${{ steps.version.outputs.version }}"
+          if [ "$tag" != "$expected" ]; then
+            echo "::error::tag $tag does not match package.json version $expected"
+            exit 1
+          fi
+
+      - name: Check if version already published
+        id: check
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          # registry.npmjs.org doesn't have the UA-block issue api.crates.io
+          # has, so a plain GET works. 200 = exists, 404 = not yet published.
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://registry.npmjs.org/nanograph-db/$version")
+          if [ "$status" = "200" ]; then
+            echo "already_published=true" >> "$GITHUB_OUTPUT"
+            echo "nanograph-db $version is already on npm — will skip publish"
+          elif [ "$status" = "404" ]; then
+            echo "already_published=false" >> "$GITHUB_OUTPUT"
+            echo "nanograph-db $version is not yet on npm — will publish"
+          else
+            echo "::error::Unexpected HTTP status $status from npm registry check"
+            exit 1
+          fi
+
+      - name: Download all .node artifacts
+        if: steps.check.outputs.already_published != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          path: crates/nanograph-ts
+          merge-multiple: true
+
+      - name: Verify all 5 platform binaries are present
+        if: steps.check.outputs.already_published != 'true'
+        working-directory: crates/nanograph-ts
+        run: |
+          missing=0
+          for binary in \
+            nanograph.darwin-arm64.node \
+            nanograph.darwin-x64.node \
+            nanograph.linux-x64-gnu.node \
+            nanograph.linux-arm64-gnu.node \
+            nanograph.win32-x64-msvc.node; do
+            if [ ! -f "$binary" ]; then
+              echo "::error::missing $binary"
+              missing=$((missing + 1))
+            else
+              echo "found $binary ($(stat -c%s "$binary") bytes)"
+            fi
+          done
+          if [ $missing -gt 0 ]; then
+            exit 1
+          fi
+
+      - name: Set publish flags
+        id: flags
+        run: |
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "args=--dry-run" >> "$GITHUB_OUTPUT"
+          else
+            echo "args=" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish to npm
+        if: steps.check.outputs.already_published != 'true'
+        working-directory: crates/nanograph-ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public ${{ steps.flags.outputs.args }}
