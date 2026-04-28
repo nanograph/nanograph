@@ -28,7 +28,7 @@ jobs:
             target: aarch64-apple-darwin
             binary: nanograph.darwin-arm64.node
           - name: darwin-x64
-            runner: macos-13
+            runner: macos-14
             target: x86_64-apple-darwin
             binary: nanograph.darwin-x64.node
           - name: linux-x64-gnu
@@ -73,7 +73,13 @@ jobs:
 
       - name: Install npm deps
         working-directory: crates/nanograph-ts
-        run: npm install
+        # --ignore-scripts skips the package's own `install` lifecycle hook
+        # (scripts/install.cjs), which is meant for end-user installs and
+        # tries to rebuild the .node when a bundled binary is missing — its
+        # Windows fallback path is broken (execFileSync of `napi.cmd` returns
+        # EINVAL) and its Linux/macOS path would do redundant work since we
+        # build explicitly in the next step.
+        run: npm install --ignore-scripts
 
       - name: Build .node binary
         working-directory: crates/nanograph-ts
