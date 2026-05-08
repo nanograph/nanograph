@@ -1,260 +1,276 @@
-// Codebase Agent Workspace — NanoGraph Queries
-// Demonstrates: file lookup, import traversal, blast radius,
-//               conflict detection, review routing, semantic search,
-//               hybrid search, aggregation, negation, date filtering,
-//               decision traces, task management, mutations
+// Codebase Agent Workspace - Planning queries for AI agents
+// Inspired by beads (https://github.com/gastownhall/beads).
+//
+// Workflow: ready -> claim_issue -> work -> close_issue
+//           similar_issues before create to dedupe
+//           blockers / blocking_chain when stuck
+//           decisions_for to surface prior rationale
+//
+// Issues, Decisions, and Events use `slug` as their @key property.
+// Convention: beads-style slugs like "ng-a1b2" for Issues, "dec-xxx" for
+// Decisions, "ev-xxx" for Events.
 
 // ═══════════════════════════════════════════════════════════════
-// FILE OPERATIONS — What agents call instead of filesystem I/O
+// WORKFLOW - the headline queries
 // ═══════════════════════════════════════════════════════════════
 
-query read_file($path: String)
-  @description("Read a file by path. Equivalent to agent 'read' tool call.")
-{
-    match { $f: File { path: $path } }
-    return { $f.slug, $f.path, $f.language, $f.content, $f.hash }
-}
-
-query list_files($mod: String)
-  @description("List all files in a module.")
+query ready()
+    @description("Open issues with no open blockers. The headline query.")
+    @instruction("Run this to find what to work on next. Ordered by priority (0=critical first).")
 {
     match {
-        $m: Module { slug: $mod }
-        $m contains $f
+        $i: Issue { status: "open" }
+        not {
+            $b blocks $i
+            $b.status != "closed"
+        }
     }
-    return { $f.slug, $f.path, $f.language, $f.size }
-    order { $f.path }
+    return { $i.slug, $i.title, $i.type, $i.priority }
+    order { $i.priority }
 }
 
-// ── Search: keyword, semantic, hybrid ───────────────────────────
-
-query keyword_search_files($q: String)
-  @description("Find files whose descriptions contain the query tokens.")
-  @instruction("Use for exact term lookup across file descriptions.")
-{
-    match {
-        $f: File
-        search($f.description, $q)
-    }
-    return { $f.slug, $f.path, $f.language }
-    order { $f.path }
-}
-
-query semantic_search_files($q: String)
-  @description("Rank files by semantic similarity against their descriptions.")
-  @instruction("Use for broad conceptual search: 'where is the auth code?' or 'find the rate limiter'.")
-{
-    match { $f: File }
-    return { $f.slug, $f.path, $f.language, $f.description, nearest($f.descriptionEmbedding, $q) as score }
-    order { nearest($f.descriptionEmbedding, $q) }
-    limit 10
-}
-
-query hybrid_search_files($q: String)
-  @description("Blend semantic and lexical ranking across file descriptions.")
-  @instruction("Use when both exact wording and broader meaning matter.")
-{
-    match { $f: File }
-    return {
-        $f.slug
-        $f.path
-        $f.language
-        nearest($f.descriptionEmbedding, $q) as semantic_distance
-        bm25($f.description, $q) as lexical_score
-        rrf(nearest($f.descriptionEmbedding, $q), bm25($f.description, $q)) as hybrid_score
-    }
-    order { rrf(nearest($f.descriptionEmbedding, $q), bm25($f.description, $q)) desc }
-    limit 10
-}
-
-query search_modules($q: String)
-  @description("Semantic search across module descriptions.")
-{
-    match { $m: Module }
-    return { $m.slug, $m.name, $m.path, $m.description, nearest($m.descriptionEmbedding, $q) as score }
-    order { nearest($m.descriptionEmbedding, $q) }
-    limit 5
-}
-
-// ═══════════════════════════════════════════════════════════════
-// IMPORT GRAPH — Blast radius and dependency analysis
-// ═══════════════════════════════════════════════════════════════
-
-query file_dependencies($path: String)
-  @description("What does this file import?")
-{
-    match {
-        $f: File { path: $path }
-        $f imports $dep
-    }
-    return { $f.path as file, $dep.path as imports, $dep.language }
-}
-
-query file_dependents($path: String)
-  @description("What files import this file? The blast radius of a change.")
-  @instruction("Run this before modifying any file to understand impact.")
-{
-    match {
-        $f: File { path: $path }
-        $dependent imports $f
-    }
-    return { $f.path as file, $dependent.path as imported_by, $dependent.language }
-}
-
-query import_chain($path: String)
-  @description("Files that import this file, and files that import those.")
-{
-    match {
-        $f: File { path: $path }
-        $d1 imports $f
-        $d2 imports $d1
-    }
-    return { $f.path as source, $d1.path as direct_dependent, $d2.path as transitive_dependent }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// TASK & AGENT MANAGEMENT
-// ═══════════════════════════════════════════════════════════════
-
-query agent_tasks($agent: String)
-  @description("All tasks assigned to an agent.")
+query my_queue($agent: String)
+    @description("Ready issues assigned to this agent.")
+    @instruction("Use after ready() to filter to what is already on your plate.")
 {
     match {
         $a: Agent { slug: $agent }
-        $a assigned $t
+        $a assigned $i
+        $i.status = "open"
+        not {
+            $b blocks $i
+            $b.status != "closed"
+        }
     }
-    return { $t.slug, $t.title, $t.status, $t.branch, $t.priority }
-    order { $t.priority }
-}
-
-query task_files($task: String)
-  @description("All files a task modifies on its branch.")
-{
-    match {
-        $t: Task { slug: $task }
-        $t modifies $f
-    }
-    return { $t.title, $f.path, $f.language }
-    order { $f.path }
-}
-
-query task_detail($task: String)
-  @description("Full task view: agent, files modified, and reviews.")
-{
-    match {
-        $t: Task { slug: $task }
-        $a assigned $t
-        $t modifies $f
-    }
-    return { $t.title, $t.status, $t.branch, $a.name as agent, $f.path as file }
+    return { $i.slug, $i.title, $i.priority, $i.type }
+    order { $i.priority }
 }
 
 query active_work()
-  @description("All in-progress tasks with their agents and branches.")
+    @description("All in-progress issues with their claimant.")
 {
     match {
-        $t: Task { status: "in_progress" }
-        $a assigned $t
+        $i: Issue { status: "in_progress" }
+        $a assigned $i
     }
-    return { $a.name as agent, $t.title, $t.branch, $t.priority }
-    order { $t.priority }
-}
-
-query open_tasks()
-  @description("Tasks not yet started.")
-{
-    match { $t: Task { status: "open" } }
-    return { $t.slug, $t.title, $t.priority, $t.description }
-    order { $t.priority }
-}
-
-query search_tasks($q: String)
-  @description("Semantic search across task descriptions.")
-  @instruction("Use to find tasks related to a concept: 'anything about rate limiting?'")
-{
-    match { $t: Task }
-    return { $t.slug, $t.title, $t.status, nearest($t.descriptionEmbedding, $q) as score }
-    order { nearest($t.descriptionEmbedding, $q) }
-    limit 5
+    return { $a.name as agent, $i.slug, $i.title, $i.priority, $i.claimedAt }
+    order { $i.priority }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// CONFLICT DETECTION — Do any active tasks overlap?
+// DEPENDENCY GRAPH
 // ═══════════════════════════════════════════════════════════════
 
-query file_conflicts($task: String)
-  @description("Find other tasks that modify the same files as this task.")
-  @instruction("Run before merging. If results are non-empty, coordinate with the other task's agent.")
+query blockers($slug: String)
+    @description("Open issues directly blocking this one.")
 {
     match {
-        $t: Task { slug: $task }
-        $t modifies $f
-        $other modifies $f
+        $i: Issue { slug: $slug }
+        $b blocks $i
+        $b.status != "closed"
     }
-    return { $t.title as this_task, $other.slug as conflicting_task, $other.title as conflicting_title, $f.path as contested_file }
+    return { $b.slug, $b.title, $b.status, $b.priority }
+    order { $b.priority }
 }
 
-query import_conflicts($task: String)
-  @description("Find tasks that modify files imported by files this task modifies.")
-  @instruction("Subtler than direct conflicts: another task changed a dependency of your code.")
+query blocking_chain($slug: String)
+    @description("Two-hop transitive blockers. Use when direct blockers are themselves blocked.")
 {
     match {
-        $t: Task { slug: $task }
-        $t modifies $f
-        $f imports $dep
-        $other modifies $dep
+        $i: Issue { slug: $slug }
+        $b1 blocks $i
+        $b2 blocks $b1
     }
-    return { $t.title as this_task, $f.path as your_file, $dep.path as dependency, $other.title as other_task }
+    return { $i.slug as target, $b1.slug as direct, $b2.slug as transitive }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// REVIEW ROUTING — Who should review this?
-// ═══════════════════════════════════════════════════════════════
-
-query review_candidates($task: String)
-  @description("Find agents with expertise in modules containing files this task modifies.")
-  @instruction("Use to auto-assign reviewers. Prefer agents not assigned to the task itself.")
+query blocked_by_me($slug: String)
+    @description("Issues that this one is blocking. Closing this unblocks them.")
 {
     match {
-        $t: Task { slug: $task }
-        $t modifies $f
-        $m contains $f
-        $expert expert $m
+        $i: Issue { slug: $slug }
+        $i blocks $blocked
     }
-    return { $t.title, $f.path as file, $m.name as module, $expert.name as reviewer }
+    return { $blocked.slug, $blocked.title, $blocked.status, $blocked.priority }
+    order { $blocked.priority }
 }
 
-query task_constraints($task: String)
-  @description("All constraints that apply to files this task modifies.")
-  @instruction("All constraints with severity=error must pass before merge.")
+query related_to($slug: String)
+    @description("Soft-relationship neighbors.")
 {
     match {
-        $t: Task { slug: $task }
-        $t modifies $f
-        $c governs $f
+        $i: Issue { slug: $slug }
+        $i relatesTo $r
     }
-    return { $t.title, $f.path, $c.name as constraint, $c.kind, $c.severity, $c.rule }
-}
-
-query task_reviews($task: String)
-  @description("All reviews on a task.")
-{
-    match {
-        $r: Review
-        $r reviews $t
-        $t: Task { slug: $task }
-        $r reviewedBy $a
-    }
-    return { $t.title, $r.outcome, $r.comment, $a.name as reviewer, $r.createdAt }
+    return { $r.slug, $r.title, $r.status, $r.type }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// DECISIONS — Organizational memory
+// ISSUE DETAIL & LISTING
+// ═══════════════════════════════════════════════════════════════
+
+query issue_detail($slug: String)
+    @description("Full context for one issue: assignee and scoped module.")
+{
+    match {
+        $i: Issue { slug: $slug }
+        $a assigned $i
+        $i scopes $m
+    }
+    return {
+        $i.slug, $i.title, $i.status, $i.type, $i.priority,
+        $i.description, $i.acceptance, $i.design,
+        $a.name as assignee, $m.name as module
+    }
+}
+
+query open_issues()
+    @description("All open issues regardless of blocker state.")
+{
+    match { $i: Issue { status: "open" } }
+    return { $i.slug, $i.title, $i.type, $i.priority }
+    order { $i.priority }
+}
+
+query unassigned_open()
+    @description("Open issues with no agent assigned.")
+{
+    match {
+        $i: Issue { status: "open" }
+        not { $_ assigned $i }
+    }
+    return { $i.slug, $i.title, $i.priority, $i.type }
+    order { $i.priority }
+}
+
+query agent_issues($agent: String)
+    @description("All issues assigned to this agent, any status.")
+{
+    match {
+        $a: Agent { slug: $agent }
+        $a assigned $i
+    }
+    return { $i.slug, $i.title, $i.status, $i.priority }
+    order { $i.priority }
+}
+
+query recent_issues($since: DateTime)
+    @description("Issues created after a given date.")
+{
+    match {
+        $i: Issue
+        $i.createdAt >= $since
+    }
+    return { $i.slug, $i.title, $i.type, $i.status, $i.createdAt }
+    order { $i.createdAt desc }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SEARCH - semantic, lexical, hybrid
+// ═══════════════════════════════════════════════════════════════
+
+query search_issues($q: String)
+    @description("Semantic search across issue descriptions.")
+    @instruction("Use for conceptual queries: 'anything about rate limiting?'")
+{
+    match { $i: Issue }
+    return { $i.slug, $i.title, $i.status, nearest($i.descriptionEmbedding, $q) as score }
+    order { nearest($i.descriptionEmbedding, $q) }
+    limit 10
+}
+
+query keyword_search_issues($q: String)
+    @description("Token-based keyword search in issue descriptions.")
+{
+    match {
+        $i: Issue
+        search($i.description, $q)
+    }
+    return { $i.slug, $i.title, $i.status, $i.priority }
+    order { $i.priority }
+}
+
+query similar_issues($q: String)
+    @description("Hybrid dedup: have we already seen this bug or feature?")
+    @instruction("Run before creating a new issue to avoid duplicates. Uses rrf over semantic + lexical rankings.")
+{
+    match { $i: Issue }
+    return {
+        $i.slug
+        $i.title
+        $i.status
+        nearest($i.descriptionEmbedding, $q) as semantic_distance
+        bm25($i.description, $q) as lexical_score
+        rrf(nearest($i.descriptionEmbedding, $q), bm25($i.description, $q)) as hybrid_score
+    }
+    order { rrf(nearest($i.descriptionEmbedding, $q), bm25($i.description, $q)) desc }
+    limit 10
+}
+
+// ═══════════════════════════════════════════════════════════════
+// EPIC HIERARCHY
+// ═══════════════════════════════════════════════════════════════
+
+query epic_tree($epic: String)
+    @description("All children of an epic.")
+{
+    match {
+        $e: Issue { slug: $epic }
+        $e parentOf $child
+    }
+    return { $e.title as epic, $child.slug, $child.title, $child.status, $child.priority }
+    order { $child.priority }
+}
+
+query epic_progress($epic: String)
+    @description("Child count for an epic.")
+    @instruction("Count of all children. To see how many are closed, use epic_tree and filter client-side.")
+{
+    match {
+        $e: Issue { slug: $epic }
+        $e parentOf $child
+    }
+    return {
+        $e.slug
+        $e.title
+        count($child) as children
+    }
+}
+
+query open_epics()
+    @description("All epics not yet closed.")
+{
+    match {
+        $e: Issue { type: "epic" }
+        $e.status != "closed"
+    }
+    return { $e.slug, $e.title, $e.priority, $e.status }
+    order { $e.priority }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MESSAGES - threaded agent-to-agent communication
+// ═══════════════════════════════════════════════════════════════
+
+query thread($root: String)
+    @description("All replies in a message thread.")
+{
+    match {
+        $reply: Issue { type: "message" }
+        $reply repliesTo $root_msg
+        $root_msg: Issue { slug: $root }
+    }
+    return { $reply.slug, $reply.title, $reply.description, $reply.createdAt }
+    order { $reply.createdAt }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DECISIONS - organizational memory
 // ═══════════════════════════════════════════════════════════════
 
 query search_decisions($q: String)
-  @description("Semantic search across past decisions.")
-  @instruction("Use when an agent asks 'why was this done this way?' or 'has anyone decided on X before?'")
+    @description("Semantic search across past decisions.")
+    @instruction("Use when asking 'why did we do this?' or 'has anyone decided on X?'")
 {
     match { $d: Decision }
     return { $d.slug, $d.summary, $d.reasoning, nearest($d.reasoningEmbedding, $q) as score }
@@ -263,8 +279,7 @@ query search_decisions($q: String)
 }
 
 query keyword_search_decisions($q: String)
-  @description("Find decisions whose reasoning contains the query tokens.")
-  @instruction("Use for exact term lookup in decision history.")
+    @description("Keyword search in decision reasoning.")
 {
     match {
         $d: Decision
@@ -274,37 +289,35 @@ query keyword_search_decisions($q: String)
     order { $d.decidedAt desc }
 }
 
-query file_decisions($path: String)
-  @description("All decisions that affect a specific file.")
+query decisions_for($slug: String)
+    @description("Decisions linked to a specific issue.")
 {
     match {
-        $f: File { path: $path }
-        $d decides $f
-        $d madeBy $a
+        $i: Issue { slug: $slug }
+        $d explains $i
     }
-    return { $d.summary, $d.reasoning, $a.name as decided_by, $d.decidedAt }
+    return { $d.slug, $d.summary, $d.reasoning, $d.decidedAt }
     order { $d.decidedAt desc }
 }
 
-query decision_trace($task: String)
-  @description("Decisions linked to files modified by a task.")
-  @instruction("Use before starting work to understand prior design choices in the area.")
+// ═══════════════════════════════════════════════════════════════
+// MODULES - grouping and review routing
+// ═══════════════════════════════════════════════════════════════
+
+query issues_in_module($mod: String)
+    @description("All open issues scoped to a module.")
 {
     match {
-        $t: Task { slug: $task }
-        $t modifies $f
-        $d decides $f
-        $d madeBy $a
+        $m: Module { slug: $mod }
+        $i scopes $m
+        $i.status != "closed"
     }
-    return { $t.title, $f.path, $d.summary, $a.name as decided_by }
+    return { $i.slug, $i.title, $i.status, $i.priority }
+    order { $i.priority }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// AGENT EXPERTISE
-// ═══════════════════════════════════════════════════════════════
-
 query module_experts($mod: String)
-  @description("Who knows this module?")
+    @description("Agents who know this area.")
 {
     match {
         $m: Module { slug: $mod }
@@ -313,205 +326,185 @@ query module_experts($mod: String)
     return { $m.name as module, $a.name as expert, $a.kind }
 }
 
-query agent_expertise($agent: String)
-  @description("What modules does this agent know?")
+query review_candidates($slug: String)
+    @description("Agents expert in the module an issue is scoped to.")
+    @instruction("Use to auto-assign reviewers. Prefer agents not already on the issue.")
 {
     match {
-        $a: Agent { slug: $agent }
+        $i: Issue { slug: $slug }
+        $i scopes $m
         $a expert $m
     }
-    return { $a.name, $m.name as module, $m.path }
+    return { $i.title, $m.name as module, $a.name as reviewer }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// AGGREGATION
-// ═══════════════════════════════════════════════════════════════
+query search_modules($q: String)
+    @description("Semantic search to find the right module for an issue.")
+{
+    match { $m: Module }
+    return { $m.slug, $m.name, $m.description, nearest($m.descriptionEmbedding, $q) as score }
+    order { nearest($m.descriptionEmbedding, $q) }
+    limit 5
+}
 
-query files_per_module()
-  @description("Count of files in each module.")
+query module_backlog()
+    @description("Open issue count per module.")
 {
     match {
         $m: Module
-        $m contains $f
+        $i scopes $m
+        $i.status = "open"
     }
     return {
         $m.name
-        count($f) as files
+        count($i) as open_issues
     }
-    order { files desc }
-}
-
-query tasks_per_agent()
-  @description("Count of tasks assigned to each agent.")
-{
-    match {
-        $a: Agent
-        $a assigned $t
-    }
-    return {
-        $a.name
-        count($t) as tasks
-    }
-    order { tasks desc }
-}
-
-query most_imported()
-  @description("Files ranked by how many other files import them.")
-{
-    match {
-        $dep: File
-        $f imports $dep
-    }
-    return {
-        $dep.path
-        count($f) as importers
-    }
-    order { importers desc }
-    limit 5
-}
-
-query most_constrained()
-  @description("Files with the most constraints applied.")
-{
-    match {
-        $f: File
-        $c governs $f
-    }
-    return {
-        $f.path
-        count($c) as constraints
-    }
-    order { constraints desc }
-    limit 5
+    order { open_issues desc }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// NEGATION — Find gaps
+// CONSTRAINTS - what must pass before close
 // ═══════════════════════════════════════════════════════════════
 
-query ungoverned_files()
-  @description("Files with no constraints applied.")
-  @instruction("These files have no lint, typecheck, test, or security rules. Consider adding constraints.")
+query issue_constraints($slug: String)
+    @description("Constraints directly required by this issue (not counting module-inherited).")
 {
     match {
-        $f: File
-        not { $_ governs $f }
+        $i: Issue { slug: $slug }
+        $i requires $c
     }
-    return { $f.path, $f.language }
-    order { $f.path }
+    return { $i.title, $c.name, $c.kind, $c.severity, $c.rule }
 }
 
-query unassigned_tasks()
-  @description("Tasks with no agent assigned.")
+query module_constraints($mod: String)
+    @description("Constraints that apply to every issue in a module.")
 {
     match {
-        $t: Task
-        not { $_ assigned $t }
+        $m: Module { slug: $mod }
+        $c appliesTo $m
     }
-    return { $t.slug, $t.title, $t.status, $t.priority }
-}
-
-query orphan_files()
-  @description("Files not contained in any module.")
-{
-    match {
-        $f: File
-        not { $_ contains $f }
-    }
-    return { $f.path, $f.language }
-}
-
-// ═══════════════════════════════════════════════════════════════
-// FILTERING — DateTime, Enum
-// ═══════════════════════════════════════════════════════════════
-
-query recent_tasks($since: DateTime)
-  @description("Tasks created after a given date.")
-{
-    match {
-        $t: Task
-        $t.createdAt >= $since
-    }
-    return { $t.slug, $t.title, $t.status, $t.priority, $t.createdAt }
-    order { $t.createdAt desc }
-}
-
-query recent_decisions($since: DateTime)
-  @description("Decisions made after a given date.")
-{
-    match {
-        $d: Decision
-        $d.decidedAt >= $since
-    }
-    return { $d.slug, $d.summary, $d.decidedAt }
-    order { $d.decidedAt desc }
+    return { $m.name as module, $c.name, $c.kind, $c.severity }
 }
 
 query error_constraints()
-  @description("All constraints with severity = error.")
+    @description("All constraints with severity=error - hard blockers to close.")
 {
     match {
         $c: Constraint
         $c.severity = "error"
     }
     return { $c.slug, $c.name, $c.kind, $c.rule }
+    order { $c.kind }
 }
 
-// ═══════════════════════════════════════════════════════════════
-// MUTATIONS
-// ═══════════════════════════════════════════════════════════════
-
-query write_file($slug: String, $path: String, $language: String, $content: String, $description: String, $size: I32, $hash: String) {
-    insert File {
-        slug: $slug,
-        path: $path,
-        language: $language,
-        content: $content,
-        description: $description,
-        size: $size,
-        hash: $hash,
-        createdAt: now(),
-        updatedAt: now()
+query unconstrained_issues()
+    @description("Open issues with no Requires edge. Candidates for gating.")
+{
+    match {
+        $i: Issue
+        $i.status = "open"
+        not { $i requires $_ }
     }
+    return { $i.slug, $i.title, $i.priority }
 }
 
-query update_file_content($path: String, $content: String, $size: I32, $hash: String) {
-    update File set {
-        content: $content,
-        size: $size,
-        hash: $hash,
-        updatedAt: now()
-    } where path = $path
+// ═══════════════════════════════════════════════════════════════
+// AUDIT TRAIL
+// ═══════════════════════════════════════════════════════════════
+
+query recent_events($slug: String)
+    @description("Audit trail for one issue, newest first.")
+{
+    match {
+        $e: Event
+        $e records $i
+        $i: Issue { slug: $slug }
+    }
+    return { $e.kind, $e.actor, $e.at, $e.payload }
+    order { $e.at desc }
 }
 
-query delete_file($path: String) {
-    delete File where path = $path
+query agent_activity($agent: String, $since: DateTime)
+    @description("What this agent did since a given timestamp.")
+{
+    match {
+        $e: Event
+        $e.actor = $agent
+        $e.at >= $since
+    }
+    return { $e.at, $e.kind, $e.issueSlug, $e.payload }
+    order { $e.at desc }
 }
 
-query create_task($slug: String, $title: String, $description: String, $branch: String, $priority: String) {
-    insert Task {
+// ═══════════════════════════════════════════════════════════════
+// MUTATIONS - issue lifecycle
+// ═══════════════════════════════════════════════════════════════
+
+query create_issue($slug: String, $title: String, $description: String, $type: String, $priority: I32) {
+    insert Issue {
         slug: $slug,
         title: $title,
         description: $description,
         status: "open",
-        branch: $branch,
+        type: $type,
         priority: $priority,
         createdAt: now(),
         updatedAt: now()
     }
 }
 
-query start_task($slug: String) {
-    update Task set { status: "in_progress", updatedAt: now() } where slug = $slug
+query update_issue($slug: String, $description: String, $design: String, $notes: String, $acceptance: String) {
+    update Issue set {
+        description: $description,
+        design: $design,
+        notes: $notes,
+        acceptance: $acceptance,
+        updatedAt: now()
+    } where slug = $slug
+}
+
+query claim_issue($slug: String, $agent: String) {
+    update Issue set {
+        status: "in_progress",
+        claimedBy: $agent,
+        claimedAt: now(),
+        updatedAt: now()
+    } where slug = $slug
+}
+
+query release_issue($slug: String) {
+    update Issue set {
+        status: "open",
+        updatedAt: now()
+    } where slug = $slug
 }
 
 query submit_for_review($slug: String) {
-    update Task set { status: "in_review", updatedAt: now() } where slug = $slug
+    update Issue set {
+        status: "in_review",
+        updatedAt: now()
+    } where slug = $slug
 }
 
-query merge_task($slug: String) {
-    update Task set { status: "merged", updatedAt: now() } where slug = $slug
+query close_issue($slug: String, $reason: String) {
+    update Issue set {
+        status: "closed",
+        closedAt: now(),
+        closedReason: $reason,
+        updatedAt: now()
+    } where slug = $slug
 }
+
+query supersede_issue($slug: String) {
+    update Issue set {
+        status: "superseded",
+        updatedAt: now()
+    } where slug = $slug
+}
+
+// ═══════════════════════════════════════════════════════════════
+// MUTATIONS - edges and append-only nodes
+// ═══════════════════════════════════════════════════════════════
 
 query add_decision($slug: String, $summary: String, $reasoning: String) {
     insert Decision {
@@ -523,39 +516,65 @@ query add_decision($slug: String, $summary: String, $reasoning: String) {
     }
 }
 
-query add_review($slug: String, $outcome: String, $comment: String) {
-    insert Review {
+query record_event($slug: String, $issueSlug: String, $actor: String, $kind: String, $payload: String) {
+    insert Event {
         slug: $slug,
-        outcome: $outcome,
-        comment: $comment,
-        createdAt: now()
+        issueSlug: $issueSlug,
+        actor: $actor,
+        kind: $kind,
+        payload: $payload,
+        at: now()
     }
 }
 
-query add_import($from: String, $to: String, $kind: String) {
-    insert Imports { from: $from, to: $to, kind: $kind }
+query block_issue($blocker: String, $blocked: String) {
+    insert Blocks { from: $blocker, to: $blocked }
 }
 
-query assign_task($agent: String, $task: String) {
-    insert Assigned { from: $agent, to: $task }
+query relate_issues($a: String, $b: String) {
+    insert RelatesTo { from: $a, to: $b }
 }
 
-query record_modification($task: String, $file: String, $changeType: String) {
-    insert Modifies { from: $task, to: $file, changeType: $changeType }
+query duplicate_of($dup: String, $canonical: String) {
+    insert Duplicates { from: $dup, to: $canonical }
 }
 
-query link_decision_file($decision: String, $file: String) {
-    insert Decides { from: $decision, to: $file }
+query supersedes_edge($new: String, $old: String) {
+    insert Supersedes { from: $new, to: $old }
 }
 
-query link_decision_agent($decision: String, $agent: String) {
-    insert MadeBy { from: $decision, to: $agent }
+query parent_of($epic: String, $child: String) {
+    insert ParentOf { from: $epic, to: $child }
 }
 
-query link_review_task($review: String, $task: String) {
-    insert Reviews { from: $review, to: $task }
+query reply_to($reply: String, $root: String) {
+    insert RepliesTo { from: $reply, to: $root }
 }
 
-query link_review_agent($review: String, $agent: String) {
-    insert ReviewedBy { from: $review, to: $agent }
+query assign_issue($agent: String, $issue: String) {
+    insert Assigned { from: $agent, to: $issue }
+}
+
+query author_issue($agent: String, $issue: String) {
+    insert Authored { from: $agent, to: $issue }
+}
+
+query scope_issue($issue: String, $module: String) {
+    insert Scopes { from: $issue, to: $module }
+}
+
+query add_expert($agent: String, $module: String, $confidence: String) {
+    insert Expert { from: $agent, to: $module, confidence: $confidence }
+}
+
+query require_constraint($issue: String, $constraint: String) {
+    insert Requires { from: $issue, to: $constraint }
+}
+
+query apply_constraint($constraint: String, $module: String) {
+    insert AppliesTo { from: $constraint, to: $module }
+}
+
+query explain_issue($decision: String, $issue: String) {
+    insert Explains { from: $decision, to: $issue }
 }

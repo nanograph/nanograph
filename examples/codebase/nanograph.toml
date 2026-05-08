@@ -1,7 +1,7 @@
 [project]
 name = "Codebase Agent Workspace"
-description = "Multi-agent code collaboration graph. Files as nodes, imports as edges, agents on branches."
-instruction = "Run commands from this directory. Queries model agent tool calls: read, write, search, blast radius, conflict detection, review routing."
+description = "Persistent planning graph for AI agents. Issues, dependencies, decisions, and audit. Inspired by beads."
+instruction = "Run commands from this directory. Start with 'nanograph run ready' to see what to work on next. Use 'similar' before creating new issues to avoid duplicates. Use 'decisions_for' to surface prior rationale."
 
 [db]
 default_path = "codebase.nano"
@@ -20,64 +20,17 @@ chunk_overlap_chars = 200
 [cli]
 output_format = "table"
 
-# ── File operations (agent tool call equivalents) ──────────────
+# ── Workflow (the headline aliases) ────────────────────────────
 
-[query_aliases.read]
+[query_aliases.ready]
 query = "codebase.gq"
-name = "read_file"
-args = ["path"]
-format = "kv"
-
-[query_aliases.ls]
-query = "codebase.gq"
-name = "list_files"
-args = ["mod"]
+name = "ready"
 format = "table"
 
-[query_aliases.find]
+[query_aliases.queue]
 query = "codebase.gq"
-name = "semantic_search_files"
-args = ["q"]
-format = "table"
-
-[query_aliases.search]
-query = "codebase.gq"
-name = "hybrid_search_files"
-args = ["q"]
-format = "table"
-
-# ── Import graph ───────────────────────────────────────────────
-
-[query_aliases.deps]
-query = "codebase.gq"
-name = "file_dependencies"
-args = ["path"]
-format = "table"
-
-[query_aliases.dependents]
-query = "codebase.gq"
-name = "file_dependents"
-args = ["path"]
-format = "table"
-
-[query_aliases.blast]
-query = "codebase.gq"
-name = "import_chain"
-args = ["path"]
-format = "table"
-
-# ── Task management ───────────────────────────────────────────
-
-[query_aliases.tasks]
-query = "codebase.gq"
-name = "agent_tasks"
+name = "my_queue"
 args = ["agent"]
-format = "table"
-
-[query_aliases.files]
-query = "codebase.gq"
-name = "task_files"
-args = ["task"]
 format = "table"
 
 [query_aliases.active]
@@ -85,47 +38,92 @@ query = "codebase.gq"
 name = "active_work"
 format = "table"
 
+# ── Dependency graph ──────────────────────────────────────────
+
+[query_aliases.blockers]
+query = "codebase.gq"
+name = "blockers"
+args = ["slug"]
+format = "table"
+
+[query_aliases.chain]
+query = "codebase.gq"
+name = "blocking_chain"
+args = ["slug"]
+format = "table"
+
+[query_aliases.unblocks]
+query = "codebase.gq"
+name = "blocked_by_me"
+args = ["slug"]
+format = "table"
+
+# ── Issue detail & listing ────────────────────────────────────
+
 [query_aliases.detail]
 query = "codebase.gq"
-name = "task_detail"
-args = ["task"]
-format = "table"
+name = "issue_detail"
+args = ["slug"]
+format = "kv"
 
-# ── Conflict detection ────────────────────────────────────────
-
-[query_aliases.conflicts]
+[query_aliases.open]
 query = "codebase.gq"
-name = "file_conflicts"
-args = ["task"]
+name = "open_issues"
 format = "table"
 
-[query_aliases.dep-conflicts]
+[query_aliases.unassigned]
 query = "codebase.gq"
-name = "import_conflicts"
-args = ["task"]
+name = "unassigned_open"
 format = "table"
 
-# ── Review routing ─────────────────────────────────────────────
-
-[query_aliases.reviewers]
+[query_aliases.my]
 query = "codebase.gq"
-name = "review_candidates"
-args = ["task"]
+name = "agent_issues"
+args = ["agent"]
 format = "table"
 
-[query_aliases.checks]
+# ── Search ────────────────────────────────────────────────────
+
+[query_aliases.find]
 query = "codebase.gq"
-name = "task_constraints"
-args = ["task"]
+name = "search_issues"
+args = ["q"]
 format = "table"
 
-[query_aliases.reviews]
+[query_aliases.similar]
 query = "codebase.gq"
-name = "task_reviews"
-args = ["task"]
+name = "similar_issues"
+args = ["q"]
 format = "table"
 
-# ── Decisions ──────────────────────────────────────────────────
+# ── Epic hierarchy ────────────────────────────────────────────
+
+[query_aliases.tree]
+query = "codebase.gq"
+name = "epic_tree"
+args = ["epic"]
+format = "table"
+
+[query_aliases.progress]
+query = "codebase.gq"
+name = "epic_progress"
+args = ["epic"]
+format = "table"
+
+[query_aliases.epics]
+query = "codebase.gq"
+name = "open_epics"
+format = "table"
+
+# ── Messages ──────────────────────────────────────────────────
+
+[query_aliases.thread]
+query = "codebase.gq"
+name = "thread"
+args = ["root"]
+format = "table"
+
+# ── Decisions ─────────────────────────────────────────────────
 
 [query_aliases.why]
 query = "codebase.gq"
@@ -133,32 +131,75 @@ name = "search_decisions"
 args = ["q"]
 format = "kv"
 
-[query_aliases.history]
+[query_aliases.decisions]
 query = "codebase.gq"
-name = "file_decisions"
-args = ["path"]
+name = "decisions_for"
+args = ["slug"]
 format = "kv"
 
-# ── Aggregation ────────────────────────────────────────────────
+# ── Modules ───────────────────────────────────────────────────
 
-[query_aliases.stats]
+[query_aliases.mod]
 query = "codebase.gq"
-name = "files_per_module"
+name = "issues_in_module"
+args = ["mod"]
 format = "table"
 
-[query_aliases.hotspots]
+[query_aliases.experts]
 query = "codebase.gq"
-name = "most_imported"
+name = "module_experts"
+args = ["mod"]
 format = "table"
 
-# ── Gaps ───────────────────────────────────────────────────────
-
-[query_aliases.ungoverned]
+[query_aliases.reviewers]
 query = "codebase.gq"
-name = "ungoverned_files"
+name = "review_candidates"
+args = ["slug"]
 format = "table"
 
-[query_aliases.unassigned]
+[query_aliases.backlog]
 query = "codebase.gq"
-name = "unassigned_tasks"
+name = "module_backlog"
+format = "table"
+
+# ── Constraints ───────────────────────────────────────────────
+
+[query_aliases.checks]
+query = "codebase.gq"
+name = "issue_constraints"
+args = ["slug"]
+format = "table"
+
+[query_aliases.mod-checks]
+query = "codebase.gq"
+name = "module_constraints"
+args = ["mod"]
+format = "table"
+
+# ── Audit ─────────────────────────────────────────────────────
+
+[query_aliases.history]
+query = "codebase.gq"
+name = "recent_events"
+args = ["slug"]
+format = "table"
+
+# ── Mutations ─────────────────────────────────────────────────
+
+[query_aliases.claim]
+query = "codebase.gq"
+name = "claim_issue"
+args = ["slug", "agent"]
+format = "table"
+
+[query_aliases.close]
+query = "codebase.gq"
+name = "close_issue"
+args = ["slug", "reason"]
+format = "table"
+
+[query_aliases.review]
+query = "codebase.gq"
+name = "submit_for_review"
+args = ["slug"]
 format = "table"

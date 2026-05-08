@@ -1,185 +1,238 @@
 # Codebase Agent Workspace
 
-Multi-agent code collaboration graph. Models the "database as a git" paradigm where files are structured nodes, agents work on branches, and import relationships are first-class edges.
+Persistent planning graph for AI agents. Issues, dependencies, decisions, and audit trail. Inspired by [beads](https://github.com/gastownhall/beads).
 
-**Thesis:** Code is high-velocity data. Agent tool calls (read, write, grep) should be graph operations, not filesystem I/O. Conflict detection, blast radius analysis, and review routing become graph traversals.
+**Thesis:** Agents need persistent structured memory for long-horizon work. What's ready to work on, what's blocked, who decided what, what's been tried. This example models that memory as a typed property graph: issues as the primary entity, dependency edges for the plan, decisions as append-only organizational memory, and events as the audit trail.
+
+This is **not** a code store. Files, imports, and commits live in git. This graph is the layer above: the plan, the rationale, and the record.
 
 ## Files
 
 | File | Description |
 |------|-------------|
-| `codebase.pg` | Schema with mutable pointer nodes, append-only event nodes, and agent-facing metadata |
-| `codebase.gq` | Query suite: file ops, search (keyword/semantic/hybrid), import graph, conflict detection, review routing, aggregation, negation, filtering, mutations |
-| `codebase.jsonl` | Seed data: "Acme API" project with 3 agents, 15 files, 4 concurrent tasks |
+| `codebase.pg` | Schema: Issue, Agent, Decision, Event, Module, Constraint + dependency, scoping, and audit edges |
+| `codebase.gq` | 55 queries: ready, blockers, my_queue, similar_issues, claim_issue, decisions_for, etc. |
+| `codebase.jsonl` | Seed data: 18 issues across 2 epics, 4 decisions, 12 events, dependency chains |
+| `nanograph.toml` | Query aliases (`ready`, `queue`, `blockers`, `claim`, `similar`, `why`, ...) |
 
 ## Quick Start
 
 ```bash
-cd codebase
+cd examples/codebase
 
 nanograph init
 nanograph load --data codebase.jsonl --mode overwrite
 nanograph embed
-nanograph check --query codebase.gq
-nanograph run active
-nanograph run blast src/auth/jwt.ts
-nanograph run conflicts task-usage-alerts
-nanograph run why "token revocation"
-nanograph run why "token revocation" --format kv
+nanograph lint --query codebase.gq
+
+# The headline queries
+nanograph run ready
+nanograph run queue claude
+nanograph run blockers ng-rt03
+nanograph run similar "refresh token rotation"
+nanograph run why "rate limiter"
+
+# Full context
+nanograph run detail ng-rt02
+nanograph run decisions ng-rt02
+nanograph run history ng-rt02
 ```
 
-The checked-in `nanograph.toml` provides:
+## Data Model
 
-- `db.default_path = "codebase.nano"`
-- `query.roots = ["."]`
-- aliases like `read`, `find`, `search`, `blast`, `conflicts`, `reviewers`, `why`, `hotspots`
-- deterministic mock embeddings for description and reasoning fields
+Six node types, fourteen edge types.
 
-`nanograph run` supports `table` (default), `kv`, `csv`, `jsonl`, and `json`.
-- `kv` is the record-oriented human view
-- `json` wraps result rows with query metadata plus `rows`
+### Nodes
 
-See also:
+- **Issue** - the primary work unit. Tasks, bugs, features, epics, messages are all Issues with a `type` discriminator. Slug-keyed (`ng-a1b2` style).
+- **Agent** - human or AI that works on issues. Has capabilities.
+- **Decision** - append-only rationale with embedded reasoning for semantic search.
+- **Event** - append-only audit log; one record per state change.
+- **Module** - logical grouping (area, component, domain).
+- **Constraint** - rule that must pass before an issue can close.
 
-- [Search Guide](../../docs/user/search.md)
-- [Project Config](../../docs/user/config.md)
+### Edge groups
 
-## Schema Overview
+| Group | Edges |
+|-------|-------|
+| Dependency | `Blocks`, `RelatesTo`, `Duplicates`, `Supersedes`, `ParentOf`, `RepliesTo` |
+| People | `Assigned`, `Authored` |
+| Grouping & gating | `Scopes`, `Expert`, `Requires`, `AppliesTo` |
+| Knowledge & audit | `Explains`, `Records` |
 
-### Pointer Nodes (Mutable)
+## Headline Queries
 
-Updated in place. All carry `slug @key`, `createdAt`, `updatedAt`.
+### `ready` - the money query
 
-- **Module** — logical grouping of files (package, directory)
-- **File** — source file with full content, path, language, description
-- **Agent** — human or AI, with model and capabilities
-- **Task** — unit of work mapping 1:1 to a nanograph branch
-- **Constraint** — rule that must pass before merge (lint, typecheck, test, security)
+```
+query ready() {
+    match {
+        $i: Issue { status: "open" }
+        not {
+            $b blocks $i
+            $b.status != "closed"
+        }
+    }
+    return { $i.slug, $i.title, $i.type, $i.priority }
+    order { $i.priority }
+}
+```
 
-### Append-Only Nodes (Immutable)
+Returns open issues that are not blocked by any still-open issue. Ordered by priority. This is the first thing an agent asks on wake-up.
 
-Never overwritten. All carry `slug @key`, `createdAt` (no `updatedAt`).
+### `similar_issues` - dedupe before creating
 
-- **Decision** — why something was designed or changed a certain way
-- **Review** — verdict on a task branch (approved, changes_requested, blocked)
+```
+query similar_issues($q: String) {
+    match { $i: Issue }
+    return {
+        $i.slug, $i.title, $i.status
+        rrf(nearest($i.descriptionEmbedding, $q), bm25($i.description, $q)) as hybrid_score
+    }
+    order { rrf(nearest($i.descriptionEmbedding, $q), bm25($i.description, $q)) desc }
+    limit 10
+}
+```
 
-### Edge Types (11)
+Reciprocal rank fusion over semantic and lexical rankings. "Has anyone already filed this?"
 
-**Structure:** Contains (Module→File), Imports (File→File)
+### `blockers` and `blocking_chain`
 
-**Work:** Assigned (Agent→Task), Modifies (Task→File), Expert (Agent→Module), Governs (Constraint→File)
+```
+nanograph run blockers ng-rt03     # direct blockers
+nanograph run chain ng-rt03        # two-hop transitive
+nanograph run unblocks ng-rt02     # what closing this unblocks
+```
 
-**Collaboration:** Decides (Decision→File), MadeBy (Decision→Agent), Reviews (Review→Task), ReviewedBy (Review→Agent), References (Task→Task)
+### `decisions_for` - why did we do this?
+
+Traverses `Decision -> Explains -> Issue` to surface prior rationale. The `why` alias runs semantic search across all decisions.
+
+### `claim_issue` - lifecycle mutation
+
+```
+nanograph run claim ng-bug01 claude
+```
+
+Sets `status=in_progress`, `claimedBy=claude`, `claimedAt=now()`, `updatedAt=now()` atomically in a single mutation. See the gaps note below on multi-agent race safety.
 
 ## Query Catalog
 
-### File Operations
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `read_file` | `$path` | Read a file by path |
-| `list_files` | `$mod` | List all files in a module |
-| `keyword_search_files` | `$q` | Find files by keyword in descriptions |
-| `semantic_search_files` | `$q` | Rank files by semantic similarity |
-| `hybrid_search_files` | `$q` | Blend semantic and lexical ranking |
-| `search_modules` | `$q` | Semantic search across modules |
+### Workflow
+| Alias | Query | Args |
+|-------|-------|------|
+| `ready` | `ready` | - |
+| `queue` | `my_queue` | agent |
+| `active` | `active_work` | - |
 
-### Import Graph
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `file_dependencies` | `$path` | What does this file import? |
-| `file_dependents` | `$path` | What files import this file? (blast radius) |
-| `import_chain` | `$path` | Two-hop transitive dependents |
+### Dependency Graph
+| Alias | Query | Args |
+|-------|-------|------|
+| `blockers` | `blockers` | slug |
+| `chain` | `blocking_chain` | slug |
+| `unblocks` | `blocked_by_me` | slug |
 
-### Task & Agent Management
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `agent_tasks` | `$agent` | Tasks assigned to an agent |
-| `task_files` | `$task` | Files modified by a task |
-| `task_detail` | `$task` | Full task view: agent, files, branch |
-| `active_work` | — | All in-progress tasks with agents |
-| `open_tasks` | — | Tasks not yet started |
-| `search_tasks` | `$q` | Semantic search across task descriptions |
+### Issue Detail & Listing
+| Alias | Query | Args |
+|-------|-------|------|
+| `detail` | `issue_detail` | slug |
+| `open` | `open_issues` | - |
+| `unassigned` | `unassigned_open` | - |
+| `my` | `agent_issues` | agent |
 
-### Conflict Detection
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `file_conflicts` | `$task` | Other tasks modifying the same files |
-| `import_conflicts` | `$task` | Tasks modifying dependencies of your files |
+### Search
+| Alias | Query | Args |
+|-------|-------|------|
+| `find` | `search_issues` | q |
+| `similar` | `similar_issues` | q |
 
-### Review Routing
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `review_candidates` | `$task` | Experts in modules this task touches |
-| `task_constraints` | `$task` | Constraints that must pass before merge |
-| `task_reviews` | `$task` | Review history on a task |
+### Epic Hierarchy
+| Alias | Query | Args |
+|-------|-------|------|
+| `tree` | `epic_tree` | epic |
+| `progress` | `epic_progress` | epic |
+| `epics` | `open_epics` | - |
+
+### Messages
+| Alias | Query | Args |
+|-------|-------|------|
+| `thread` | `thread` | root |
 
 ### Decisions
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `search_decisions` | `$q` | Semantic search across past decisions |
-| `keyword_search_decisions` | `$q` | Keyword search in decision reasoning |
-| `file_decisions` | `$path` | Decisions affecting a specific file |
-| `decision_trace` | `$task` | Decisions linked to files a task modifies |
+| Alias | Query | Args |
+|-------|-------|------|
+| `why` | `search_decisions` | q |
+| `decisions` | `decisions_for` | slug |
 
-### Agent Expertise
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `module_experts` | `$mod` | Who knows this module? |
-| `agent_expertise` | `$agent` | What modules does this agent know? |
+### Modules
+| Alias | Query | Args |
+|-------|-------|------|
+| `mod` | `issues_in_module` | mod |
+| `experts` | `module_experts` | mod |
+| `reviewers` | `review_candidates` | slug |
+| `backlog` | `module_backlog` | - |
 
-### Aggregation
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `files_per_module` | — | File count per module |
-| `tasks_per_agent` | — | Task count per agent |
-| `most_imported` | — | Files ranked by import count |
-| `most_constrained` | — | Files ranked by constraint count |
+### Constraints
+| Alias | Query | Args |
+|-------|-------|------|
+| `checks` | `issue_constraints` | slug |
+| `mod-checks` | `module_constraints` | mod |
 
-### Negation
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `ungoverned_files` | — | Files with no constraints |
-| `unassigned_tasks` | — | Tasks with no agent assigned |
-| `orphan_files` | — | Files not in any module |
-
-### Filtering
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `recent_tasks` | `$since` | Tasks created after a date |
-| `recent_decisions` | `$since` | Decisions made after a date |
-| `error_constraints` | — | Constraints with severity = error |
+### Audit
+| Alias | Query | Args |
+|-------|-------|------|
+| `history` | `recent_events` | slug |
 
 ### Mutations
-| Query | Parameters | Description |
-|-------|-----------|-------------|
-| `write_file` | `$slug, $path, ...` | Insert a new file |
-| `update_file_content` | `$path, $content, ...` | Update file content |
-| `delete_file` | `$path` | Delete a file |
-| `create_task` | `$slug, $title, ...` | Create a new task |
-| `start_task` | `$slug` | Move task to in_progress |
-| `submit_for_review` | `$slug` | Move task to in_review |
-| `merge_task` | `$slug` | Move task to merged |
-| `add_decision` | `$slug, ...` | Record a new decision |
-| `add_review` | `$slug, ...` | Add a review verdict |
+| Alias | Query | Args |
+|-------|-------|------|
+| `claim` | `claim_issue` | slug, agent |
+| `close` | `close_issue` | slug, reason |
+| `review` | `submit_for_review` | slug |
 
-## Seed Data: Acme API
+## Seed Data: Acme API Backlog
 
-The seed data models a TypeScript API project with three agents working concurrently:
+Three agents coordinating across two epics plus standalone bugs, features, and maintenance:
 
-1. **Claude** (AI) — working on refresh token rotation (`feat/refresh-tokens`), modifying auth middleware and JWT module
-2. **Devin** (AI) — building usage threshold alerts (`feat/usage-alerts`), modifying billing meter and API routes
-3. **Sarah** (human) — reviewed the Redis rate limiter migration, expert on auth and core modules
+- **Claude** (AI) - security and testing focus. Claimed `ng-rt02` (refresh endpoint) and `ng-bug01` (Safari JWT bug).
+- **Devin** (AI) - feature development, frontend. Claimed `ng-ua01` (usage meter) and `ng-bug02` (billing double-charge).
+- **Sarah** (human) - architecture and review. Authored most epics, reviews everything.
 
-**The interesting conflict:** Claude's refresh token task and Devin's usage alerts task both modify files that interact through the import graph. The `file_conflicts` query surfaces direct overlaps. The `import_conflicts` query finds subtler dependency-level conflicts.
+**The interesting scenarios:**
 
-**The review routing:** When checking reviewers for Claude's refresh token task, the graph traverses Modifies→File→Contains→Module→Expert and finds Sarah (expert on auth module with high confidence).
+1. **Dependency chains.** `ng-rt02` blocks `ng-rt03`, `ng-rt04`, and `ng-feat01`. Run `nanograph run blockers ng-rt03` to see the chain. Run `nanograph run unblocks ng-rt02` to see what a merge of Claude's work releases.
 
-**The decision memory:** The rate limiter was explicitly designed as a temporary in-memory solution. Searching decisions for "rate limiter temporary" surfaces the original reasoning, giving the agent context before starting the Redis migration.
+2. **Semantic dedup.** Try `nanograph run similar "refresh token"` - it surfaces the whole refresh-token epic plus related bugs, ranked by a hybrid of semantic distance and BM25.
+
+3. **Organizational memory.** `nanograph run why "rate limiter"` finds the `dec-redis-ratelimit` decision explaining why the in-memory limiter was replaced. Agents can surface prior rationale before re-litigating.
+
+4. **Review routing.** `nanograph run reviewers ng-rt02` traverses `Issue -> Scopes -> Module <- Expert - Agent` to find Claude and Sarah as auth-module experts.
+
+5. **Audit trail.** `nanograph run history ng-rt02` shows the Event stream: claimed, lint passed, typecheck passed.
+
+## vs. beads
+
+This example borrows beads' data model (Issue with dependency edges, hierarchical epics, message threading, append-only audit). nanograph brings typed schema, first-class hybrid search, and distinct Decision/Event node types with semantic indexing. beads brings versioned storage (Dolt), race-safe atomic claims, and a mature agent-facing CLI.
+
+Use beads if you want a drop-in issue tracker with multi-agent write safety and no deployment concerns. Use this example (or fork it) if you are already on nanograph, want typed graph queries across plan/decisions/audit, or want embedded hybrid search over issue descriptions as part of the same engine.
+
+## Known Gaps
+
+1. **Race-safe claim.** `claim_issue` is last-write-wins because nanograph's `update ... where` does not yet support a compound predicate like `where slug = $slug AND claimedBy IS NULL`. For multi-agent use, add your own check-then-update sequence through the audit log or wait for grammar support.
+2. **No versioning.** Two agents writing to the same DB stomp each other. There is no cell-level merge. Use one writer or add an external sync layer.
+3. **Compaction is manual.** beads summarizes old closed issues to save agent context window; here that would be a bespoke mutation rewriting `description` on closed issues. Not built in.
 
 ## Adding Data
 
 ```bash
-nanograph load --data your-data.jsonl --mode merge
+nanograph load --data new-issues.jsonl --mode merge
+```
+
+Mutations via `nanograph run`:
+
+```bash
+nanograph run claim ng-bug01 claude
+nanograph run close ng-bug01 "Fixed in commit abc123"
 ```
 
 To evolve the schema, edit `codebase.nano/schema.pg` then run `nanograph migrate`.
