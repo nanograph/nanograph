@@ -70,13 +70,13 @@ Three search subsystems:
 
 **Vector search** — `Vector(dim)` properties with Lance exact KNN. Two workflows:
 - **Manual vectors**: Put vectors directly in JSONL data, query with `nearest(prop, $param)` ordering.
-- **Auto-embedding**: Annotate a `Vector(dim)` property with `@embed(source_prop)` — embeddings are generated from the source String property at load time via OpenAI API.
+- **Auto-embedding**: Annotate a `Vector(dim)` property with `@embed(source_prop)` — embeddings are generated from the source String property at load time via the configured embedding provider (OpenAI, Gemini, or LM Studio).
 
 **Hybrid** — `rrf(nearest(...), bm25(...))` for reciprocal rank fusion. `nearest` and `rrf` require a `limit` clause.
 
 Embedding cache: `_embedding_cache.jsonl` in the DB directory caches content-hashed embeddings to avoid re-embedding unchanged data. Large text (>1500 chars by default) is chunked with overlap and averaged.
 
-Key modules: `embedding.rs` (OpenAI client, retry, mock mode), `store/loader/embeddings.rs` (load-time materialization, caching, chunking), `store/runtime.rs` (TextSearchKind, TextSearchCache, native Lance FTS execution), `store/indexing.rs` (scalar, vector, and FTS index lifecycle).
+Key modules: `embedding.rs` (OpenAI/Gemini/LM Studio clients, retry, mock mode), `store/loader/embeddings.rs` (load-time materialization, caching, chunking), `store/runtime.rs` (TextSearchKind, TextSearchCache, native Lance FTS execution), `store/indexing.rs` (scalar, vector, and FTS index lifecycle).
 
 ### Module Map (`crates/nanograph/src/`)
 
@@ -100,7 +100,7 @@ Key modules: `embedding.rs` (OpenAI client, retry, mock mode), `store/loader/emb
 | `store/txlog.rs` | CDC readers/writers across storage generations; default new graphs use lineage-native CDC |
 | `store/namespace_lineage_graph_log.rs` | `NamespaceLineage` internal tables: `__graph_tx` and `__graph_deletes` |
 | `store/namespace_lineage_internal.rs` | Ensures and merges `NamespaceLineage` internal datasets into committed snapshots |
-| `embedding.rs` | OpenAI embedding client, retry logic, mock mode |
+| `embedding.rs` | OpenAI / Gemini / LM Studio embedding clients, retry logic, mock mode |
 | `json_output.rs` | Shared Arrow→JSON serialization for CLI and SDKs. Handles JS safe integer range (i64/u64 > 2^53 are stringified) |
 | `query_input.rs` | Query param parsing, named query lookup from `.gq` files, JSON→ParamMap conversion |
 | `result.rs` | `RunResult`, `QueryResult`, `MutationResult` — structured result types for CLI and SDKs |
@@ -197,7 +197,11 @@ The CLI loads `.env.nano` then `.env` from the config base directory at startup 
 
 - `OPENAI_API_KEY` — required only for real embedding API calls.
 - `OPENAI_BASE_URL` — custom OpenAI-compatible endpoint (default: OpenAI API).
-- `NANOGRAPH_EMBED_MODEL` — OpenAI model name (default: `text-embedding-3-small`).
+- `GEMINI_API_KEY` / `GEMINI_BASE_URL` — Gemini provider equivalents.
+- `LMSTUDIO_BASE_URL` — LM Studio local server URL (default: `http://localhost:1234/v1`).
+- `LMSTUDIO_API_KEY` — optional bearer token, only needed if LM Studio is behind an auth proxy.
+- `NANOGRAPH_EMBED_PROVIDER` — explicit provider selector: `openai` (default), `gemini`, `lmstudio`. LM Studio is never auto-detected.
+- `NANOGRAPH_EMBED_MODEL` — model name (defaults: `text-embedding-3-small` for OpenAI, `gemini-embedding-2-preview` for Gemini, no default for LM Studio — must be set explicitly).
 - `NANOGRAPH_EMBED_BATCH_SIZE` — batch size for API calls (default: 64).
 - `NANOGRAPH_EMBED_CHUNK_CHARS` — chunk size for large text; 0 disables (default: 1500).
 - `NANOGRAPH_EMBED_CHUNK_OVERLAP_CHARS` — overlap between chunks (default: 200).
@@ -231,7 +235,7 @@ Arrow 57, DataFusion 52, Lance 4.0 + lance-index 4.0 + lance-namespace 4.0 — t
 - `docs/dev/swift-sdk.md`, `docs/dev/typescript-sdk.md` — SDK build/release notes
 - `docs/dev/release-notes-v*.md` — per-release notes
 
-User-facing docs live in `docs/user/` — `schema.md`, `queries.md`, `search.md`, `config.md`, `cli-reference.md`, `quick-start.md`, `embeddings.md`, `blobs.md`, `lance-migration.md`, `skills.md`, worked examples (`starwars-example.md`, `context-graph-example.md`), and `best-practices.md` (agent anti-patterns and operational guidelines).
+User-facing docs live in `docs/user/` — `schema.md`, `queries.md`, `search.md`, `config.md`, `cli-reference.md`, `quick-start.md`, `embeddings.md`, `blobs.md`, `lance-migration.md`, `skills.md`, `folder-structure.md`, worked examples (`starwars-example.md`, `context-graph-example.md`), and `best-practices.md` (agent anti-patterns and operational guidelines).
 
 Source of truth for behavior is code. Update docs in the same PR when behavior changes.
 
@@ -239,7 +243,7 @@ Source of truth for behavior is code. Update docs in the same PR when behavior c
 
 Test schemas, queries, and data live in `crates/nanograph/tests/fixtures/` (test.pg, test.gq, test.jsonl). Runnable examples in `examples/starwars/` and `examples/revops/`. Library integration tests: `engine_integration.rs` (core query engine), `schema_migration.rs` (schema evolution). Performance harnesses (run with `--ignored`): `index_perf.rs`, `write_amp_perf.rs`, `json_output_perf.rs`.
 
-CLI integration tests (Rust) in `crates/nanograph-cli/tests/` with shared helpers in `common/mod.rs`. Test files: `bootstrap_and_env`, `bug_regressions`, `config_and_aliases`, `config_failures`, `display_formats`, `docs_and_output`, `embed_command`, `graph_mirror`, `load_modes_and_export`, `local_gemini_media`, `namespace_lineage`, `revops_admin_and_cdc`, `revops_workflows`, `runtime_values`, `schema_analysis`, `starwars_export_roundtrip`, `starwars_workflows`.
+CLI integration tests (Rust) in `crates/nanograph-cli/tests/` with shared helpers in `common/mod.rs`. Test files: `bootstrap_and_env`, `bug_regressions`, `config_and_aliases`, `config_failures`, `display_formats`, `docs_and_output`, `embed_command`, `graph_mirror`, `load_modes_and_export`, `namespace_lineage`, `revops_admin_and_cdc`, `revops_workflows`, `runtime_values`, `schema_analysis`, `starwars_export_roundtrip`, `starwars_workflows`.
 
 Criterion benchmarks in `crates/nanograph/benches/`: `query_lookup`, `traversal`, `search`, `result_transport`. Shared setup in `benches/common/mod.rs`. Uses synthetic data and checked-in examples (starwars, revops). Legacy perf tests (`tests/*_perf.rs`, run with `--ignored`) are frozen — new benchmark work goes in `benches/`.
 

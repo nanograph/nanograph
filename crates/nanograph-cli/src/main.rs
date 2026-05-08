@@ -1104,6 +1104,7 @@ fn default_nanograph_toml(project_dir: &Path, db_path: &Path, schema_path: &Path
          [query]\n\
          roots = [\"queries\"]\n\n\
          [embedding]\n\
+         # provider options: openai, gemini, lmstudio, mock\n\
          provider = \"openai\"\n\
          model = \"text-embedding-3-small\"\n\
          batch_size = 64\n\
@@ -1137,6 +1138,8 @@ const DEFAULT_DOTENV_NANO: &str = "\
 # Do not commit this file.\n\
 # OPENAI_API_KEY=sk-...\n\
 # GEMINI_API_KEY=...\n\
+# LMSTUDIO_BASE_URL=http://localhost:1234/v1   # only if non-default\n\
+# LMSTUDIO_API_KEY=                            # only if behind an auth proxy\n\
 # NANOGRAPH_EMBEDDINGS_MOCK=1\n";
 
 #[instrument(skip(data_path), fields(db_path = %db_path.display(), mode = ?mode))]

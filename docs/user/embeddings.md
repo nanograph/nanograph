@@ -54,6 +54,7 @@ nanograph uses retrieval-aware roles internally:
 |----------|---------------|--------------|---------------|
 | OpenAI | `text-embedding-3-small` | Supported | Not supported |
 | Gemini | `gemini-embedding-2-preview` | Supported | Supported |
+| LM Studio | none — set explicitly | Supported | Not supported |
 | Mock | deterministic test provider | Supported | Supported in tests/examples |
 
 Important implications:
@@ -61,9 +62,10 @@ Important implications:
 - OpenAI is text-only in nanograph today
 - if `@embed(...)` points at a `@media_uri(...)` field and OpenAI is configured, embedding will fail
 - Gemini supports both text and media sources in nanograph
+- LM Studio runs locally as a separate desktop app and serves an OpenAI-compatible `/v1/embeddings` endpoint; it is text-only and the loaded model dictates the output dimension
 - the mock provider is useful for examples and tests, not production retrieval quality
 
-nanograph asks the provider for the dimension declared in your schema, so `Vector(dim)` is the contract even when the provider's native model dimension is larger.
+For OpenAI and Gemini, nanograph asks the provider for the dimension declared in your schema, so `Vector(dim)` is the contract even when the provider's native model dimension is larger. LM Studio does not honor a requested dimension — its loaded model produces a fixed native dimension, and nanograph fails with a clear error if that dimension does not match your schema's `Vector(dim)`.
 
 ## Configuring embeddings
 
@@ -88,12 +90,29 @@ model = "gemini-embedding-2-preview"
 api_key_env = "GEMINI_API_KEY"
 ```
 
+LM Studio example:
+
+```toml
+[embedding]
+provider = "lmstudio"
+# Required: must match the model loaded in LM Studio's Local Server tab.
+model = "nomic-embed-text-v1.5"
+# Optional: only needed if LM Studio is not on the default localhost:1234.
+# base_url = "http://localhost:1234/v1"
+# Optional: only needed if LM Studio is fronted by an auth proxy.
+# api_key_env = "LMSTUDIO_API_KEY"
+```
+
+Make sure LM Studio is running with an embedding model loaded in the Local Server tab before invoking nanograph.
+
 Put the matching secret in `.env.nano`:
 
 ```bash
 OPENAI_API_KEY=sk-...
 # or
 GEMINI_API_KEY=...
+# LM Studio usually does not need a key
+# LMSTUDIO_API_KEY=
 ```
 
 You can get a free Gemini API key from [Google AI Studio](https://aistudio.google.com/).
@@ -105,10 +124,12 @@ You can also override provider/model at runtime with:
 
 Provider auto-detection is:
 
-- use `NANOGRAPH_EMBED_PROVIDER` if set
+- use `NANOGRAPH_EMBED_PROVIDER` if set (accepted values: `openai`, `gemini`, `lmstudio`)
 - otherwise, if the configured model starts with `gemini-`, use Gemini
 - otherwise, if `GEMINI_API_KEY` is present and `OPENAI_API_KEY` is not, use Gemini
 - otherwise, default to OpenAI
+
+LM Studio is never auto-detected — always select it explicitly.
 
 See [config.md](config.md) for the full config precedence and env mapping.
 

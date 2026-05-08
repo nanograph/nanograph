@@ -342,7 +342,7 @@ impl LoadedConfig {
         let embedding = &self.settings.embedding;
         let provider = trim_nonempty(embedding.provider.as_deref()).unwrap_or("openai");
         match provider {
-            "openai" | "gemini" => {
+            "openai" | "gemini" | "lmstudio" => {
                 set_if_missing(
                     &mut exists,
                     &mut set,
@@ -357,7 +357,7 @@ impl LoadedConfig {
             }
             other => {
                 return Err(eyre!(
-                    "unsupported embedding.provider `{}` (supported: openai, gemini, mock)",
+                    "unsupported embedding.provider `{}` (supported: openai, gemini, lmstudio, mock)",
                     other
                 ));
             }
@@ -377,6 +377,7 @@ impl LoadedConfig {
             &mut set,
             match provider {
                 "gemini" => "GEMINI_BASE_URL",
+                "lmstudio" => "LMSTUDIO_BASE_URL",
                 _ => "OPENAI_BASE_URL",
             },
             embedding.base_url.as_deref(),
@@ -402,6 +403,7 @@ impl LoadedConfig {
 
         let api_key_target = match provider {
             "gemini" => "GEMINI_API_KEY",
+            "lmstudio" => "LMSTUDIO_API_KEY",
             _ => "OPENAI_API_KEY",
         };
 
@@ -1017,6 +1019,95 @@ chunk_size = 512
             env.borrow().get("GEMINI_BASE_URL").map(String::as_str),
             Some("https://example.invalid/gemini")
         );
+    }
+
+    #[test]
+    fn embedding_env_resolution_supports_lmstudio_provider() {
+        let cfg = LoadedConfig {
+            path: Some(PathBuf::from("/tmp/project/nanograph.toml")),
+            base_dir: PathBuf::from("/tmp/project"),
+            settings: NanographConfig {
+                embedding: EmbeddingConfig {
+                    provider: Some("lmstudio".to_string()),
+                    model: Some("nomic-embed-text-v1.5".to_string()),
+                    api_key_env: Some("ALT_LMSTUDIO_KEY".to_string()),
+                    base_url: Some("http://localhost:1234/v1".to_string()),
+                    ..EmbeddingConfig::default()
+                },
+                ..NanographConfig::default()
+            },
+        };
+        let env = std::cell::RefCell::new(std::collections::HashMap::from([(
+            "ALT_LMSTUDIO_KEY".to_string(),
+            "lm-secret".to_string(),
+        )]));
+
+        cfg.apply_embedding_env_with(
+            |key| env.borrow().contains_key(key),
+            |key| env.borrow().get(key).cloned(),
+            |key, value| {
+                env.borrow_mut().insert(key.to_string(), value.to_string());
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            env.borrow()
+                .get("NANOGRAPH_EMBED_PROVIDER")
+                .map(String::as_str),
+            Some("lmstudio")
+        );
+        assert_eq!(
+            env.borrow()
+                .get("NANOGRAPH_EMBED_MODEL")
+                .map(String::as_str),
+            Some("nomic-embed-text-v1.5")
+        );
+        assert_eq!(
+            env.borrow().get("LMSTUDIO_BASE_URL").map(String::as_str),
+            Some("http://localhost:1234/v1")
+        );
+        assert_eq!(
+            env.borrow().get("LMSTUDIO_API_KEY").map(String::as_str),
+            Some("lm-secret")
+        );
+        // OpenAI/Gemini env vars must not be set when provider is lmstudio.
+        assert!(env.borrow().get("OPENAI_API_KEY").is_none());
+        assert!(env.borrow().get("GEMINI_API_KEY").is_none());
+    }
+
+    #[test]
+    fn embedding_env_resolution_supports_lmstudio_without_api_key() {
+        let cfg = LoadedConfig {
+            path: Some(PathBuf::from("/tmp/project/nanograph.toml")),
+            base_dir: PathBuf::from("/tmp/project"),
+            settings: NanographConfig {
+                embedding: EmbeddingConfig {
+                    provider: Some("lmstudio".to_string()),
+                    model: Some("nomic-embed-text-v1.5".to_string()),
+                    ..EmbeddingConfig::default()
+                },
+                ..NanographConfig::default()
+            },
+        };
+        let env = std::cell::RefCell::new(std::collections::HashMap::<String, String>::new());
+
+        cfg.apply_embedding_env_with(
+            |key| env.borrow().contains_key(key),
+            |key| env.borrow().get(key).cloned(),
+            |key, value| {
+                env.borrow_mut().insert(key.to_string(), value.to_string());
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            env.borrow()
+                .get("NANOGRAPH_EMBED_PROVIDER")
+                .map(String::as_str),
+            Some("lmstudio")
+        );
+        assert!(env.borrow().get("LMSTUDIO_API_KEY").is_none());
     }
 
     #[test]
