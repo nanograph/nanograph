@@ -13,6 +13,7 @@ const DEFAULT_OPENAI_EMBED_MODEL: &str = "text-embedding-3-small";
 const DEFAULT_GEMINI_EMBED_MODEL: &str = "gemini-embedding-2-preview";
 const DEFAULT_OPENAI_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_GEMINI_BASE_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+const DEFAULT_LMSTUDIO_BASE_URL: &str = "http://localhost:1234/v1";
 const DEFAULT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_RETRY_ATTEMPTS: usize = 4;
 const DEFAULT_RETRY_BACKOFF_MS: u64 = 200;
@@ -25,6 +26,7 @@ const GEMINI_PDF_MAX_PAGES: usize = 6;
 enum EmbeddingProvider {
     OpenAi,
     Gemini,
+    LmStudio,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -102,6 +104,7 @@ impl EmbeddingTransport {
             Self::Mock => "Mock",
             Self::OpenAi { .. } => "OpenAI",
             Self::Gemini { .. } => "Gemini",
+            Self::LmStudio { .. } => "LM Studio",
         }
     }
 
@@ -114,7 +117,7 @@ impl EmbeddingTransport {
             Self::Mock | Self::Gemini { .. } => {
                 unreachable!("transport supports media embeddings")
             }
-            Self::OpenAi { .. } => NanoError::Execution(format!(
+            Self::OpenAi { .. } | Self::LmStudio { .. } => NanoError::Execution(format!(
                 "{} embeddings are text-only; media embeddings are not supported",
                 self.provider_name()
             )),
@@ -132,6 +135,11 @@ enum EmbeddingTransport {
     },
     Gemini {
         api_key: String,
+        base_url: String,
+        http: Client,
+    },
+    LmStudio {
+        api_key: Option<String>,
         base_url: String,
         http: Client,
     },
@@ -264,8 +272,16 @@ impl EmbeddingClient {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty());
         let provider = infer_embedding_provider(configured_model.as_deref())?;
-        let model =
-            configured_model.unwrap_or_else(|| default_model_for_provider(provider).to_string());
+        let model = match (configured_model, default_model_for_provider(provider)) {
+            (Some(model), _) => model,
+            (None, Some(default)) => default.to_string(),
+            (None, None) => {
+                return Err(NanoError::Execution(
+                    "LM Studio embeddings require an explicit model name (set NANOGRAPH_EMBED_MODEL or `embedding.model`); LM Studio model IDs are user-defined so there is no safe default"
+                        .to_string(),
+                ));
+            }
+        };
 
         let timeout_ms = parse_env_u64("NANOGRAPH_EMBED_TIMEOUT_MS", DEFAULT_TIMEOUT_MS);
         let http = Client::builder()
@@ -297,6 +313,22 @@ impl EmbeddingClient {
                     .filter(|v| !v.is_empty())
                     .unwrap_or_else(|| DEFAULT_GEMINI_BASE_URL.to_string());
                 EmbeddingTransport::Gemini {
+                    api_key,
+                    base_url,
+                    http,
+                }
+            }
+            EmbeddingProvider::LmStudio => {
+                let api_key = std::env::var("LMSTUDIO_API_KEY")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty());
+                let base_url = std::env::var("LMSTUDIO_BASE_URL")
+                    .ok()
+                    .map(|v| v.trim_end_matches('/').to_string())
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| DEFAULT_LMSTUDIO_BASE_URL.to_string());
+                EmbeddingTransport::LmStudio {
                     api_key,
                     base_url,
                     http,
@@ -372,6 +404,10 @@ impl EmbeddingClient {
                 self.embed_texts_gemini_with_retry(inputs, expected_dim, role)
                     .await
             }
+            EmbeddingTransport::LmStudio { .. } => {
+                self.embed_texts_lmstudio_with_retry(inputs, expected_dim)
+                    .await
+            }
         }
     }
 
@@ -413,7 +449,9 @@ impl EmbeddingClient {
                 .iter()
                 .map(|input| mock_media_embedding(input, role, expected_dim))
                 .collect()),
-            EmbeddingTransport::OpenAi { .. } => unreachable!("openai transport is rejected"),
+            EmbeddingTransport::OpenAi { .. } | EmbeddingTransport::LmStudio { .. } => {
+                unreachable!("text-only transport is rejected before this match")
+            }
             EmbeddingTransport::Gemini { .. } => {
                 self.embed_media_gemini_with_retry(inputs, expected_dim, role)
                     .await
@@ -455,10 +493,7 @@ impl EmbeddingClient {
                 base_url,
                 http,
             } => (api_key, base_url, http),
-            EmbeddingTransport::Mock => unreachable!("mock transport should not call OpenAI"),
-            EmbeddingTransport::Gemini { .. } => {
-                unreachable!("gemini transport should not call OpenAI")
-            }
+            _ => unreachable!("non-openai transport should not call OpenAI"),
         };
 
         let request = serde_json::json!({
@@ -545,6 +580,138 @@ impl EmbeddingClient {
                         "embedding dimension mismatch: expected {}, got {}",
                         expected_dim,
                         item.embedding.len()
+                    ),
+                    retryable: false,
+                });
+            }
+            vectors.push(item.embedding);
+        }
+        Ok(vectors)
+    }
+
+    async fn embed_texts_lmstudio_with_retry(
+        &self,
+        inputs: &[String],
+        expected_dim: usize,
+    ) -> Result<Vec<Vec<f32>>> {
+        let max_attempt = self.retry_attempts.max(1);
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            match self.embed_texts_lmstudio_once(inputs, expected_dim).await {
+                Ok(vectors) => return Ok(vectors),
+                Err(err) => {
+                    if !err.retryable || attempt >= max_attempt {
+                        return Err(NanoError::Execution(err.message));
+                    }
+                    let shift = (attempt - 1).min(10) as u32;
+                    let delay = self.retry_backoff_ms.saturating_mul(1u64 << shift);
+                    sleep(Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }
+
+    async fn embed_texts_lmstudio_once(
+        &self,
+        inputs: &[String],
+        expected_dim: usize,
+    ) -> std::result::Result<Vec<Vec<f32>>, EmbedCallError> {
+        let (api_key, base_url, http) = match &self.transport {
+            EmbeddingTransport::LmStudio {
+                api_key,
+                base_url,
+                http,
+            } => (api_key.as_deref(), base_url, http),
+            _ => unreachable!("non-lmstudio transport should not call LM Studio"),
+        };
+
+        // LM Studio mirrors OpenAI's `/v1/embeddings` request shape but does NOT
+        // honor the `dimensions` field — the loaded model dictates the output
+        // dimension. We omit `dimensions` and validate the response client-side.
+        let request = serde_json::json!({
+            "model": self.model,
+            "input": inputs,
+        });
+        let url = format!("{}/embeddings", base_url);
+        let mut builder = http.post(&url).json(&request);
+        if let Some(key) = api_key {
+            builder = builder.bearer_auth(key);
+        }
+        let response = builder.send().await;
+
+        let response = match response {
+            Ok(resp) => resp,
+            Err(err) => {
+                let retryable = err.is_timeout() || err.is_connect() || err.is_request();
+                return Err(EmbedCallError {
+                    message: format!("LM Studio embedding request failed: {}", err),
+                    retryable,
+                });
+            }
+        };
+
+        let status = response.status();
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(err) => {
+                return Err(EmbedCallError {
+                    message: format!(
+                        "LM Studio embedding response read failed (status {}): {}",
+                        status, err
+                    ),
+                    retryable: status.is_server_error() || status.as_u16() == 429,
+                });
+            }
+        };
+
+        if !status.is_success() {
+            let message = parse_openai_error_message(&body).unwrap_or_else(|| body.clone());
+            return Err(EmbedCallError {
+                message: format!(
+                    "LM Studio embedding request failed with status {}: {}",
+                    status, message
+                ),
+                retryable: status.is_server_error() || status.as_u16() == 429,
+            });
+        }
+
+        let mut parsed: OpenAiEmbeddingResponse =
+            serde_json::from_str(&body).map_err(|err| EmbedCallError {
+                message: format!("LM Studio embedding response decode failed: {}", err),
+                retryable: false,
+            })?;
+
+        if parsed.data.len() != inputs.len() {
+            return Err(EmbedCallError {
+                message: format!(
+                    "LM Studio embedding response size mismatch: expected {}, got {}",
+                    inputs.len(),
+                    parsed.data.len()
+                ),
+                retryable: false,
+            });
+        }
+
+        parsed.data.sort_by_key(|item| item.index);
+        let mut vectors = Vec::with_capacity(parsed.data.len());
+        for (idx, item) in parsed.data.into_iter().enumerate() {
+            if item.index != idx {
+                return Err(EmbedCallError {
+                    message: format!(
+                        "LM Studio embedding response index mismatch at position {}: got {}",
+                        idx, item.index
+                    ),
+                    retryable: false,
+                });
+            }
+            if item.embedding.len() != expected_dim {
+                return Err(EmbedCallError {
+                    message: format!(
+                        "LM Studio model `{}` returned {}-dim vectors but schema declares Vector({}); load a model whose native dimension matches your schema or change the schema",
+                        self.model,
+                        item.embedding.len(),
+                        expected_dim
                     ),
                     retryable: false,
                 });
@@ -946,8 +1113,9 @@ fn infer_embedding_provider(configured_model: Option<&str>) -> Result<EmbeddingP
         return match provider.as_str() {
             "openai" => Ok(EmbeddingProvider::OpenAi),
             "gemini" => Ok(EmbeddingProvider::Gemini),
+            "lmstudio" | "lm-studio" | "lm_studio" => Ok(EmbeddingProvider::LmStudio),
             other => Err(NanoError::Execution(format!(
-                "unsupported embedding provider `{}` (supported: openai, gemini)",
+                "unsupported embedding provider `{}` (supported: openai, gemini, lmstudio)",
                 other
             ))),
         };
@@ -963,10 +1131,12 @@ fn infer_embedding_provider(configured_model: Option<&str>) -> Result<EmbeddingP
     Ok(EmbeddingProvider::OpenAi)
 }
 
-fn default_model_for_provider(provider: EmbeddingProvider) -> &'static str {
+fn default_model_for_provider(provider: EmbeddingProvider) -> Option<&'static str> {
     match provider {
-        EmbeddingProvider::OpenAi => DEFAULT_OPENAI_EMBED_MODEL,
-        EmbeddingProvider::Gemini => DEFAULT_GEMINI_EMBED_MODEL,
+        EmbeddingProvider::OpenAi => Some(DEFAULT_OPENAI_EMBED_MODEL),
+        EmbeddingProvider::Gemini => Some(DEFAULT_GEMINI_EMBED_MODEL),
+        // LM Studio model IDs are user-defined; no safe default.
+        EmbeddingProvider::LmStudio => None,
     }
 }
 
@@ -1437,6 +1607,167 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("OpenAI embeddings are text-only"));
+    }
+
+    #[tokio::test]
+    async fn lmstudio_rejects_media_embeddings() {
+        let client = lmstudio_client_for_test(None, DEFAULT_LMSTUDIO_BASE_URL);
+        let err = client
+            .embed_media(
+                &MediaSource::RemoteUri {
+                    uri: "https://example.com/hero.jpg".to_string(),
+                    mime_type: "image/jpeg".to_string(),
+                },
+                16,
+                EmbedRole::Document,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("LM Studio embeddings are text-only")
+        );
+    }
+
+    #[tokio::test]
+    async fn lmstudio_request_omits_dimensions_and_uses_correct_auth() {
+        // Spin up a tiny mock server inside the test that captures the request,
+        // then return a synthetic embedding.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        async fn run_capture(api_key: Option<&str>) -> (String, Option<String>) {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let base_url = format!("http://{}/v1", addr);
+
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 16 * 1024];
+                let n = stream.read(&mut buf).await.unwrap();
+                let raw = String::from_utf8_lossy(&buf[..n]).to_string();
+                let body_start = raw.find("\r\n\r\n").map(|i| i + 4).unwrap_or(raw.len());
+                let body = raw[body_start..].to_string();
+                let auth_header = raw
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().starts_with("authorization:"))
+                    .map(|line| line.trim().to_string());
+
+                let response_body = serde_json::json!({
+                    "data": [
+                        { "index": 0, "embedding": [0.1f32, 0.2, 0.3, 0.4] }
+                    ]
+                });
+                let response_body = serde_json::to_string(&response_body).unwrap();
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                stream.write_all(response.as_bytes()).await.unwrap();
+                stream.shutdown().await.ok();
+                (body, auth_header)
+            });
+
+            let client = lmstudio_client_for_test(api_key.map(str::to_string), &base_url);
+            client.embed_texts(&["hello".to_string()], 4).await.unwrap();
+
+            server.await.unwrap()
+        }
+
+        let (body, auth) = run_capture(None).await;
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["model"], "nomic-embed-text-v1.5");
+        assert_eq!(parsed["input"][0], "hello");
+        assert!(
+            parsed.get("dimensions").is_none(),
+            "LM Studio request must not include `dimensions` (got body: {body})"
+        );
+        assert!(
+            auth.is_none(),
+            "no Authorization header expected when api_key is None (got: {auth:?})"
+        );
+
+        let (_, auth) = run_capture(Some("lm-studio-secret")).await;
+        let auth = auth.expect("expected Authorization header when api_key is set");
+        assert!(
+            auth.contains("Bearer lm-studio-secret"),
+            "expected bearer token, got: {auth}"
+        );
+    }
+
+    #[tokio::test]
+    async fn lmstudio_dimension_mismatch_is_actionable() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{}/v1", addr);
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 4096];
+            let _ = stream.read(&mut buf).await.unwrap();
+            // Return 768-dim vector when caller asked for 384.
+            let vector: Vec<f32> = (0..768).map(|i| i as f32 / 768.0).collect();
+            let response_body =
+                serde_json::json!({ "data": [{ "index": 0, "embedding": vector }] });
+            let response_body = serde_json::to_string(&response_body).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                response_body.len(),
+                response_body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.ok();
+        });
+
+        let client = lmstudio_client_for_test(None, &base_url);
+        let err = client
+            .embed_texts(&["hello".to_string()], 384)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("returned 768-dim"), "got: {msg}");
+        assert!(msg.contains("Vector(384)"), "got: {msg}");
+        assert!(
+            msg.contains("nomic-embed-text-v1.5"),
+            "error should name the model, got: {msg}"
+        );
+
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn infer_provider_accepts_lmstudio_aliases() {
+        let _guard = ENV_LOCK.lock().await;
+        let prev_provider = std::env::var_os("NANOGRAPH_EMBED_PROVIDER");
+        for alias in ["lmstudio", "lm-studio", "lm_studio"] {
+            unsafe {
+                std::env::set_var("NANOGRAPH_EMBED_PROVIDER", alias);
+            }
+            let provider = infer_embedding_provider(None).unwrap();
+            assert_eq!(
+                provider,
+                EmbeddingProvider::LmStudio,
+                "alias `{alias}` should resolve to LmStudio"
+            );
+        }
+        restore_env_var("NANOGRAPH_EMBED_PROVIDER", prev_provider);
+    }
+
+    fn lmstudio_client_for_test(api_key: Option<String>, base_url: &str) -> EmbeddingClient {
+        EmbeddingClient {
+            model: "nomic-embed-text-v1.5".to_string(),
+            retry_attempts: 1,
+            retry_backoff_ms: 1,
+            transport: EmbeddingTransport::LmStudio {
+                api_key,
+                base_url: base_url.to_string(),
+                http: Client::builder().build().unwrap(),
+            },
+        }
     }
 
     #[tokio::test]

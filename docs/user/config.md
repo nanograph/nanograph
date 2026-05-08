@@ -173,7 +173,7 @@ Shared embedding defaults.
 
 ```toml
 [embedding]
-provider = "openai"   # or "gemini" / "mock"
+provider = "openai"   # or "gemini" / "lmstudio" / "mock"
 model = "text-embedding-3-small"
 base_url = "https://api.openai.com/v1"
 batch_size = 64
@@ -184,14 +184,14 @@ api_key_env = "OPENAI_API_KEY"
 
 Supported fields:
 
-- `provider` — `openai`, `gemini`, or `mock`
-- `model` — defaults to `text-embedding-3-small` for OpenAI and `gemini-embedding-2-preview` for Gemini
-- `base_url` — maps to `OPENAI_BASE_URL` or `GEMINI_BASE_URL` depending on provider
+- `provider` — `openai`, `gemini`, `lmstudio`, or `mock`
+- `model` — defaults to `text-embedding-3-small` for OpenAI and `gemini-embedding-2-preview` for Gemini; **required** for `lmstudio` (no safe default — must match the model loaded in LM Studio)
+- `base_url` — maps to `OPENAI_BASE_URL`, `GEMINI_BASE_URL`, or `LMSTUDIO_BASE_URL` depending on provider (LM Studio default: `http://localhost:1234/v1`)
 - `mock`
 - `batch_size`
 - `chunk_size` — config key for text chunk size; env equivalent is `NANOGRAPH_EMBED_CHUNK_CHARS`
 - `chunk_overlap_chars` — env equivalent is `NANOGRAPH_EMBED_CHUNK_OVERLAP_CHARS`
-- `api_key_env` — alternate env var name to read the provider API key from
+- `api_key_env` — alternate env var name to read the provider API key from. Optional for `lmstudio` (typically no key is required)
 
 Do not put raw API keys in `nanograph.toml`.
 
