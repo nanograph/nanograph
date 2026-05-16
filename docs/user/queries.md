@@ -7,6 +7,40 @@ slug: queries
 
 nanograph queries are defined in `.gq` files. The query language uses typed Datalog semantics with GraphQL-shaped syntax — named, parameterized queries validated against the schema at compile time.
 
+## Design philosophy: the agent toolbelt
+
+Each named query in a `.gq` file is a **tool**. The query language is the toolbelt. Workflows are sequences of tool calls — composed by the caller (typically an LLM agent), not by the query language itself.
+
+This is the deliberate distinguishing wager of nanograph versus Cypher / TypeQL / SQL: those languages let humans write complex multi-stage queries because a human is the user. Nanograph's user is an agent, which is much better at *selecting and chaining simple tools* than at *constructing complex queries*. The complexity profile is intentionally inverted.
+
+Concrete consequences for how you write `.gq` files:
+
+- **One query = one atomic operation = one tool call.** A query body holds one read pattern or one mutation. Multi-step workflows are sequences of named queries the agent calls in order. There are no transactional bundles, no `try { }` blocks, no `assert` stages, no `WITH` clauses.
+
+- **Mutations are single-row and idempotent where possible.** Prefer `put` (upsert by `@key`) over insert-then-update dances. Race-safety comes from `where { ... }` blocks with conjunctive filter clauses (e.g. `where { slug = $s; claimedBy is null }`) — there are no boolean operators, conjunction is structural, OR is unrepresentable by design. The result envelope (`matched_nodes`, `affected_nodes`, optional `rows`) tells the agent what happened.
+
+- **Reads are narrow.** If a "detail" view needs the assignee, the module, the recent events, and the dependency chain, that's **four narrow queries** the agent calls in parallel — not one wide query with optional blocks. Each narrow query is trivial to reason about, trivial to retry, and trivial for an LLM to compose.
+
+- **Use denormalized fields when they exist.** If `Issue.claimedBy: String?` already holds the assignee's slug, query that directly. Don't traverse the `Assigned` edge just to get the name — that introduces an inner-join footgun. The schema should make the common-case query a one-binding match.
+
+- **Name queries by what they do, not by what they touch.** `claim_issue`, `assign_issue`, `record_event` — verbs the agent can match to its intent. Avoid generated `update_issue_by_id` patterns; each query is a curated tool, not a CRUD endpoint.
+
+Example: an agent claiming an issue and recording it
+```
+// 1. CAS-safe atomic claim, observable outcome via matched_nodes
+nanograph run claim_issue --param slug=ng-001 --param agent=alice
+
+// 2. Idempotent edge insert
+nanograph run assign_issue --param agent=alice --param issue=ng-001
+
+// 3. Append the audit event (idempotent put by event slug)
+nanograph run record_event --param ev=ev-... --param issue=ng-001 \
+    --param actor=alice --param kind=claimed
+```
+Three tool calls. Each one is one atomic mutation. If the agent crashes between steps, retrying from the start is safe because each call is idempotent. The orchestration logic — "did the claim succeed? if so, write the edge; if so, emit the event" — lives in the agent, not in the query language.
+
+The full design rationale, principles, and rules for what to add (and not add) to the language live in `ql-canon.md` at the repo root.
+
 ## Query structure
 
 ```graphql
