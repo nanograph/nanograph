@@ -1729,6 +1729,210 @@ query upsert_person($name: String, $age: I32) {
 }
 
 #[tokio::test]
+async fn test_query_cache_returns_consistent_results_across_repeated_calls() {
+    // Regression for CL-508: the compiled-query cache must return identical
+    // results on hit vs miss. We call the same query 50× — first call is a
+    // miss (typecheck + lower), the next 49 are hits (cache-only path).
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let query_src = r#"
+query find_by_name($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name as name }
+}
+"#;
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+
+    let mut results = Vec::new();
+    for _ in 0..50 {
+        let batches = run_db_query_test_with_params(query_src, &db, &params).await;
+        results.push(extract_string_column(&batches, "name"));
+    }
+    // Every call returns exactly one row "Alice".
+    for (i, names) in results.iter().enumerate() {
+        assert_eq!(names, &vec!["Alice".to_string()], "call {} mismatched", i);
+    }
+
+    // Mutation cache: also verify on a put.
+    let mut put_params = ParamMap::new();
+    put_params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Eve".to_string()),
+    );
+    put_params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(50),
+    );
+    let put_src = r#"
+query ensure_person($name: String, $age: I32) {
+    put Person { name: $name, age: $age }
+}
+"#;
+    for _ in 0..10 {
+        let r = run_db_mutation_test_with_params(put_src, &db, &put_params).await;
+        assert_eq!(r.affected_nodes, 1);
+        assert_eq!(r.matched_nodes, 1);
+    }
+
+    // Exactly one Eve after 10 cached put calls.
+    let rows = export_rows_for_db(&db).await;
+    let eves: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Eve")
+        })
+        .collect();
+    assert_eq!(eves.len(), 1);
+}
+
+#[tokio::test]
+async fn test_fast_search_point_lookup_returns_correct_row() {
+    // Regression for CL-512: the fast_search gate fires when there's exactly
+    // one Eq predicate on an indexed property (@key qualifies). Verifies the
+    // gated path returns the right row and doesn't accidentally hide rows
+    // that should match.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+{"type":"Person","data":{"name":"Carol","age":40}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    // Point lookup on @key — fast_search gate should fire.
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+    let batches = run_db_query_test_with_params(
+        r#"
+query find_by_name($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name as name, $p.age as age }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    let names = extract_string_column(&batches, "name");
+    assert_eq!(names, vec!["Bob".to_string()]);
+
+    // Lookup for non-existent row — gate fires, must return empty (not error).
+    let mut params_missing = ParamMap::new();
+    params_missing.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Nobody".to_string()),
+    );
+    let empty = run_db_query_test_with_params(
+        r#"
+query find_by_name($name: String) {
+    match { $p: Person { name: $name } }
+    return { $p.name as name }
+}
+"#,
+        &db,
+        &params_missing,
+    )
+    .await;
+    let empty_names = extract_string_column(&empty, "name");
+    assert!(empty_names.is_empty(), "expected no rows for missing key");
+}
+
+#[tokio::test]
+async fn test_put_back_to_back_same_key_does_not_ambiguous_merge() {
+    // Regression for CL-505: an upstream Lance 4.0.x bug where back-to-back
+    // MergeInsertBuilder operations on the same key in a multi-row table
+    // could panic with "Ambiguous merge inserts" because of double-processing
+    // in `processed_row_ids`. The fix is opting into SourceDedupeBehavior::FirstSeen
+    // on the builder. We test by hammering the same key 20× in tight sequence,
+    // then asserting exactly one row remains and the latest write wins.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    // Seed two other rows so the merge target table is multi-row when each
+    // put runs (the bug only triggers in multi-row contexts).
+    db.load(
+        r#"{"type":"Person","data":{"name":"OtherA","age":1}}
+{"type":"Person","data":{"name":"OtherB","age":2}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    for i in 0..20i32 {
+        let mut params = ParamMap::new();
+        params.insert(
+            "name".to_string(),
+            nanograph::query::ast::Literal::String("Alice".to_string()),
+        );
+        params.insert(
+            "age".to_string(),
+            nanograph::query::ast::Literal::Integer(i.into()),
+        );
+        let result = run_db_mutation_test_with_params(
+            r#"
+query upsert($name: String, $age: I32) {
+    put Person { name: $name, age: $age }
+}
+"#,
+            &db,
+            &params,
+        )
+        .await;
+        assert_eq!(
+            result.affected_nodes, 1,
+            "iteration {} should report affected_nodes=1",
+            i
+        );
+    }
+
+    let rows = export_rows_for_db(&db).await;
+    let alices: Vec<_> = rows
+        .iter()
+        .filter(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Alice")
+        })
+        .collect();
+    assert_eq!(
+        alices.len(),
+        1,
+        "20× put on same key must collapse to exactly one row"
+    );
+    assert_eq!(
+        alices[0]["data"]["age"].as_i64(),
+        Some(19),
+        "last write wins"
+    );
+}
+
+#[tokio::test]
 async fn test_put_edge_is_idempotent() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");
