@@ -5,7 +5,7 @@ use arrow_array::{
     StringArray, UInt64Array,
 };
 use lance::Dataset;
-use lance_index::DatasetIndexExt;
+use lance::index::DatasetIndexExt;
 use tokio::sync::Mutex;
 use url::Url;
 

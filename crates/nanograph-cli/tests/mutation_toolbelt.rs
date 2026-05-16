@@ -47,7 +47,8 @@ fn init_toolbelt_db(workspace: &ExampleWorkspace) {
     workspace.write_file("toolbelt.pg", toolbelt_schema());
     workspace.write_file("toolbelt.gq", toolbelt_queries());
 
-    let init = workspace.json_value(&["--json", "init", "toolbelt.nano", "--schema", "toolbelt.pg"]);
+    let init =
+        workspace.json_value(&["--json", "init", "toolbelt.nano", "--schema", "toolbelt.pg"]);
     assert_eq!(init["status"], "ok");
 }
 

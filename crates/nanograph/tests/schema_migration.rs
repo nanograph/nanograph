@@ -5,7 +5,7 @@ use std::fs;
 use std::path::Path;
 
 use lance::Dataset;
-use lance_index::DatasetIndexExt;
+use lance::index::DatasetIndexExt;
 use tempfile::TempDir;
 
 use nanograph::schema::parser::parse_schema;

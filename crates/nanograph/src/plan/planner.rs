@@ -32,7 +32,7 @@ use datafusion_physical_plan::{
     projection::{ProjectionExec, ProjectionExpr},
     sorts::sort::SortExec,
 };
-use lance_index::DatasetIndexExt;
+use lance::index::DatasetIndexExt;
 
 use crate::embedding::{EmbedRole, EmbeddingClient};
 use crate::error::{NanoError, Result};
@@ -600,7 +600,7 @@ struct ScoreExec {
     runtime: Arc<DatabaseRuntime>,
     variable_types: Arc<AHashMap<String, String>>,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl ScoreExec {
@@ -623,12 +623,12 @@ impl ScoreExec {
                 .map(|expr| Field::new(&expr.column_name, expr.data_type.clone(), expr.nullable)),
         );
         let output_schema = Arc::new(Schema::new(output_fields));
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             datafusion_physical_plan::execution_plan::EmissionType::Incremental,
             datafusion_physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -661,7 +661,7 @@ impl ExecutionPlan for ScoreExec {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -4405,7 +4405,7 @@ struct CrossJoinExec {
     left: Arc<dyn ExecutionPlan>,
     right: Arc<dyn ExecutionPlan>,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl CrossJoinExec {
@@ -4414,12 +4414,12 @@ impl CrossJoinExec {
         right: Arc<dyn ExecutionPlan>,
         output_schema: SchemaRef,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             datafusion_physical_plan::execution_plan::EmissionType::Incremental,
             datafusion_physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
         Self {
             left,
             right,
@@ -4448,7 +4448,7 @@ impl ExecutionPlan for CrossJoinExec {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -4633,7 +4633,7 @@ struct AntiJoinExec {
     inner_pipeline: Vec<IROp>,
     params: ParamMap,
     output_schema: SchemaRef,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl AntiJoinExec {
@@ -4645,12 +4645,12 @@ impl AntiJoinExec {
         params: ParamMap,
     ) -> Self {
         let output_schema = outer.schema();
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             datafusion_physical_plan::execution_plan::EmissionType::Incremental,
             datafusion_physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
         Self {
             outer,
             inner,
@@ -4682,7 +4682,7 @@ impl ExecutionPlan for AntiJoinExec {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
