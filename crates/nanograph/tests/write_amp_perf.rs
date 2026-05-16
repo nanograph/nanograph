@@ -364,11 +364,7 @@ async fn run_delete_scenario(rows: usize) -> ScenarioMetrics {
     let start = Instant::now();
     db.delete_edges(
         "Knows",
-        &DeletePredicate {
-            property: "src".to_string(),
-            op: DeleteOp::Lt,
-            value: cutoff.to_string(),
-        },
+        &DeletePredicate::compare("src".to_string(), DeleteOp::Lt, cutoff.to_string()),
     )
     .await
     .expect("delete mutation");

@@ -75,6 +75,13 @@ impl QueryResult {
 pub struct MutationResult {
     pub affected_nodes: usize,
     pub affected_edges: usize,
+    /// Count of rows the predicate matched before applying the write.
+    /// For update/delete: number of rows the `where { ... }` block matched.
+    /// For put: 1 (the key gate always identifies exactly one row).
+    /// For insert: 0 (no gate; insert is a pure append).
+    /// `matched_nodes == 0 && affected_nodes == 0` means a CAS predicate
+    /// matched no rows — the canonical "claim lost" signal for agents.
+    pub matched_nodes: usize,
 }
 
 impl MutationResult {
@@ -82,6 +89,7 @@ impl MutationResult {
         serde_json::json!({
             "affectedNodes": self.affected_nodes,
             "affectedEdges": self.affected_edges,
+            "matchedNodes": self.matched_nodes,
         })
     }
 
@@ -89,12 +97,14 @@ impl MutationResult {
         let schema = Arc::new(Schema::new(vec![
             Field::new("affected_nodes", DataType::UInt64, false),
             Field::new("affected_edges", DataType::UInt64, false),
+            Field::new("matched_nodes", DataType::UInt64, false),
         ]));
         Ok(RecordBatch::try_new(
             schema,
             vec![
                 Arc::new(UInt64Array::from(vec![self.affected_nodes as u64])),
                 Arc::new(UInt64Array::from(vec![self.affected_edges as u64])),
+                Arc::new(UInt64Array::from(vec![self.matched_nodes as u64])),
             ],
         )?)
     }
@@ -105,6 +115,7 @@ impl From<MutationExecResult> for MutationResult {
         Self {
             affected_nodes: value.affected_nodes,
             affected_edges: value.affected_edges,
+            matched_nodes: value.matched_nodes,
         }
     }
 }

@@ -308,6 +308,7 @@ fn parse_prop_match(pair: pest::iterators::Pair<Rule>) -> Result<PropMatch> {
 fn parse_mutation_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Mutation> {
     match pair.as_rule() {
         Rule::insert_stmt => parse_insert_mutation(pair).map(Mutation::Insert),
+        Rule::put_stmt => parse_insert_mutation(pair).map(Mutation::Put),
         Rule::update_stmt => parse_update_mutation(pair).map(Mutation::Update),
         Rule::delete_stmt => parse_delete_mutation(pair).map(Mutation::Delete),
         other => Err(NanoError::Parse(format!(
@@ -379,15 +380,65 @@ fn parse_mutation_assignment(pair: pest::iterators::Pair<Rule>) -> Result<Mutati
 }
 
 fn parse_mutation_predicate(pair: pest::iterators::Pair<Rule>) -> Result<MutationPredicate> {
-    let mut inner = pair.into_inner();
-    let property = inner.next().unwrap().as_str().to_string();
-    let op = parse_comp_op(inner.next().unwrap())?;
-    let value = parse_match_value(inner.next().unwrap())?;
-    Ok(MutationPredicate {
-        property,
-        op,
-        value,
-    })
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| NanoError::Parse("mutation predicate is empty".to_string()))?;
+    match inner.as_rule() {
+        Rule::mutation_pred_atom => {
+            let atom = parse_mutation_pred_atom(inner)?;
+            Ok(MutationPredicate { atoms: vec![atom] })
+        }
+        Rule::mutation_pred_block => {
+            let atoms = inner
+                .into_inner()
+                .filter(|p| matches!(p.as_rule(), Rule::mutation_pred_atom))
+                .map(parse_mutation_pred_atom)
+                .collect::<Result<Vec<_>>>()?;
+            if atoms.is_empty() {
+                return Err(NanoError::Parse(
+                    "mutation predicate block requires at least one atom".to_string(),
+                ));
+            }
+            Ok(MutationPredicate { atoms })
+        }
+        other => Err(NanoError::Parse(format!(
+            "unexpected mutation predicate rule: {:?}",
+            other
+        ))),
+    }
+}
+
+fn parse_mutation_pred_atom(pair: pest::iterators::Pair<Rule>) -> Result<MutationPredAtom> {
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| NanoError::Parse("mutation predicate atom is empty".to_string()))?;
+    match inner.as_rule() {
+        Rule::compare_pred => {
+            let mut parts = inner.into_inner();
+            let property = parts.next().unwrap().as_str().to_string();
+            let op = parse_comp_op(parts.next().unwrap())?;
+            let value = parse_match_value(parts.next().unwrap())?;
+            Ok(MutationPredAtom::Compare {
+                property,
+                op,
+                value,
+            })
+        }
+        Rule::is_null_pred => {
+            let property = inner.into_inner().next().unwrap().as_str().to_string();
+            Ok(MutationPredAtom::IsNull { property })
+        }
+        Rule::is_not_null_pred => {
+            let property = inner.into_inner().next().unwrap().as_str().to_string();
+            Ok(MutationPredAtom::IsNotNull { property })
+        }
+        other => Err(NanoError::Parse(format!(
+            "unexpected mutation predicate atom rule: {:?}",
+            other
+        ))),
+    }
 }
 
 fn parse_match_value(pair: pest::iterators::Pair<Rule>) -> Result<MatchValue> {
@@ -1205,8 +1256,14 @@ query set_age($name: String, $age: I32) {
             Mutation::Update(upd) => {
                 assert_eq!(upd.type_name, "Person");
                 assert_eq!(upd.assignments.len(), 1);
-                assert_eq!(upd.predicate.property, "name");
-                assert_eq!(upd.predicate.op, CompOp::Eq);
+                assert_eq!(upd.predicate.atoms.len(), 1);
+                match &upd.predicate.atoms[0] {
+                    MutationPredAtom::Compare { property, op, .. } => {
+                        assert_eq!(property, "name");
+                        assert_eq!(*op, CompOp::Eq);
+                    }
+                    other => panic!("expected Compare atom, got {:?}", other),
+                }
             }
             _ => panic!("expected Update mutation"),
         }
@@ -1224,8 +1281,14 @@ query drop_person($name: String) {
         match q.mutation.as_ref().expect("expected mutation") {
             Mutation::Delete(del) => {
                 assert_eq!(del.type_name, "Person");
-                assert_eq!(del.predicate.property, "name");
-                assert_eq!(del.predicate.op, CompOp::Eq);
+                assert_eq!(del.predicate.atoms.len(), 1);
+                match &del.predicate.atoms[0] {
+                    MutationPredAtom::Compare { property, op, .. } => {
+                        assert_eq!(property, "name");
+                        assert_eq!(*op, CompOp::Eq);
+                    }
+                    other => panic!("expected Compare atom, got {:?}", other),
+                }
             }
             _ => panic!("expected Delete mutation"),
         }
@@ -1291,7 +1354,13 @@ query stamp() {
         match mutation.queries[0].mutation.as_ref().unwrap() {
             Mutation::Update(update) => {
                 assert!(matches!(update.assignments[0].value, MatchValue::Now));
-                assert!(matches!(update.predicate.value, MatchValue::Now));
+                assert_eq!(update.predicate.atoms.len(), 1);
+                match &update.predicate.atoms[0] {
+                    MutationPredAtom::Compare { value, .. } => {
+                        assert!(matches!(value, MatchValue::Now));
+                    }
+                    other => panic!("expected Compare atom, got {:?}", other),
+                }
             }
             _ => panic!("expected update mutation"),
         }

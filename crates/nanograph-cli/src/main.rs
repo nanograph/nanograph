@@ -1968,7 +1968,7 @@ fn collect_type_mutation_coverage(
                     );
                 }
             }
-            Mutation::Insert(_) | Mutation::Delete(_) => {}
+            Mutation::Insert(_) | Mutation::Put(_) | Mutation::Delete(_) => {}
         }
     }
 
@@ -2094,6 +2094,13 @@ fn query_is_sparse_mutation_eligible(query: &QueryDecl, metadata: &DatabaseMetad
                     .catalog()
                     .edge_types
                     .contains_key(&insert.type_name)
+        }
+        Some(nanograph::query::ast::Mutation::Put(_)) => {
+            // Put routes through Database::open + execute_put_mutation, which
+            // dispatches to apply_merge_mutation_locked. The sparse path doesn't
+            // (yet) replicate that machinery in a single-row form.
+            let _ = metadata;
+            false
         }
         Some(nanograph::query::ast::Mutation::Update(update)) => {
             metadata
@@ -3285,11 +3292,7 @@ fn parse_delete_predicate(input: &str) -> Result<DeletePredicate> {
 
             let value = strip_matching_quotes(raw_value).to_string();
 
-            return Ok(DeletePredicate {
-                property: property.to_string(),
-                op,
-                value,
-            });
+            return Ok(DeletePredicate::compare(property.to_string(), op, value));
         }
     }
 

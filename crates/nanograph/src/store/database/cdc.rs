@@ -15,7 +15,10 @@ use super::persist::{
     collect_ids_from_batch, filter_record_batch_by_delete_mask, read_sparse_edge_batch,
     read_sparse_node_batch, select_record_batch_rows,
 };
-use super::{Database, DatabaseWriteGuard, DeleteOp, DeletePredicate, DeleteResult, MutationPlan};
+use super::{
+    Database, DatabaseWriteGuard, DeleteOp, DeletePredAtom, DeletePredicate, DeleteResult,
+    MutationPlan,
+};
 use crate::error::{NanoError, Result};
 use crate::store::metadata::DatabaseMetadata;
 use crate::store::txlog::{CdcLogEntry, VisibleChangeRow, read_visible_change_rows};
@@ -35,7 +38,7 @@ impl Database {
     }
 
     /// Delete nodes of a given type matching a predicate, cascading incident edges.
-    #[instrument(skip(self), fields(type_name = type_name, property = %predicate.property))]
+    #[instrument(skip(self), fields(type_name = type_name, atoms = predicate.atoms.len()))]
     pub async fn delete_nodes(
         &self,
         type_name: &str,
@@ -145,7 +148,7 @@ impl Database {
     }
 
     /// Delete edges of a given type matching a predicate.
-    #[instrument(skip(self), fields(type_name = type_name, property = %predicate.property))]
+    #[instrument(skip(self), fields(type_name = type_name, atoms = predicate.atoms.len()))]
     pub async fn delete_edges(
         &self,
         type_name: &str,
@@ -350,17 +353,90 @@ pub(super) fn build_delete_mask_for_mutation(
     batch: &RecordBatch,
     predicate: &DeletePredicate,
 ) -> Result<BooleanArray> {
-    let left = batch
-        .column_by_name(&predicate.property)
-        .ok_or_else(|| {
-            NanoError::Storage(format!(
-                "property '{}' not found for delete predicate",
-                predicate.property
-            ))
-        })?
-        .clone();
-    let right = parse_predicate_array(&predicate.value, left.data_type(), batch.num_rows())?;
-    compare_for_delete(&left, &right, predicate.op)
+    if predicate.atoms.is_empty() {
+        return Err(NanoError::Storage(
+            "delete predicate must contain at least one atom".to_string(),
+        ));
+    }
+    let mut combined: Option<BooleanArray> = None;
+    for atom in &predicate.atoms {
+        let atom_mask = build_mask_for_atom(batch, atom)?;
+        combined = Some(match combined {
+            None => atom_mask,
+            Some(prev) => kleene_and(&prev, &atom_mask)?,
+        });
+    }
+    combined.ok_or_else(|| NanoError::Storage("empty delete predicate".to_string()))
+}
+
+fn build_mask_for_atom(batch: &RecordBatch, atom: &DeletePredAtom) -> Result<BooleanArray> {
+    match atom {
+        DeletePredAtom::Compare {
+            property,
+            op,
+            value,
+        } => {
+            let left = batch.column_by_name(property).ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "property '{}' not found for delete predicate",
+                    property
+                ))
+            })?;
+            let right = parse_predicate_array(value, left.data_type(), batch.num_rows())?;
+            compare_for_delete(left, &right, *op)
+        }
+        DeletePredAtom::IsNull { property } => {
+            let col = batch.column_by_name(property).ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "property '{}' not found for delete predicate",
+                    property
+                ))
+            })?;
+            let mut builder = BooleanBuilder::with_capacity(col.len());
+            for row in 0..col.len() {
+                builder.append_value(col.is_null(row));
+            }
+            Ok(builder.finish())
+        }
+        DeletePredAtom::IsNotNull { property } => {
+            let col = batch.column_by_name(property).ok_or_else(|| {
+                NanoError::Storage(format!(
+                    "property '{}' not found for delete predicate",
+                    property
+                ))
+            })?;
+            let mut builder = BooleanBuilder::with_capacity(col.len());
+            for row in 0..col.len() {
+                builder.append_value(!col.is_null(row));
+            }
+            Ok(builder.finish())
+        }
+    }
+}
+
+/// Three-valued (kleene) AND of two boolean masks. Mirrors SQL semantics:
+/// false AND null = false; true AND null = null; null AND null = null.
+fn kleene_and(a: &BooleanArray, b: &BooleanArray) -> Result<BooleanArray> {
+    if a.len() != b.len() {
+        return Err(NanoError::Storage(format!(
+            "mask length mismatch in kleene AND: {} vs {}",
+            a.len(),
+            b.len()
+        )));
+    }
+    let mut builder = BooleanBuilder::with_capacity(a.len());
+    for row in 0..a.len() {
+        let a_null = a.is_null(row);
+        let b_null = b.is_null(row);
+        let a_val = if a_null { None } else { Some(a.value(row)) };
+        let b_val = if b_null { None } else { Some(b.value(row)) };
+        match (a_val, b_val) {
+            (Some(false), _) | (_, Some(false)) => builder.append_value(false),
+            (Some(true), Some(true)) => builder.append_value(true),
+            _ => builder.append_null(),
+        }
+    }
+    Ok(builder.finish())
 }
 
 fn filter_edge_batch_by_deleted_nodes(
