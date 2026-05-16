@@ -406,27 +406,47 @@ fn ensure_no_duplicate_assignment_names(assignments: &[MutationAssignment]) -> R
     Ok(())
 }
 
+/// Extract the single legacy Compare atom from a mutation predicate.
+/// Multi-atom `where { ... }` blocks and IS NULL / IS NOT NULL atoms parse but
+/// are not yet implemented end-to-end (landing in a follow-up commit).
+fn require_single_compare_atom(
+    predicate: &MutationPredicate,
+) -> Result<(&str, CompOp, &MatchValue)> {
+    if predicate.atoms.len() != 1 {
+        return Err(NanoError::Type(
+            "T11: `where { ... }` blocks with multiple atoms are not yet supported"
+                .to_string(),
+        ));
+    }
+    match &predicate.atoms[0] {
+        MutationPredAtom::Compare {
+            property,
+            op,
+            value,
+        } => Ok((property.as_str(), *op, value)),
+        MutationPredAtom::IsNull { .. } | MutationPredAtom::IsNotNull { .. } => Err(
+            NanoError::Type(
+                "T11: `IS NULL` / `IS NOT NULL` predicate atoms are not yet supported"
+                    .to_string(),
+            ),
+        ),
+    }
+}
+
 fn typecheck_mutation_predicate(
     type_name: &str,
     predicate: &MutationPredicate,
     node_type: &crate::catalog::NodeType,
     param_types: &HashMap<String, PropType>,
 ) -> Result<()> {
-    let prop_type = node_type
-        .properties
-        .get(&predicate.property)
-        .ok_or_else(|| {
-            NanoError::Type(format!(
-                "T11: type `{}` has no property `{}`",
-                type_name, predicate.property
-            ))
-        })?;
-    check_match_value_type(
-        &predicate.value,
-        param_types,
-        prop_type,
-        &predicate.property,
-    )?;
+    let (property, _op, value) = require_single_compare_atom(predicate)?;
+    let prop_type = node_type.properties.get(property).ok_or_else(|| {
+        NanoError::Type(format!(
+            "T11: type `{}` has no property `{}`",
+            type_name, property
+        ))
+    })?;
+    check_match_value_type(value, param_types, prop_type, property)?;
     Ok(())
 }
 
@@ -436,30 +456,23 @@ fn typecheck_edge_mutation_predicate(
     edge_type: &crate::catalog::EdgeType,
     param_types: &HashMap<String, PropType>,
 ) -> Result<()> {
-    if predicate.property == "from" || predicate.property == "to" {
+    let (property, _op, value) = require_single_compare_atom(predicate)?;
+    if property == "from" || property == "to" {
         return check_match_value_type(
-            &predicate.value,
+            value,
             param_types,
             &PropType::scalar(ScalarType::String, false),
-            &predicate.property,
+            property,
         );
     }
 
-    let prop_type = edge_type
-        .properties
-        .get(&predicate.property)
-        .ok_or_else(|| {
-            NanoError::Type(format!(
-                "T11: type `{}` has no property `{}`",
-                type_name, predicate.property
-            ))
-        })?;
-    check_match_value_type(
-        &predicate.value,
-        param_types,
-        prop_type,
-        &predicate.property,
-    )?;
+    let prop_type = edge_type.properties.get(property).ok_or_else(|| {
+        NanoError::Type(format!(
+            "T11: type `{}` has no property `{}`",
+            type_name, property
+        ))
+    })?;
+    check_match_value_type(value, param_types, prop_type, property)?;
     Ok(())
 }
 

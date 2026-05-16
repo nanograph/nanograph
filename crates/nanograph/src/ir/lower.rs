@@ -90,19 +90,11 @@ pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
                     value: lower_match_value(&a.value, &param_names),
                 })
                 .collect(),
-            predicate: IRMutationPredicate {
-                property: update.predicate.property.clone(),
-                op: update.predicate.op,
-                value: lower_match_value(&update.predicate.value, &param_names),
-            },
+            predicate: lower_legacy_mutation_predicate(&update.predicate, &param_names)?,
         },
         Mutation::Delete(delete) => MutationOpIR::Delete {
             type_name: delete.type_name.clone(),
-            predicate: IRMutationPredicate {
-                property: delete.predicate.property.clone(),
-                op: delete.predicate.op,
-                value: lower_match_value(&delete.predicate.value, &param_names),
-            },
+            predicate: lower_legacy_mutation_predicate(&delete.predicate, &param_names)?,
         },
     };
 
@@ -461,6 +453,40 @@ fn lower_match_value(value: &MatchValue, param_names: &HashSet<String>) -> IRExp
                 IRExpr::Variable(v.clone())
             }
         }
+    }
+}
+
+/// Lower a single-Compare-atom mutation predicate into the legacy IR shape.
+/// Multi-atom blocks and IS NULL atoms are rejected at typecheck time; this
+/// helper exists to bridge the new AST shape to the still-single-atom IR until
+/// the conjunctive executor lands.
+fn lower_legacy_mutation_predicate(
+    predicate: &crate::query::ast::MutationPredicate,
+    param_names: &HashSet<String>,
+) -> Result<IRMutationPredicate> {
+    use crate::query::ast::MutationPredAtom;
+    if predicate.atoms.len() != 1 {
+        return Err(crate::error::NanoError::Plan(
+            "lower: multi-atom mutation predicates not yet wired through the executor"
+                .to_string(),
+        ));
+    }
+    match &predicate.atoms[0] {
+        MutationPredAtom::Compare {
+            property,
+            op,
+            value,
+        } => Ok(IRMutationPredicate {
+            property: property.clone(),
+            op: *op,
+            value: lower_match_value(value, param_names),
+        }),
+        MutationPredAtom::IsNull { .. } | MutationPredAtom::IsNotNull { .. } => Err(
+            crate::error::NanoError::Plan(
+                "lower: IS NULL / IS NOT NULL atoms not yet wired through the executor"
+                    .to_string(),
+            ),
+        ),
     }
 }
 

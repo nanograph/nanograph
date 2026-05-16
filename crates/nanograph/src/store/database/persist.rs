@@ -835,11 +835,18 @@ pub async fn run_mutation_query_sparse(
             else {
                 return Ok(MutationResult::default());
             };
+            let (pred_property, pred_op, pred_value) = update
+                .predicate
+                .legacy_single_compare()
+                .ok_or_else(|| NanoError::Plan(
+                    "sparse mutation: multi-atom `where` blocks are not yet supported"
+                        .to_string(),
+                ))?;
             let delete_pred = DeletePredicate {
-                property: update.predicate.property.clone(),
-                op: comp_op_to_delete_op(update.predicate.op)?,
+                property: pred_property.to_string(),
+                op: comp_op_to_delete_op(pred_op)?,
                 value: literal_to_predicate_string(&resolve_mutation_match_value(
-                    &update.predicate.value,
+                    pred_value,
                     &runtime_params,
                 )?)?,
             };
@@ -953,11 +960,18 @@ pub async fn run_mutation_query_sparse(
                 else {
                     return Ok(MutationResult::default());
                 };
+                let (pred_property, pred_op, pred_value) = delete
+                    .predicate
+                    .legacy_single_compare()
+                    .ok_or_else(|| NanoError::Plan(
+                        "sparse mutation: multi-atom `where` blocks are not yet supported"
+                            .to_string(),
+                    ))?;
                 let delete_pred = DeletePredicate {
-                    property: delete.predicate.property.clone(),
-                    op: comp_op_to_delete_op(delete.predicate.op)?,
+                    property: pred_property.to_string(),
+                    op: comp_op_to_delete_op(pred_op)?,
                     value: literal_to_predicate_string(&resolve_mutation_match_value(
-                        &delete.predicate.value,
+                        pred_value,
                         &runtime_params,
                     )?)?,
                 };
@@ -1014,12 +1028,19 @@ pub async fn run_mutation_query_sparse(
                 else {
                     return Ok(MutationResult::default());
                 };
+                let (edge_pred_property, edge_pred_op, edge_pred_value) = delete
+                    .predicate
+                    .legacy_single_compare()
+                    .ok_or_else(|| NanoError::Plan(
+                        "sparse edge mutation: multi-atom `where` blocks are not yet supported"
+                            .to_string(),
+                    ))?;
                 let Some(delete_pred) = map_sparse_edge_delete_predicate(
                     &metadata,
                     &delete.type_name,
-                    &delete.predicate.property,
-                    delete.predicate.op,
-                    &delete.predicate.value,
+                    edge_pred_property,
+                    edge_pred_op,
+                    edge_pred_value,
                     &runtime_params,
                 )
                 .await?

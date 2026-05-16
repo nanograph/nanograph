@@ -215,7 +215,50 @@ pub struct MutationAssignment {
 
 #[derive(Debug, Clone)]
 pub struct MutationPredicate {
-    pub property: String,
-    pub op: CompOp,
-    pub value: MatchValue,
+    pub atoms: Vec<MutationPredAtom>,
+}
+
+#[derive(Debug, Clone)]
+pub enum MutationPredAtom {
+    Compare {
+        property: String,
+        op: CompOp,
+        value: MatchValue,
+    },
+    IsNull {
+        property: String,
+    },
+    IsNotNull {
+        property: String,
+    },
+}
+
+impl MutationPredAtom {
+    /// Name of the property this atom predicates on.
+    pub fn property(&self) -> &str {
+        match self {
+            Self::Compare { property, .. }
+            | Self::IsNull { property }
+            | Self::IsNotNull { property } => property,
+        }
+    }
+}
+
+impl MutationPredicate {
+    /// Returns the single Compare atom's fields if the predicate is exactly
+    /// one Compare atom, otherwise None. Used by the sparse-mutation fast paths
+    /// while the multi-atom executor is still being wired up.
+    pub fn legacy_single_compare(&self) -> Option<(&str, CompOp, &MatchValue)> {
+        if self.atoms.len() != 1 {
+            return None;
+        }
+        match &self.atoms[0] {
+            MutationPredAtom::Compare {
+                property,
+                op,
+                value,
+            } => Some((property.as_str(), *op, value)),
+            _ => None,
+        }
+    }
 }
