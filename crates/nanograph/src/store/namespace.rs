@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lance::Dataset;
+use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode};
 use lance_io::object_store::{ObjectStore, ObjectStoreParams, ObjectStoreRegistry};
 use lance_namespace::LanceNamespace;
@@ -528,7 +529,9 @@ pub(crate) async fn namespace_merge_insert_with_key(
     builder
         .when_matched(WhenMatched::UpdateAll)
         .when_not_matched(WhenNotMatched::InsertAll)
-        .conflict_retries(0);
+        .conflict_retries(0)
+        // See lance_io.rs for rationale (CL-505).
+        .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
     let source_batch = logical_batch_to_lance(&source_batch, kind)?;
     let source_schema = source_batch.schema();
     let source = Box::new(arrow_array::RecordBatchIterator::new(
