@@ -73,12 +73,6 @@ jobs:
 
       - name: Install npm deps
         working-directory: crates/nanograph-ts
-        # --ignore-scripts skips the package's own `install` lifecycle hook
-        # (scripts/install.cjs), which is meant for end-user installs and
-        # tries to rebuild the .node when a bundled binary is missing — its
-        # Windows fallback path is broken (execFileSync of `napi.cmd` returns
-        # EINVAL) and its Linux/macOS path would do redundant work since we
-        # build explicitly in the next step.
         run: npm install --ignore-scripts
 
       - name: Build .node binary
@@ -122,7 +116,7 @@ jobs:
         run: |
           version=$(node -p "require('./package.json').version")
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "Publishing nanograph-db@$version"
+          echo "Publishing nanograph-db@$version (+5 per-platform packages)"
 
       - name: Verify version matches tag
         if: github.event_name == 'push'
@@ -134,53 +128,53 @@ jobs:
             exit 1
           fi
 
-      - name: Check if version already published
-        id: check
+      - name: Verify per-platform package versions match
+        working-directory: crates/nanograph-ts
         run: |
-          version="${{ steps.version.outputs.version }}"
-          # registry.npmjs.org doesn't have the UA-block issue api.crates.io
-          # has, so a plain GET works. 200 = exists, 404 = not yet published.
-          status=$(curl -s -o /dev/null -w "%{http_code}" \
-            "https://registry.npmjs.org/nanograph-db/$version")
-          if [ "$status" = "200" ]; then
-            echo "already_published=true" >> "$GITHUB_OUTPUT"
-            echo "nanograph-db $version is already on npm — will skip publish"
-          elif [ "$status" = "404" ]; then
-            echo "already_published=false" >> "$GITHUB_OUTPUT"
-            echo "nanograph-db $version is not yet on npm — will publish"
-          else
-            echo "::error::Unexpected HTTP status $status from npm registry check"
-            exit 1
-          fi
+          expected="${{ steps.version.outputs.version }}"
+          for dir in npm/*/; do
+            actual=$(node -p "require('./$dir/package.json').version")
+            if [ "$actual" != "$expected" ]; then
+              echo "::error::$dir has version $actual, expected $expected (run 'napi version' in crates/nanograph-ts)"
+              exit 1
+            fi
+          done
+
+      - name: Install npm deps
+        working-directory: crates/nanograph-ts
+        run: npm install --ignore-scripts
 
       - name: Download all .node artifacts
-        if: steps.check.outputs.already_published != 'true'
         uses: actions/download-artifact@v4
         with:
-          path: crates/nanograph-ts
+          path: crates/nanograph-ts/artifacts
           merge-multiple: true
 
-      - name: Verify all 5 platform binaries are present
-        if: steps.check.outputs.already_published != 'true'
+      - name: Move binaries into per-platform packages
+        working-directory: crates/nanograph-ts
+        run: npx napi artifacts --output-dir ./artifacts --npm-dir ./npm
+
+      - name: Verify all 5 platform packages have their binary
         working-directory: crates/nanograph-ts
         run: |
           missing=0
-          for binary in \
-            nanograph.darwin-arm64.node \
-            nanograph.darwin-x64.node \
-            nanograph.linux-x64-gnu.node \
-            nanograph.linux-arm64-gnu.node \
-            nanograph.win32-x64-msvc.node; do
-            if [ ! -f "$binary" ]; then
-              echo "::error::missing $binary"
+          for entry in \
+            "darwin-arm64:nanograph.darwin-arm64.node" \
+            "darwin-x64:nanograph.darwin-x64.node" \
+            "linux-x64-gnu:nanograph.linux-x64-gnu.node" \
+            "linux-arm64-gnu:nanograph.linux-arm64-gnu.node" \
+            "win32-x64-msvc:nanograph.win32-x64-msvc.node"; do
+            dir="${entry%%:*}"
+            file="${entry##*:}"
+            path="npm/$dir/$file"
+            if [ ! -f "$path" ]; then
+              echo "::error::missing $path"
               missing=$((missing + 1))
             else
-              echo "found $binary ($(stat -c%s "$binary") bytes)"
+              echo "found $path ($(stat -c%s "$path") bytes)"
             fi
           done
-          if [ $missing -gt 0 ]; then
-            exit 1
-          fi
+          if [ $missing -gt 0 ]; then exit 1; fi
 
       - name: Set publish flags
         id: flags
@@ -191,9 +185,42 @@ jobs:
             echo "args=" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Publish to npm
-        if: steps.check.outputs.already_published != 'true'
+      - name: Publish per-platform packages
         working-directory: crates/nanograph-ts
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --access public ${{ steps.flags.outputs.args }}
+        # idempotent: each platform package skipped if already on npm at this version
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          for dir in npm/*/; do
+            name=$(node -p "require('./$dir/package.json').name")
+            status=$(curl -s -o /dev/null -w "%{http_code}" \
+              "https://registry.npmjs.org/$name/$version")
+            if [ "$status" = "200" ]; then
+              echo "$name@$version already on npm — skipping"
+              continue
+            elif [ "$status" != "404" ]; then
+              echo "::error::Unexpected HTTP status $status checking $name@$version"
+              exit 1
+            fi
+            echo "Publishing $name@$version"
+            (cd "$dir" && npm publish --access public ${{ steps.flags.outputs.args }})
+          done
+
+      - name: Publish main package
+        working-directory: crates/nanograph-ts
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        # idempotent: skipped if main package already on npm at this version
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          status=$(curl -s -o /dev/null -w "%{http_code}" \
+            "https://registry.npmjs.org/nanograph-db/$version")
+          if [ "$status" = "200" ]; then
+            echo "nanograph-db@$version already on npm — skipping"
+            exit 0
+          elif [ "$status" != "404" ]; then
+            echo "::error::Unexpected HTTP status $status checking nanograph-db@$version"
+            exit 1
+          fi
+          npm publish --access public ${{ steps.flags.outputs.args }}
