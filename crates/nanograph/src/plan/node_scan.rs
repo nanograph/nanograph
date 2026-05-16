@@ -363,6 +363,17 @@ impl ExecutionPlan for NodeScanExec {
             };
             let text_query = self.text_query();
             let debug_dataset_version = locator.dataset_version;
+            // CL-512: gate fast_search on indexed point-lookup.
+            // Safe when: filter pushed to Lance (apply_after=false), exactly
+            // one Eq predicate, and the property is @key or @index. fast_search
+            // restricts execution to indexed data only, skipping the deletion
+            // mask join and any unindexed-data scan — the hot path for agent
+            // toolbelt point lookups (claim_issue, inspect, record_event).
+            let use_fast_search = !apply_filters_after_scan
+                && self.text_query().is_none()
+                && self.pushdown_filters.len() == 1
+                && self.pushdown_filters[0].op == CompOp::Eq
+                && self.pushdown_filters[0].index_eligible;
             let stream = futures::stream::once(async move {
                 let dataset = open_dataset_for_locator(&locator).await.map_err(|e| {
                     DataFusionError::Execution(format!("lance dataset open error: {}", e))
@@ -398,6 +409,9 @@ impl ExecutionPlan for NodeScanExec {
                     scanner.limit(Some(lim), None).map_err(|e| {
                         DataFusionError::Execution(format!("lance limit pushdown error: {}", e))
                     })?;
+                }
+                if use_fast_search {
+                    scanner.fast_search();
                 }
 
                 let mut scan_stream = scanner.try_into_stream().await.map_err(|e| {

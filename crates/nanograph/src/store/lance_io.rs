@@ -6,6 +6,7 @@ use arrow_array::{RecordBatch, RecordBatchIterator};
 use async_trait::async_trait;
 use futures::StreamExt;
 use lance::Dataset;
+use lance::dataset::write::merge_insert::SourceDedupeBehavior;
 use lance::dataset::{
     InsertBuilder, MergeInsertBuilder, WhenMatched, WhenNotMatched, WriteMode, WriteParams,
 };
@@ -493,7 +494,12 @@ async fn run_lance_merge_insert_with_key_versioned_for_kind(
     builder
         .when_matched(WhenMatched::UpdateAll)
         .when_not_matched(WhenNotMatched::InsertAll)
-        .conflict_retries(0);
+        .conflict_retries(0)
+        // Defensive: a sister project root-caused "Ambiguous merge inserts"
+        // failures in Lance 4.0.x when duplicate keys appeared in the source
+        // batch. FirstSeen makes the dedupe explicit and is harmless even if
+        // upstream fixed it. (Linear CL-505)
+        .source_dedupe_behavior(SourceDedupeBehavior::FirstSeen);
 
     let source_batch = logical_batch_to_lance(&source_batch, kind)?;
     let source_schema = source_batch.schema();
