@@ -1953,6 +1953,243 @@ query first_claim($name: String, $age: I32) {
 }
 
 #[tokio::test]
+async fn test_concurrent_cas_claim_exactly_one_wins() {
+    // The headline correctness claim: two simultaneous claims on the same row.
+    // The IS NULL gate combined with Lance's commit-level optimistic
+    // concurrency must guarantee exactly one matches — the other sees the
+    // gate fail at executor evaluation time (because the first claim's
+    // commit already flipped the column to non-null).
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(r#"{"type":"Person","data":{"name":"Bob"}}"#)
+        .await
+        .unwrap();
+
+    let claim = r#"
+query claim($name: String, $age: I32) {
+    update Person set { age: $age } where {
+        name = $name
+        age is null
+    }
+}
+"#;
+
+    let mut params_a = ParamMap::new();
+    params_a.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+    params_a.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(11),
+    );
+    let mut params_b = ParamMap::new();
+    params_b.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+    params_b.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(22),
+    );
+
+    let (r_a, r_b) = tokio::join!(
+        run_db_mutation_test_with_params(claim, &db, &params_a),
+        run_db_mutation_test_with_params(claim, &db, &params_b),
+    );
+
+    // Exactly one matched. The other's IS NULL gate failed because the first
+    // call's commit flipped the column to non-null before the second
+    // executor's mask construction read it.
+    let total_matched = r_a.matched_nodes + r_b.matched_nodes;
+    assert_eq!(
+        total_matched, 1,
+        "expected exactly one CAS winner, got a={} b={}",
+        r_a.matched_nodes, r_b.matched_nodes
+    );
+
+    // And the final row reflects exactly one winner — either 11 or 22, not both.
+    let rows = export_rows_for_db(&db).await;
+    let bob = rows
+        .iter()
+        .find(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Bob")
+        })
+        .unwrap();
+    let age = bob["data"]["age"].as_i64().unwrap();
+    assert!(age == 11 || age == 22, "unexpected final age {}", age);
+}
+
+#[tokio::test]
+async fn test_delete_with_conjunctive_where_block() {
+    // Conjunctive predicates work in delete too — only rows matching every
+    // atom should be removed.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":30}}
+{"type":"Person","data":{"name":"Carol","age":40}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(30),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query del($name: String, $age: I32) {
+    delete Person where {
+        name = $name
+        age = $age
+    }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.matched_nodes, 1);
+
+    // Bob (matches age but not name) and Carol (matches neither) survive.
+    let rows = export_rows_for_db(&db).await;
+    let persons: Vec<_> = rows
+        .iter()
+        .filter(|row| row.get("type").and_then(serde_json::Value::as_str) == Some("Person"))
+        .collect();
+    assert_eq!(persons.len(), 2);
+    assert!(
+        persons.iter().any(|p| p["data"]["name"] == "Bob"),
+        "Bob should survive"
+    );
+    assert!(
+        persons.iter().any(|p| p["data"]["name"] == "Carol"),
+        "Carol should survive"
+    );
+}
+
+#[tokio::test]
+async fn test_is_not_null_atom_in_where_block() {
+    // Symmetric with is_null — only rows where the property IS set should match.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob"}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let result = run_db_mutation_test_with_params(
+        r#"
+query clear_ages() {
+    delete Person where { age is not null }
+}
+"#,
+        &db,
+        &ParamMap::new(),
+    )
+    .await;
+    // Alice (age set) deleted; Bob (age null) survives.
+    assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.matched_nodes, 1);
+
+    let rows = export_rows_for_db(&db).await;
+    let persons: Vec<_> = rows
+        .iter()
+        .filter(|row| row.get("type").and_then(serde_json::Value::as_str) == Some("Person"))
+        .collect();
+    assert_eq!(persons.len(), 1);
+    assert_eq!(persons[0]["data"]["name"], "Bob");
+}
+
+#[tokio::test]
+async fn test_typecheck_is_null_on_non_nullable_property_fails() {
+    let catalog = build_catalog(
+        &parse_schema(
+            r#"
+node Person {
+    name: String @key
+    age: I32
+}
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let qf = parse_query(
+        r#"
+query del() {
+    delete Person where {
+        name = "x"
+        age is null
+    }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("T11") && msg.contains("non-nullable") && msg.contains("age"),
+        "expected non-nullable IS NULL error, got: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn test_typecheck_multi_atom_with_unknown_property_fails() {
+    let catalog = build_catalog(
+        &parse_schema(
+            r#"
+node Person {
+    name: String @key
+    age: I32?
+}
+"#,
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let qf = parse_query(
+        r#"
+query bad() {
+    update Person set { age: 1 } where {
+        name = "x"
+        nonexistent = 42
+    }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("T11") && msg.contains("nonexistent"),
+        "expected unknown property error, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn test_delete_edge_mutation_query() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");
