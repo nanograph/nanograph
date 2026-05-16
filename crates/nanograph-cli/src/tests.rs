@@ -804,9 +804,19 @@ fn parse_param_single_quote_value_does_not_panic() {
 #[test]
 fn parse_delete_predicate_single_quote_value_does_not_panic() {
     let pred = parse_delete_predicate("slug='").unwrap();
-    assert_eq!(pred.property, "slug");
-    assert_eq!(pred.op, DeleteOp::Eq);
-    assert_eq!(pred.value, "'");
+    assert_eq!(pred.atoms.len(), 1);
+    match &pred.atoms[0] {
+        nanograph::store::database::DeletePredAtom::Compare {
+            property,
+            op,
+            value,
+        } => {
+            assert_eq!(property, "slug");
+            assert_eq!(*op, DeleteOp::Eq);
+            assert_eq!(value, "'");
+        }
+        other => panic!("expected Compare atom, got {:?}", other),
+    }
 }
 
 #[test]

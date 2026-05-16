@@ -47,9 +47,32 @@ pub struct IRAssignment {
 
 #[derive(Debug, Clone)]
 pub struct IRMutationPredicate {
-    pub property: String,
-    pub op: CompOp,
-    pub value: IRExpr,
+    pub atoms: Vec<IRMutationPredAtom>,
+}
+
+#[derive(Debug, Clone)]
+pub enum IRMutationPredAtom {
+    Compare {
+        property: String,
+        op: CompOp,
+        value: IRExpr,
+    },
+    IsNull {
+        property: String,
+    },
+    IsNotNull {
+        property: String,
+    },
+}
+
+impl IRMutationPredAtom {
+    pub fn property(&self) -> &str {
+        match self {
+            Self::Compare { property, .. }
+            | Self::IsNull { property }
+            | Self::IsNotNull { property } => property,
+        }
+    }
 }
 
 /// Resolved runtime parameters: param name → literal value.

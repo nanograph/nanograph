@@ -1360,11 +1360,7 @@ async fn test_lance_v2_0_datasets_remain_operational_in_v0_11_0() {
         .unwrap();
     db.delete_edges(
         "Knows",
-        &DeletePredicate {
-            property: "src".to_string(),
-            op: DeleteOp::Eq,
-            value: "0".to_string(),
-        },
+        &DeletePredicate::compare("src".to_string(), DeleteOp::Eq, "0".to_string()),
     )
     .await
     .unwrap();
@@ -2291,11 +2287,7 @@ async fn test_delete_nodes_uses_lance_native_delete_path() {
 
     db.delete_nodes(
         "Person",
-        &DeletePredicate {
-            property: "name".to_string(),
-            op: DeleteOp::Eq,
-            value: "Bob".to_string(),
-        },
+        &DeletePredicate::compare("name".to_string(), DeleteOp::Eq, "Bob".to_string()),
     )
     .await
     .unwrap();
@@ -2332,11 +2324,7 @@ async fn test_compact_advances_dataset_versions_and_commits_manifest() {
     db.load(test_data_src()).await.unwrap();
     db.delete_edges(
         "Knows",
-        &DeletePredicate {
-            property: "src".to_string(),
-            op: DeleteOp::Eq,
-            value: "0".to_string(),
-        },
+        &DeletePredicate::compare("src".to_string(), DeleteOp::Eq, "0".to_string()),
     )
     .await
     .unwrap();
@@ -2381,11 +2369,7 @@ async fn test_cleanup_prunes_old_dataset_versions_but_keeps_manifest_visible_sta
     db.load(test_data_src()).await.unwrap();
     db.delete_edges(
         "Knows",
-        &DeletePredicate {
-            property: "src".to_string(),
-            op: DeleteOp::Eq,
-            value: "0".to_string(),
-        },
+        &DeletePredicate::compare("src".to_string(), DeleteOp::Eq, "0".to_string()),
     )
     .await
     .unwrap();
@@ -3073,11 +3057,7 @@ async fn test_delete_nodes_cascades_edges() {
     let result = db
         .delete_nodes(
             "Person",
-            &DeletePredicate {
-                property: "name".to_string(),
-                op: DeleteOp::Eq,
-                value: "Alice".to_string(),
-            },
+            &DeletePredicate::compare("name".to_string(), DeleteOp::Eq, "Alice".to_string()),
         )
         .await
         .unwrap();
@@ -3153,11 +3133,7 @@ async fn test_delete_edges_commits_through_mutation_pipeline() {
     let result = db
         .delete_edges(
             "Knows",
-            &DeletePredicate {
-                property: "src".to_string(),
-                op: DeleteOp::Eq,
-                value: alice_id.to_string(),
-            },
+            &DeletePredicate::compare("src".to_string(), DeleteOp::Eq, alice_id.to_string()),
         )
         .await
         .unwrap();
@@ -3207,11 +3183,7 @@ async fn test_delete_edges_uses_lance_native_delete_path() {
     let result = db
         .delete_edges(
             "Knows",
-            &DeletePredicate {
-                property: "dst".to_string(),
-                op: DeleteOp::Eq,
-                value: bob_id.to_string(),
-            },
+            &DeletePredicate::compare("dst".to_string(), DeleteOp::Eq, bob_id.to_string()),
         )
         .await
         .unwrap();

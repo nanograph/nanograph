@@ -3285,11 +3285,7 @@ fn parse_delete_predicate(input: &str) -> Result<DeletePredicate> {
 
             let value = strip_matching_quotes(raw_value).to_string();
 
-            return Ok(DeletePredicate {
-                property: property.to_string(),
-                op,
-                value,
-            });
+            return Ok(DeletePredicate::compare(property.to_string(), op, value));
         }
     }
 

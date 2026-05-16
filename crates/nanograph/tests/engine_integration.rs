@@ -1660,6 +1660,149 @@ query q() {
 }
 
 #[tokio::test]
+async fn test_update_with_conjunctive_where_block() {
+    // Verify the new `where { atom+ }` block AND's atoms conjunctively:
+    // only rows matching every atom should be touched.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(keyed_mutation_data()).await.unwrap();
+
+    // Alice is age 30; Bob is age 25. Update only the row whose name
+    // is "Alice" AND age is 30 — should affect exactly 1 row.
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params.insert(
+        "expected".to_string(),
+        nanograph::query::ast::Literal::Integer(30),
+    );
+    params.insert(
+        "next".to_string(),
+        nanograph::query::ast::Literal::Integer(31),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query bump_age($name: String, $expected: I32, $next: I32) {
+    update Person set { age: $next } where {
+        name = $name
+        age = $expected
+    }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+
+    // Calling the same mutation again should be a no-op now that age = 31,
+    // not 30 — the conjunctive predicate fails on the age atom.
+    let result2 = run_db_mutation_test_with_params(
+        r#"
+query bump_age($name: String, $expected: I32, $next: I32) {
+    update Person set { age: $next } where {
+        name = $name
+        age = $expected
+    }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result2.affected_nodes, 0);
+}
+
+#[tokio::test]
+async fn test_update_with_is_null_atom_in_where_block() {
+    // Race-safe claim pattern: only update rows where the gate field is null.
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    // Seed with one row whose age is null and one whose age is set.
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob"}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    // Update Bob (age is null) — should affect 1 row.
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+    params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(42),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query first_claim($name: String, $age: I32) {
+    update Person set { age: $age } where {
+        name = $name
+        age is null
+    }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+
+    // Same call again — Bob's age is no longer null, so the gate fails.
+    let result2 = run_db_mutation_test_with_params(
+        r#"
+query first_claim($name: String, $age: I32) {
+    update Person set { age: $age } where {
+        name = $name
+        age is null
+    }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result2.affected_nodes, 0);
+
+    // Alice's age was 30 (not null) from the start — the gate excludes her.
+    let mut params_alice = ParamMap::new();
+    params_alice.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params_alice.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(99),
+    );
+    let result3 = run_db_mutation_test_with_params(
+        r#"
+query first_claim($name: String, $age: I32) {
+    update Person set { age: $age } where {
+        name = $name
+        age is null
+    }
+}
+"#,
+        &db,
+        &params_alice,
+    )
+    .await;
+    assert_eq!(result3.affected_nodes, 0);
+}
+
+#[tokio::test]
 async fn test_delete_edge_mutation_query() {
     let dir = tempfile::TempDir::new().unwrap();
     let db_path = dir.path().join("db");

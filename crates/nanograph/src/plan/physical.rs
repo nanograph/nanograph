@@ -18,12 +18,17 @@ use datafusion_physical_plan::{
 };
 
 use crate::error::{NanoError, Result};
-use crate::ir::{IRAssignment, IRExpr, IRMutationPredicate, MutationIR, MutationOpIR, ParamMap};
+use crate::ir::{
+    IRAssignment, IRExpr, IRMutationPredAtom, IRMutationPredicate, MutationIR, MutationOpIR,
+    ParamMap,
+};
 use crate::plan::bindings::{binding_property_array, flat_binding_col, split_flat_binding_col};
 use crate::query::ast::{CompOp, Literal};
 use crate::store::csr::CsrIndex;
 use crate::store::database::persist::{read_sparse_node_batch, resolve_sparse_node_id_by_name};
-use crate::store::database::{Database, DatabaseWriteGuard, DeleteOp, DeletePredicate};
+use crate::store::database::{
+    Database, DatabaseWriteGuard, DeleteOp, DeletePredAtom, DeletePredicate,
+};
 use crate::store::metadata::DatabaseMetadata;
 use crate::store::runtime::{DatabaseRuntime, EdgeIndexPair, NodeLookup};
 use crate::types::Direction;
@@ -824,39 +829,38 @@ async fn execute_delete_edge_mutation(
     let src_type = edge_type.from_type.clone();
     let dst_type = edge_type.to_type.clone();
 
-    let delete_pred = build_delete_predicate(predicate, params)?;
-    let mapped_pred = match predicate.property.as_str() {
-        "from" => {
-            let endpoint = resolve_mutation_literal(&predicate.value, params)?;
-            let endpoint_name = literal_to_endpoint_name(&endpoint, "from")?;
-            let metadata = DatabaseMetadata::open(db.path())?;
-            let Some(src_id) =
-                resolve_sparse_node_id_by_name(&metadata, &src_type, &endpoint_name).await?
-            else {
-                return Ok(MutationExecResult::default());
-            };
-            DeletePredicate {
-                property: "src".to_string(),
-                op: delete_pred.op,
-                value: src_id.to_string(),
+    let mut mapped_atoms = Vec::with_capacity(predicate.atoms.len());
+    for atom in &predicate.atoms {
+        match atom {
+            IRMutationPredAtom::Compare {
+                property,
+                op,
+                value,
+            } if property == "from" || property == "to" => {
+                let endpoint = resolve_mutation_literal(value, params)?;
+                let endpoint_name = literal_to_endpoint_name(&endpoint, property)?;
+                let metadata = DatabaseMetadata::open(db.path())?;
+                let (target_type, internal_col) = if property == "from" {
+                    (&src_type, "src")
+                } else {
+                    (&dst_type, "dst")
+                };
+                let Some(node_id) =
+                    resolve_sparse_node_id_by_name(&metadata, target_type, &endpoint_name).await?
+                else {
+                    return Ok(MutationExecResult::default());
+                };
+                mapped_atoms.push(DeletePredAtom::Compare {
+                    property: internal_col.to_string(),
+                    op: comp_op_to_delete_op(*op)?,
+                    value: node_id.to_string(),
+                });
             }
+            other => mapped_atoms.push(ir_atom_to_delete_atom(other, params)?),
         }
-        "to" => {
-            let endpoint = resolve_mutation_literal(&predicate.value, params)?;
-            let endpoint_name = literal_to_endpoint_name(&endpoint, "to")?;
-            let metadata = DatabaseMetadata::open(db.path())?;
-            let Some(dst_id) =
-                resolve_sparse_node_id_by_name(&metadata, &dst_type, &endpoint_name).await?
-            else {
-                return Ok(MutationExecResult::default());
-            };
-            DeletePredicate {
-                property: "dst".to_string(),
-                op: delete_pred.op,
-                value: dst_id.to_string(),
-            }
-        }
-        _ => delete_pred,
+    }
+    let mapped_pred = DeletePredicate {
+        atoms: mapped_atoms,
     };
 
     let result = db
@@ -872,12 +876,38 @@ fn build_delete_predicate(
     predicate: &IRMutationPredicate,
     params: &ParamMap,
 ) -> Result<DeletePredicate> {
-    let lit = resolve_mutation_literal(&predicate.value, params)?;
-    Ok(DeletePredicate {
-        property: predicate.property.clone(),
-        op: comp_op_to_delete_op(predicate.op)?,
-        value: literal_to_predicate_string(&lit)?,
-    })
+    let atoms = predicate
+        .atoms
+        .iter()
+        .map(|a| ir_atom_to_delete_atom(a, params))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(DeletePredicate { atoms })
+}
+
+fn ir_atom_to_delete_atom(
+    atom: &IRMutationPredAtom,
+    params: &ParamMap,
+) -> Result<DeletePredAtom> {
+    match atom {
+        IRMutationPredAtom::Compare {
+            property,
+            op,
+            value,
+        } => {
+            let lit = resolve_mutation_literal(value, params)?;
+            Ok(DeletePredAtom::Compare {
+                property: property.clone(),
+                op: comp_op_to_delete_op(*op)?,
+                value: literal_to_predicate_string(&lit)?,
+            })
+        }
+        IRMutationPredAtom::IsNull { property } => Ok(DeletePredAtom::IsNull {
+            property: property.clone(),
+        }),
+        IRMutationPredAtom::IsNotNull { property } => Ok(DeletePredAtom::IsNotNull {
+            property: property.clone(),
+        }),
+    }
 }
 
 fn resolve_mutation_literal(expr: &IRExpr, params: &ParamMap) -> Result<Literal> {

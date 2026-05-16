@@ -10,13 +10,15 @@ use tracing::{debug, info, warn};
 
 use super::mutation::{DatasetMutationPlan, EdgeDelta, MutationDelta, NodeDelta};
 use super::{
-    Database, DatabaseWriteGuard, DeletePredicate, EmbedOptions, EmbedResult, LoadMode,
-    MutationPlan, MutationSource,
+    Database, DatabaseWriteGuard, DeletePredAtom, DeletePredicate, EmbedOptions, EmbedResult,
+    LoadMode, MutationPlan, MutationSource,
 };
 use crate::catalog::schema_ir::SchemaIR;
 use crate::error::{NanoError, Result};
 use crate::json_output::array_value_to_json;
-use crate::query::ast::{CompOp, Literal, MatchValue, Mutation, QueryDecl};
+use crate::query::ast::{
+    CompOp, Literal, MatchValue, Mutation, MutationPredAtom, MutationPredicate, QueryDecl,
+};
 use crate::result::MutationResult;
 use crate::store::graph::DatasetAccumulator;
 use crate::store::graph_mirror::rebuild_graph_mirror_from_wal;
@@ -835,21 +837,8 @@ pub async fn run_mutation_query_sparse(
             else {
                 return Ok(MutationResult::default());
             };
-            let (pred_property, pred_op, pred_value) = update
-                .predicate
-                .legacy_single_compare()
-                .ok_or_else(|| NanoError::Plan(
-                    "sparse mutation: multi-atom `where` blocks are not yet supported"
-                        .to_string(),
-                ))?;
-            let delete_pred = DeletePredicate {
-                property: pred_property.to_string(),
-                op: comp_op_to_delete_op(pred_op)?,
-                value: literal_to_predicate_string(&resolve_mutation_match_value(
-                    pred_value,
-                    &runtime_params,
-                )?)?,
-            };
+            let delete_pred =
+                ast_predicate_to_delete_predicate(&update.predicate, &runtime_params)?;
             let match_mask = crate::store::database::build_delete_mask_for_mutation(
                 &target_batch,
                 &delete_pred,
@@ -960,21 +949,8 @@ pub async fn run_mutation_query_sparse(
                 else {
                     return Ok(MutationResult::default());
                 };
-                let (pred_property, pred_op, pred_value) = delete
-                    .predicate
-                    .legacy_single_compare()
-                    .ok_or_else(|| NanoError::Plan(
-                        "sparse mutation: multi-atom `where` blocks are not yet supported"
-                            .to_string(),
-                    ))?;
-                let delete_pred = DeletePredicate {
-                    property: pred_property.to_string(),
-                    op: comp_op_to_delete_op(pred_op)?,
-                    value: literal_to_predicate_string(&resolve_mutation_match_value(
-                        pred_value,
-                        &runtime_params,
-                    )?)?,
-                };
+                let delete_pred =
+                    ast_predicate_to_delete_predicate(&delete.predicate, &runtime_params)?;
                 let delete_mask = crate::store::database::build_delete_mask_for_mutation(
                     &target_batch,
                     &delete_pred,
@@ -1028,19 +1004,10 @@ pub async fn run_mutation_query_sparse(
                 else {
                     return Ok(MutationResult::default());
                 };
-                let (edge_pred_property, edge_pred_op, edge_pred_value) = delete
-                    .predicate
-                    .legacy_single_compare()
-                    .ok_or_else(|| NanoError::Plan(
-                        "sparse edge mutation: multi-atom `where` blocks are not yet supported"
-                            .to_string(),
-                    ))?;
                 let Some(delete_pred) = map_sparse_edge_delete_predicate(
                     &metadata,
                     &delete.type_name,
-                    edge_pred_property,
-                    edge_pred_op,
-                    edge_pred_value,
+                    &delete.predicate,
                     &runtime_params,
                 )
                 .await?
@@ -1826,66 +1793,85 @@ pub(crate) fn filter_record_batch_by_delete_mask(
         .map_err(|e| NanoError::Storage(format!("{} delete filter error: {}", entity_kind, e)))
 }
 
+fn ast_atom_to_delete_atom(
+    atom: &MutationPredAtom,
+    params: &crate::ParamMap,
+) -> Result<DeletePredAtom> {
+    match atom {
+        MutationPredAtom::Compare {
+            property,
+            op,
+            value,
+        } => Ok(DeletePredAtom::Compare {
+            property: property.clone(),
+            op: comp_op_to_delete_op(*op)?,
+            value: literal_to_predicate_string(&resolve_mutation_match_value(value, params)?)?,
+        }),
+        MutationPredAtom::IsNull { property } => Ok(DeletePredAtom::IsNull {
+            property: property.clone(),
+        }),
+        MutationPredAtom::IsNotNull { property } => Ok(DeletePredAtom::IsNotNull {
+            property: property.clone(),
+        }),
+    }
+}
+
+fn ast_predicate_to_delete_predicate(
+    predicate: &MutationPredicate,
+    params: &crate::ParamMap,
+) -> Result<DeletePredicate> {
+    let atoms = predicate
+        .atoms
+        .iter()
+        .map(|a| ast_atom_to_delete_atom(a, params))
+        .collect::<Result<Vec<_>>>()?;
+    Ok(DeletePredicate { atoms })
+}
+
 async fn map_sparse_edge_delete_predicate(
     metadata: &DatabaseMetadata,
     edge_type_name: &str,
-    property: &str,
-    op: CompOp,
-    value: &MatchValue,
+    predicate: &MutationPredicate,
     params: &crate::ParamMap,
 ) -> Result<Option<DeletePredicate>> {
-    let delete_op = comp_op_to_delete_op(op)?;
-    match property {
-        "from" => {
-            let edge_type = metadata
-                .catalog()
-                .edge_types
-                .get(edge_type_name)
-                .ok_or_else(|| {
-                    NanoError::Execution(format!("unknown edge type `{}`", edge_type_name))
-                })?;
-            let endpoint = resolve_mutation_match_value(value, params)?;
-            let endpoint_name = literal_to_endpoint_name(&endpoint, "from")?;
-            let Some(src_id) =
-                resolve_sparse_node_id_by_name(metadata, &edge_type.from_type, &endpoint_name)
-                    .await?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(DeletePredicate {
-                property: "src".to_string(),
-                op: delete_op,
-                value: src_id.to_string(),
-            }))
+    let edge_type = metadata
+        .catalog()
+        .edge_types
+        .get(edge_type_name)
+        .ok_or_else(|| NanoError::Execution(format!("unknown edge type `{}`", edge_type_name)))?;
+    let from_type = edge_type.from_type.clone();
+    let to_type = edge_type.to_type.clone();
+
+    let mut atoms = Vec::with_capacity(predicate.atoms.len());
+    for atom in &predicate.atoms {
+        match atom {
+            MutationPredAtom::Compare {
+                property,
+                op,
+                value,
+            } if property == "from" || property == "to" => {
+                let endpoint = resolve_mutation_match_value(value, params)?;
+                let endpoint_name = literal_to_endpoint_name(&endpoint, property)?;
+                let (target_type, internal_col) = if property == "from" {
+                    (&from_type, "src")
+                } else {
+                    (&to_type, "dst")
+                };
+                let Some(node_id) =
+                    resolve_sparse_node_id_by_name(metadata, target_type, &endpoint_name).await?
+                else {
+                    return Ok(None);
+                };
+                atoms.push(DeletePredAtom::Compare {
+                    property: internal_col.to_string(),
+                    op: comp_op_to_delete_op(*op)?,
+                    value: node_id.to_string(),
+                });
+            }
+            other => atoms.push(ast_atom_to_delete_atom(other, params)?),
         }
-        "to" => {
-            let edge_type = metadata
-                .catalog()
-                .edge_types
-                .get(edge_type_name)
-                .ok_or_else(|| {
-                    NanoError::Execution(format!("unknown edge type `{}`", edge_type_name))
-                })?;
-            let endpoint = resolve_mutation_match_value(value, params)?;
-            let endpoint_name = literal_to_endpoint_name(&endpoint, "to")?;
-            let Some(dst_id) =
-                resolve_sparse_node_id_by_name(metadata, &edge_type.to_type, &endpoint_name)
-                    .await?
-            else {
-                return Ok(None);
-            };
-            Ok(Some(DeletePredicate {
-                property: "dst".to_string(),
-                op: delete_op,
-                value: dst_id.to_string(),
-            }))
-        }
-        _ => Ok(Some(DeletePredicate {
-            property: property.to_string(),
-            op: delete_op,
-            value: literal_to_predicate_string(&resolve_mutation_match_value(value, params)?)?,
-        })),
     }
+    Ok(Some(DeletePredicate { atoms }))
 }
 
 pub(crate) async fn resolve_sparse_node_id_by_name(

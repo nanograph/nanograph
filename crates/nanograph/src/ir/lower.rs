@@ -456,38 +456,41 @@ fn lower_match_value(value: &MatchValue, param_names: &HashSet<String>) -> IRExp
     }
 }
 
-/// Lower a single-Compare-atom mutation predicate into the legacy IR shape.
-/// Multi-atom blocks and IS NULL atoms are rejected at typecheck time; this
-/// helper exists to bridge the new AST shape to the still-single-atom IR until
-/// the conjunctive executor lands.
+/// Lower an AST mutation predicate (Vec of atoms) into the IR shape.
+/// Each atom is lowered independently; the executor composes the masks via
+/// kleene-AND.
 fn lower_legacy_mutation_predicate(
     predicate: &crate::query::ast::MutationPredicate,
     param_names: &HashSet<String>,
 ) -> Result<IRMutationPredicate> {
     use crate::query::ast::MutationPredAtom;
-    if predicate.atoms.len() != 1 {
+    if predicate.atoms.is_empty() {
         return Err(crate::error::NanoError::Plan(
-            "lower: multi-atom mutation predicates not yet wired through the executor"
-                .to_string(),
+            "lower: mutation predicate has no atoms".to_string(),
         ));
     }
-    match &predicate.atoms[0] {
-        MutationPredAtom::Compare {
-            property,
-            op,
-            value,
-        } => Ok(IRMutationPredicate {
-            property: property.clone(),
-            op: *op,
-            value: lower_match_value(value, param_names),
-        }),
-        MutationPredAtom::IsNull { .. } | MutationPredAtom::IsNotNull { .. } => Err(
-            crate::error::NanoError::Plan(
-                "lower: IS NULL / IS NOT NULL atoms not yet wired through the executor"
-                    .to_string(),
-            ),
-        ),
-    }
+    let atoms = predicate
+        .atoms
+        .iter()
+        .map(|atom| match atom {
+            MutationPredAtom::Compare {
+                property,
+                op,
+                value,
+            } => IRMutationPredAtom::Compare {
+                property: property.clone(),
+                op: *op,
+                value: lower_match_value(value, param_names),
+            },
+            MutationPredAtom::IsNull { property } => IRMutationPredAtom::IsNull {
+                property: property.clone(),
+            },
+            MutationPredAtom::IsNotNull { property } => IRMutationPredAtom::IsNotNull {
+                property: property.clone(),
+            },
+        })
+        .collect();
+    Ok(IRMutationPredicate { atoms })
 }
 
 #[cfg(test)]
@@ -579,7 +582,13 @@ query q($name: String, $age: I32) {
                 assert_eq!(type_name, "Person");
                 assert_eq!(assignments.len(), 1);
                 assert_eq!(assignments[0].property, "age");
-                assert_eq!(predicate.property, "name");
+                assert_eq!(predicate.atoms.len(), 1);
+                match &predicate.atoms[0] {
+                    IRMutationPredAtom::Compare { property, .. } => {
+                        assert_eq!(property, "name");
+                    }
+                    other => panic!("expected Compare atom, got {:?}", other),
+                }
             }
             _ => panic!("expected update mutation op"),
         }
@@ -673,10 +682,16 @@ query stamp() {
                     assignments[0].value,
                     IRExpr::Param(ref name) if name == NOW_PARAM_NAME
                 ));
-                assert!(matches!(
-                    predicate.value,
-                    IRExpr::Param(ref name) if name == NOW_PARAM_NAME
-                ));
+                assert_eq!(predicate.atoms.len(), 1);
+                match &predicate.atoms[0] {
+                    IRMutationPredAtom::Compare { value, .. } => {
+                        assert!(matches!(
+                            value,
+                            IRExpr::Param(name) if name == NOW_PARAM_NAME
+                        ));
+                    }
+                    other => panic!("expected Compare atom, got {:?}", other),
+                }
             }
             _ => panic!("expected update mutation op"),
         }

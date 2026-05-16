@@ -69,9 +69,45 @@ pub enum LoadMode {
 
 #[derive(Debug, Clone)]
 pub struct DeletePredicate {
-    pub property: String,
-    pub op: DeleteOp,
-    pub value: String,
+    pub atoms: Vec<DeletePredAtom>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DeletePredAtom {
+    Compare {
+        property: String,
+        op: DeleteOp,
+        value: String,
+    },
+    IsNull {
+        property: String,
+    },
+    IsNotNull {
+        property: String,
+    },
+}
+
+impl DeletePredicate {
+    /// Single-Compare predicate (the common case).
+    pub fn compare(property: String, op: DeleteOp, value: String) -> Self {
+        Self {
+            atoms: vec![DeletePredAtom::Compare {
+                property,
+                op,
+                value,
+            }],
+        }
+    }
+}
+
+impl DeletePredAtom {
+    pub fn property(&self) -> &str {
+        match self {
+            Self::Compare { property, .. }
+            | Self::IsNull { property }
+            | Self::IsNotNull { property } => property,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
