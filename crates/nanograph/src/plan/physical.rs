@@ -583,6 +583,8 @@ mod tests {
 pub struct MutationExecResult {
     pub affected_nodes: usize,
     pub affected_edges: usize,
+    /// See `crate::result::MutationResult::matched_nodes`.
+    pub matched_nodes: usize,
 }
 
 pub(crate) async fn execute_mutation(
@@ -649,6 +651,7 @@ async fn execute_put_mutation(
     Ok(MutationExecResult {
         affected_nodes: 1,
         affected_edges: 0,
+        matched_nodes: 1,
     })
 }
 
@@ -699,6 +702,7 @@ async fn execute_put_edge_mutation(
     Ok(MutationExecResult {
         affected_nodes: 0,
         affected_edges: 1,
+        matched_nodes: 1,
     })
 }
 
@@ -736,6 +740,7 @@ async fn execute_insert_mutation(
     Ok(MutationExecResult {
         affected_nodes: 1,
         affected_edges: 0,
+        matched_nodes: 0,
     })
 }
 
@@ -791,6 +796,7 @@ async fn execute_insert_edge_mutation(
     Ok(MutationExecResult {
         affected_nodes: 0,
         affected_edges: 1,
+        matched_nodes: 0,
     })
 }
 
@@ -877,6 +883,7 @@ async fn execute_update_mutation(
     Ok(MutationExecResult {
         affected_nodes: matched_rows.len(),
         affected_edges: 0,
+        matched_nodes: matched_rows.len(),
     })
 }
 
@@ -895,6 +902,7 @@ async fn execute_delete_mutation(
         return Ok(MutationExecResult {
             affected_nodes: result.deleted_nodes,
             affected_edges: result.deleted_edges,
+            matched_nodes: result.deleted_nodes,
         });
     }
 
@@ -963,6 +971,7 @@ async fn execute_delete_edge_mutation(
     Ok(MutationExecResult {
         affected_nodes: 0,
         affected_edges: result.deleted_edges,
+        matched_nodes: result.deleted_edges,
     })
 }
 

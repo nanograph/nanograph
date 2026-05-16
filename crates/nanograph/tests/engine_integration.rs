@@ -253,6 +253,7 @@ async fn run_db_mutation_test_with_params(
         nanograph::RunResult::Mutation(result) => MutationExecResult {
             affected_nodes: result.affected_nodes,
             affected_edges: result.affected_edges,
+            matched_nodes: result.matched_nodes,
         },
         nanograph::RunResult::Query(_) => panic!("expected mutation result"),
     }
@@ -1901,6 +1902,7 @@ query first_claim($name: String, $age: I32) {
     )
     .await;
     assert_eq!(result.affected_nodes, 1);
+    assert_eq!(result.matched_nodes, 1, "CAS won → matched_nodes is 1");
 
     // Same call again — Bob's age is no longer null, so the gate fails.
     let result2 = run_db_mutation_test_with_params(
@@ -1917,6 +1919,10 @@ query first_claim($name: String, $age: I32) {
     )
     .await;
     assert_eq!(result2.affected_nodes, 0);
+    assert_eq!(
+        result2.matched_nodes, 0,
+        "CAS lost → matched_nodes is 0 (the canonical agent signal)"
+    );
 
     // Alice's age was 30 (not null) from the start — the gate excludes her.
     let mut params_alice = ParamMap::new();

@@ -705,6 +705,7 @@ pub async fn run_mutation_query_sparse(
                 return Ok(MutationResult {
                     affected_nodes,
                     affected_edges: 0,
+                    matched_nodes: 0,
                 });
             }
             if metadata
@@ -789,6 +790,7 @@ pub async fn run_mutation_query_sparse(
                 return Ok(MutationResult {
                     affected_nodes: 0,
                     affected_edges,
+                    matched_nodes: 0,
                 });
             }
             Err(NanoError::Execution(format!(
@@ -937,6 +939,7 @@ pub async fn run_mutation_query_sparse(
             Ok(MutationResult {
                 affected_nodes,
                 affected_edges: 0,
+                matched_nodes: affected_nodes,
             })
         }
         Mutation::Delete(delete) => {
@@ -1000,6 +1003,7 @@ pub async fn run_mutation_query_sparse(
                 return Ok(MutationResult {
                     affected_nodes: delete_ids.len(),
                     affected_edges: 0,
+                    matched_nodes: delete_ids.len(),
                 });
             }
             if metadata
@@ -1063,6 +1067,7 @@ pub async fn run_mutation_query_sparse(
                 return Ok(MutationResult {
                     affected_nodes: 0,
                     affected_edges: delete_ids.len(),
+                    matched_nodes: delete_ids.len(),
                 });
             }
             Err(NanoError::Execution(format!(
