@@ -1762,7 +1762,10 @@ query ensure_knows($from: String, $to: String) {
     let r1 = run_db_mutation_test_with_params(put, &db, &params).await;
     assert_eq!(r1.affected_edges, 1);
     let r2 = run_db_mutation_test_with_params(put, &db, &params).await;
-    assert_eq!(r2.affected_edges, 1, "put reports the row touched each call");
+    assert_eq!(
+        r2.affected_edges, 1,
+        "put reports the row touched each call"
+    );
 
     // No duplicate edges after two calls.
     let rows = export_rows_for_db(&db).await;
@@ -1783,8 +1786,7 @@ node Tag {
     name: String
 }
 "#;
-    let parsed_schema =
-        nanograph::schema::parser::parse_schema(schema).expect("parse schema");
+    let parsed_schema = nanograph::schema::parser::parse_schema(schema).expect("parse schema");
     let catalog = build_catalog(&parsed_schema).expect("build catalog");
     let qf = parse_query(
         r#"

@@ -987,10 +987,7 @@ fn build_delete_predicate(
     Ok(DeletePredicate { atoms })
 }
 
-fn ir_atom_to_delete_atom(
-    atom: &IRMutationPredAtom,
-    params: &ParamMap,
-) -> Result<DeletePredAtom> {
+fn ir_atom_to_delete_atom(atom: &IRMutationPredAtom, params: &ParamMap) -> Result<DeletePredAtom> {
     match atom {
         IRMutationPredAtom::Compare {
             property,

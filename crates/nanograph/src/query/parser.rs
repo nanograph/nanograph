@@ -380,9 +380,10 @@ fn parse_mutation_assignment(pair: pest::iterators::Pair<Rule>) -> Result<Mutati
 }
 
 fn parse_mutation_predicate(pair: pest::iterators::Pair<Rule>) -> Result<MutationPredicate> {
-    let inner = pair.into_inner().next().ok_or_else(|| {
-        NanoError::Parse("mutation predicate is empty".to_string())
-    })?;
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| NanoError::Parse("mutation predicate is empty".to_string()))?;
     match inner.as_rule() {
         Rule::mutation_pred_atom => {
             let atom = parse_mutation_pred_atom(inner)?;
@@ -409,9 +410,10 @@ fn parse_mutation_predicate(pair: pest::iterators::Pair<Rule>) -> Result<Mutatio
 }
 
 fn parse_mutation_pred_atom(pair: pest::iterators::Pair<Rule>) -> Result<MutationPredAtom> {
-    let inner = pair.into_inner().next().ok_or_else(|| {
-        NanoError::Parse("mutation predicate atom is empty".to_string())
-    })?;
+    let inner = pair
+        .into_inner()
+        .next()
+        .ok_or_else(|| NanoError::Parse("mutation predicate atom is empty".to_string()))?;
     match inner.as_rule() {
         Rule::compare_pred => {
             let mut parts = inner.into_inner();

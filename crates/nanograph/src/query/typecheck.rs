@@ -195,16 +195,15 @@ fn validate_insert_like(
 
     if let Some(node_type) = catalog.node_types.get(&insert.type_name) {
         for assignment in &insert.assignments {
-            let prop_type =
-                node_type
-                    .properties
-                    .get(&assignment.property)
-                    .ok_or_else(|| {
-                        NanoError::Type(format!(
-                            "T11: type `{}` has no property `{}`",
-                            insert.type_name, assignment.property
-                        ))
-                    })?;
+            let prop_type = node_type
+                .properties
+                .get(&assignment.property)
+                .ok_or_else(|| {
+                    NanoError::Type(format!(
+                        "T11: type `{}` has no property `{}`",
+                        insert.type_name, assignment.property
+                    ))
+                })?;
             check_match_value_type(
                 &assignment.value,
                 param_types,
@@ -269,15 +268,16 @@ fn validate_insert_like(
                     )?;
                 }
                 _ => {
-                    let prop_type = edge_type
-                        .properties
-                        .get(&assignment.property)
-                        .ok_or_else(|| {
-                            NanoError::Type(format!(
-                                "T11: type `{}` has no property `{}`",
-                                insert.type_name, assignment.property
-                            ))
-                        })?;
+                    let prop_type =
+                        edge_type
+                            .properties
+                            .get(&assignment.property)
+                            .ok_or_else(|| {
+                                NanoError::Type(format!(
+                                    "T11: type `{}` has no property `{}`",
+                                    insert.type_name, assignment.property
+                                ))
+                            })?;
                     check_match_value_type(
                         &assignment.value,
                         param_types,

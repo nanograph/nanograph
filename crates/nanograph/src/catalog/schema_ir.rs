@@ -290,11 +290,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                     fields.push(Field::new(&prop.name, prop_type.to_arrow(), prop.nullable));
                 }
 
-                let key_property = n
-                    .properties
-                    .iter()
-                    .find(|p| p.key)
-                    .map(|p| p.name.clone());
+                let key_property = n.properties.iter().find(|p| p.key).map(|p| p.name.clone());
 
                 node_types.insert(
                     n.name.clone(),

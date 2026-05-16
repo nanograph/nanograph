@@ -477,8 +477,8 @@ This work is done when:
 
 ## Decision log
 
-To be appended as decisions are taken on the open questions.
-
-- **(open)** Q1: `null` literal in `prop_match` braces — recommended yes.
-- **(open)** Q2: `returning` implicit binding name — recommended `$<lowercase first letter>` of type.
-- **(open)** Q3: list parameter type syntax — recommended `[String]` matching list literals.
+- **2026-05 (shipped, PR-1)** Mutation predicate shape: chose **`where { atom+ }` block** over the `AND`-keyword conjunction. Conjunction is structural (no boolean operators); OR is unrepresentable at the grammar level. See `ql-canon.md` "Acknowledged tensions → Mutation predicate strength".
+- **2026-05 (shipped, PR-1)** PR-1 features landed: `put` (upsert), `where { }` block, `IS NULL` / `IS NOT NULL` in mutation predicates, `matched_nodes` on `MutationResult`.
+- **(deferred to PR-2)** Q1: `null` literal in `prop_match` braces and `IS NULL` in `match` filters — read-side ergonomics, not blocking the agent toolbelt. Requires reworking `IRFilter` to enum form; deferred to its own PR.
+- **(open, PR-2)** Q2: `returning` implicit binding name — recommended `$<lowercase first letter>` of type.
+- **(open, PR-2)** Q3: list parameter type syntax — recommended `[String]` matching list literals.
