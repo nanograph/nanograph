@@ -28,6 +28,7 @@ use datafusion_physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SendableRecordBatchStream,
     aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy},
     filter::FilterExec,
+    joins::CrossJoinExec,
     limit::GlobalLimitExec,
     projection::{ProjectionExec, ProjectionExpr},
     sorts::sort::SortExec,
@@ -1229,8 +1230,16 @@ async fn resolve_nearest_query_embeddings(
     }
 
     let client = EmbeddingClient::from_env()?;
+    let model = client.model().to_string();
+    let cache = runtime.query_embedding_cache();
     let mut resolved_vectors = AHashMap::<(String, usize), Vec<f32>>::new();
     for (text, dim) in requests {
+        // CL-510: hit the per-runtime cache first. Agents that issue the
+        // same `nearest($x, $q)` query repeatedly skip the network call.
+        if let Some(vector) = cache.get(&model, &text, dim) {
+            resolved_vectors.insert((text, dim), vector);
+            continue;
+        }
         let vector = client
             .embed_texts_with_role(&[text.clone()], dim, EmbedRole::Query)
             .await?
@@ -1239,6 +1248,7 @@ async fn resolve_nearest_query_embeddings(
             .ok_or_else(|| {
                 NanoError::Execution("embedding provider returned no vector".to_string())
             })?;
+        cache.insert(&model, text.clone(), dim, vector.clone());
         resolved_vectors.insert((text, dim), vector);
     }
 
@@ -2050,20 +2060,6 @@ fn build_physical_plan(
                     })
                     .collect::<Vec<_>>();
 
-                let output_schema = if let Some(ref plan) = current_plan {
-                    // Append to existing schema
-                    let mut fields: Vec<Field> = plan
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| f.as_ref().clone())
-                        .collect();
-                    fields.extend(scan_fields.clone());
-                    Arc::new(Schema::new(fields))
-                } else {
-                    Arc::new(Schema::new(scan_fields.clone()))
-                };
-
                 let indexed_props = &node_schema.indexed_properties;
                 let mut pushdown_filters =
                     build_scan_pushdown_filters(variable, filters, params, Some(indexed_props));
@@ -2097,11 +2093,7 @@ fn build_physical_plan(
 
                 if let Some(prev) = current_plan {
                     // Cross join with previous plan (for multi-binding patterns)
-                    current_plan = Some(Arc::new(CrossJoinExec::new(
-                        prev,
-                        Arc::new(scan),
-                        output_schema,
-                    )));
+                    current_plan = Some(Arc::new(CrossJoinExec::new(prev, Arc::new(scan))));
                 } else {
                     current_plan = Some(Arc::new(scan));
                 }
@@ -2202,19 +2194,6 @@ fn build_physical_plan_with_input(
                     })
                     .collect::<Vec<_>>();
 
-                let output_schema = if let Some(ref plan) = current_plan {
-                    let mut fields: Vec<Field> = plan
-                        .schema()
-                        .fields()
-                        .iter()
-                        .map(|f| f.as_ref().clone())
-                        .collect();
-                    fields.extend(scan_fields.clone());
-                    Arc::new(Schema::new(fields))
-                } else {
-                    Arc::new(Schema::new(scan_fields.clone()))
-                };
-
                 let indexed_props = &node_schema.indexed_properties;
                 let mut pushdown_filters =
                     build_scan_pushdown_filters(variable, filters, params, Some(indexed_props));
@@ -2243,11 +2222,7 @@ fn build_physical_plan_with_input(
                 );
 
                 if let Some(prev) = current_plan {
-                    current_plan = Some(Arc::new(CrossJoinExec::new(
-                        prev,
-                        Arc::new(scan),
-                        output_schema,
-                    )));
+                    current_plan = Some(Arc::new(CrossJoinExec::new(prev, Arc::new(scan))));
                 } else {
                     current_plan = Some(Arc::new(scan));
                 }
@@ -4397,231 +4372,6 @@ fn literal_list_to_f32_vector(items: &[Literal]) -> Result<Vec<f32>> {
         }
     }
     Ok(out)
-}
-
-/// A simple cross-join exec for combining multiple NodeScans
-#[derive(Debug)]
-struct CrossJoinExec {
-    left: Arc<dyn ExecutionPlan>,
-    right: Arc<dyn ExecutionPlan>,
-    output_schema: SchemaRef,
-    properties: Arc<PlanProperties>,
-}
-
-impl CrossJoinExec {
-    fn new(
-        left: Arc<dyn ExecutionPlan>,
-        right: Arc<dyn ExecutionPlan>,
-        output_schema: SchemaRef,
-    ) -> Self {
-        let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(output_schema.clone()),
-            datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
-            datafusion_physical_plan::execution_plan::EmissionType::Incremental,
-            datafusion_physical_plan::execution_plan::Boundedness::Bounded,
-        ));
-        Self {
-            left,
-            right,
-            output_schema,
-            properties,
-        }
-    }
-}
-
-impl datafusion_physical_plan::DisplayAs for CrossJoinExec {
-    fn fmt_as(&self, _t: DisplayFormatType, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "CrossJoinExec")
-    }
-}
-
-impl ExecutionPlan for CrossJoinExec {
-    fn name(&self) -> &str {
-        "CrossJoinExec"
-    }
-
-    fn as_any(&self) -> &dyn std::any::Any {
-        self
-    }
-
-    fn schema(&self) -> SchemaRef {
-        self.output_schema.clone()
-    }
-
-    fn properties(&self) -> &Arc<PlanProperties> {
-        &self.properties
-    }
-
-    fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
-        vec![&self.left, &self.right]
-    }
-
-    fn with_new_children(
-        self: Arc<Self>,
-        children: Vec<Arc<dyn ExecutionPlan>>,
-    ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        Ok(Arc::new(CrossJoinExec::new(
-            children[0].clone(),
-            children[1].clone(),
-            self.output_schema.clone(),
-        )))
-    }
-
-    fn execute(
-        &self,
-        partition: usize,
-        context: Arc<datafusion_execution::TaskContext>,
-    ) -> DFResult<SendableRecordBatchStream> {
-        enum CrossJoinState {
-            Init {
-                left_stream: SendableRecordBatchStream,
-                right_stream: SendableRecordBatchStream,
-                schema: SchemaRef,
-            },
-            Running {
-                left_stream: SendableRecordBatchStream,
-                right_batches: Vec<RecordBatch>,
-                current_left: Option<RecordBatch>,
-                right_idx: usize,
-                schema: SchemaRef,
-            },
-        }
-
-        let left_stream = self.left.execute(partition, context.clone())?;
-        let right_stream = self.right.execute(partition, context)?;
-
-        let init = CrossJoinState::Init {
-            left_stream,
-            right_stream,
-            schema: self.output_schema.clone(),
-        };
-
-        let stream = futures::stream::try_unfold(init, |state| async move {
-            use futures::StreamExt;
-
-            let mut state = state;
-            loop {
-                match state {
-                    CrossJoinState::Init {
-                        left_stream,
-                        mut right_stream,
-                        schema,
-                    } => {
-                        let mut right_batches = Vec::new();
-                        while let Some(batch) = right_stream.next().await {
-                            right_batches.push(batch?);
-                        }
-
-                        if right_batches.is_empty() {
-                            return Ok(None);
-                        }
-
-                        state = CrossJoinState::Running {
-                            left_stream,
-                            right_batches,
-                            current_left: None,
-                            right_idx: 0,
-                            schema,
-                        };
-                    }
-                    CrossJoinState::Running {
-                        mut left_stream,
-                        right_batches,
-                        mut current_left,
-                        mut right_idx,
-                        schema,
-                    } => {
-                        if current_left.is_none() {
-                            let next_left = match left_stream.next().await {
-                                Some(batch) => batch?,
-                                None => return Ok(None),
-                            };
-                            current_left = Some(next_left);
-                            right_idx = 0;
-                        }
-
-                        let left_batch = current_left.as_ref().expect("left batch set");
-
-                        while right_idx < right_batches.len() {
-                            let right_batch = &right_batches[right_idx];
-                            right_idx += 1;
-                            let cross = cross_join_batches(left_batch, right_batch, &schema)?;
-                            if cross.num_rows() > 0 {
-                                let next_state = CrossJoinState::Running {
-                                    left_stream,
-                                    right_batches,
-                                    current_left,
-                                    right_idx,
-                                    schema,
-                                };
-                                return Ok(Some((cross, next_state)));
-                            }
-                        }
-
-                        state = CrossJoinState::Running {
-                            left_stream,
-                            right_batches,
-                            current_left: None,
-                            right_idx: 0,
-                            schema,
-                        };
-                    }
-                }
-            }
-        });
-
-        Ok(Box::pin(
-            datafusion_physical_plan::stream::RecordBatchStreamAdapter::new(
-                self.output_schema.clone(),
-                stream,
-            ),
-        ))
-    }
-}
-
-fn cross_join_batches(
-    left: &RecordBatch,
-    right: &RecordBatch,
-    schema: &SchemaRef,
-) -> DFResult<RecordBatch> {
-    let left_rows = left.num_rows();
-    let right_rows = right.num_rows();
-    let total = left_rows * right_rows;
-
-    if total == 0 {
-        return Ok(RecordBatch::new_empty(schema.clone()));
-    }
-
-    let mut columns: Vec<arrow_array::ArrayRef> = Vec::new();
-
-    // Replicate left columns
-    for col in left.columns() {
-        let mut indices = Vec::with_capacity(total);
-        for i in 0..left_rows {
-            for _ in 0..right_rows {
-                indices.push(i as u64);
-            }
-        }
-        let idx = arrow_array::UInt64Array::from(indices);
-        let taken = arrow_select::take::take(col.as_ref(), &idx, None)?;
-        columns.push(taken);
-    }
-
-    // Replicate right columns
-    for col in right.columns() {
-        let mut indices = Vec::with_capacity(total);
-        for _ in 0..left_rows {
-            for j in 0..right_rows {
-                indices.push(j as u64);
-            }
-        }
-        let idx = arrow_array::UInt64Array::from(indices);
-        let taken = arrow_select::take::take(col.as_ref(), &idx, None)?;
-        columns.push(taken);
-    }
-
-    RecordBatch::try_new(schema.clone(), columns)
-        .map_err(|e| datafusion_common::DataFusionError::ArrowError(Box::new(e), None))
 }
 
 /// Anti-join exec: returns rows from left where no matching rows exist in right

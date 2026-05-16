@@ -559,6 +559,12 @@ impl Database {
         self.tempdir.is_some()
     }
 
+    /// Test-only accessor for the query-embedding cache size (CL-510).
+    #[doc(hidden)]
+    pub fn query_embedding_cache_size_for_tests(&self) -> usize {
+        self.current_runtime().query_embedding_cache().__test_len()
+    }
+
     pub(crate) async fn lock_writer(&self) -> DatabaseWriteGuard<'_> {
         DatabaseWriteGuard {
             _guard: self.writer.lock().await,
