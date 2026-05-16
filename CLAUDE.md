@@ -225,7 +225,7 @@ See `.env.example` for reference.
 
 ## Version Constraints
 
-Arrow 57, DataFusion 52, Lance 4.0 + lance-index 4.0 + lance-namespace 4.0 — these must stay compatible with each other. Pest 2 for both grammars. napi/napi-derive 2 for TS SDK. Dependencies use sub-crates, not monolithic packages: `arrow-array`, `arrow-schema`, `arrow-select`, `arrow-cast`, `arrow-ord` (not `arrow`); `datafusion-physical-plan`, `datafusion-physical-expr`, `datafusion-execution`, `datafusion-common`, `datafusion-expr`, `datafusion-functions-aggregate` (not `datafusion`). Import accordingly. All dependency versions are centralized in the root `Cargo.toml` under `[workspace.dependencies]` — add or update versions there, then reference with `dep.workspace = true` in crate-level Cargo.toml files.
+Arrow 58, DataFusion 53, Lance 6.0 + lance-index 6.0 + lance-namespace 6.0 — these must stay compatible with each other (Lance v6 hard-pins arrow 58 and datafusion 53). Pest 2 for both grammars. napi/napi-derive 2 for TS SDK. Dependencies use sub-crates, not monolithic packages: `arrow-array`, `arrow-schema`, `arrow-select`, `arrow-cast`, `arrow-ord` (not `arrow`); `datafusion-physical-plan`, `datafusion-physical-expr`, `datafusion-execution`, `datafusion-common`, `datafusion-expr`, `datafusion-functions-aggregate` (not `datafusion`). Import accordingly. All dependency versions are centralized in the root `Cargo.toml` under `[workspace.dependencies]` — add or update versions there, then reference with `dep.workspace = true` in crate-level Cargo.toml files.
 
 ## Design Documents
 
