@@ -2,10 +2,11 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use lance::Dataset;
+use lance::index::DatasetIndexExt;
 use lance::index::vector::VectorIndexParams;
+use lance_index::IndexType;
 use lance_index::scalar::ScalarIndexParams;
 use lance_index::scalar::inverted::InvertedIndexParams;
-use lance_index::{DatasetIndexExt, IndexType};
 use lance_linalg::distance::MetricType;
 use tokio::sync::Mutex;
 use tracing::debug;

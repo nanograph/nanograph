@@ -47,7 +47,7 @@ pub(crate) struct ExpandExec {
     max_hops: Option<u32>,
     output_schema: SchemaRef,
     runtime: Arc<DatabaseRuntime>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 #[derive(Debug, Clone)]
@@ -102,12 +102,12 @@ impl ExpandExec {
         output_fields.extend(dst_fields);
         let output_schema = Arc::new(Schema::new(output_fields));
 
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             datafusion_physical_plan::execution_plan::EmissionType::Incremental,
             datafusion_physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
 
         Self {
             input,
@@ -153,7 +153,7 @@ impl ExecutionPlan for ExpandExec {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
@@ -214,12 +214,12 @@ impl ExecutionPlan for ExpandExec {
                 max_hops,
                 output_schema: schema.clone(),
                 runtime,
-                properties: PlanProperties::new(
+                properties: Arc::new(PlanProperties::new(
                     EquivalenceProperties::new(schema.clone()),
                     datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
                     datafusion_physical_plan::execution_plan::EmissionType::Incremental,
                     datafusion_physical_plan::execution_plan::Boundedness::Bounded,
-                ),
+                )),
             };
             let edge_indices = expand.resolve_edge_indices().await?;
             let dst_lookup = expand.resolve_destination_lookup().await?;

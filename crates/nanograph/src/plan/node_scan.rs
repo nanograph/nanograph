@@ -45,7 +45,7 @@ pub(crate) struct NodeScanExec {
     text_filter: Option<NodeScanTextFilter>,
     limit: Option<usize>,
     runtime: Arc<DatabaseRuntime>,
-    properties: PlanProperties,
+    properties: Arc<PlanProperties>,
 }
 
 impl NodeScanExec {
@@ -58,12 +58,12 @@ impl NodeScanExec {
         limit: Option<usize>,
         runtime: Arc<DatabaseRuntime>,
     ) -> Self {
-        let properties = PlanProperties::new(
+        let properties = Arc::new(PlanProperties::new(
             EquivalenceProperties::new(output_schema.clone()),
             datafusion_physical_plan::Partitioning::UnknownPartitioning(1),
             datafusion_physical_plan::execution_plan::EmissionType::Incremental,
             datafusion_physical_plan::execution_plan::Boundedness::Bounded,
-        );
+        ));
 
         Self {
             type_name,
@@ -319,7 +319,7 @@ impl ExecutionPlan for NodeScanExec {
         self.output_schema.clone()
     }
 
-    fn properties(&self) -> &PlanProperties {
+    fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
     }
 
