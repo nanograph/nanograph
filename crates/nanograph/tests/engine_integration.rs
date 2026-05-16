@@ -1729,6 +1729,91 @@ query upsert_person($name: String, $age: I32) {
 }
 
 #[tokio::test]
+async fn test_query_embedding_cache_skips_network_on_repeat() {
+    // CL-510: an agent that issues the same `nearest($x, $q)` query
+    // repeatedly should only embed `$q` once. We verify by running the
+    // same query 5× and asserting the per-runtime cache holds exactly
+    // one entry after.
+    let _guard = EMBED_ENV_LOCK.lock().await;
+    let prev_mock = std::env::var_os("NANOGRAPH_EMBEDDINGS_MOCK");
+    unsafe {
+        std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", "1");
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(
+        &db_path,
+        r#"
+node Doc {
+    slug: String @key
+    body: String
+    embedding: Vector(8) @embed(body) @index
+}
+"#,
+    )
+    .await
+    .unwrap();
+    db.load(
+        r#"{"type":"Doc","data":{"slug":"a","body":"alpha doc about graphs"}}
+{"type":"Doc","data":{"slug":"b","body":"beta doc about databases"}}
+{"type":"Doc","data":{"slug":"c","body":"gamma doc about queries"}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let query_src = r#"
+query similar($q: String) {
+    match { $d: Doc }
+    return { $d.slug, nearest($d.embedding, $q) as score }
+    order { nearest($d.embedding, $q) }
+    limit 3
+}
+"#;
+    let mut params = ParamMap::new();
+    params.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::String("graphs and queries".to_string()),
+    );
+
+    // Cache starts empty.
+    assert_eq!(db.query_embedding_cache_size_for_tests(), 0);
+
+    // 5 calls with the same query text.
+    for _ in 0..5 {
+        let batches = run_db_query_test_with_params(query_src, &db, &params).await;
+        let slugs = extract_string_column(&batches, "slug");
+        assert_eq!(slugs.len(), 3, "expected 3 ranked docs");
+    }
+
+    // Exactly one cache entry — the (model, "graphs and queries", 8) key.
+    // Note: nearest() appears in both filter and return positions in this
+    // query (via the AHashSet dedup); the cache further dedupes across
+    // all 5 executions.
+    assert_eq!(
+        db.query_embedding_cache_size_for_tests(),
+        1,
+        "5 calls with same $q should produce 1 cache entry"
+    );
+
+    // A different query text should produce a second entry.
+    let mut params2 = ParamMap::new();
+    params2.insert(
+        "q".to_string(),
+        nanograph::query::ast::Literal::String("different search text".to_string()),
+    );
+    let _ = run_db_query_test_with_params(query_src, &db, &params2).await;
+    assert_eq!(db.query_embedding_cache_size_for_tests(), 2);
+
+    // Restore env.
+    match prev_mock {
+        Some(value) => unsafe { std::env::set_var("NANOGRAPH_EMBEDDINGS_MOCK", value) },
+        None => unsafe { std::env::remove_var("NANOGRAPH_EMBEDDINGS_MOCK") },
+    }
+}
+
+#[tokio::test]
 async fn test_query_cache_returns_consistent_results_across_repeated_calls() {
     // Regression for CL-508: the compiled-query cache must return identical
     // results on hit vs miss. We call the same query 50× — first call is a

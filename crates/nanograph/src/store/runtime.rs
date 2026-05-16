@@ -82,6 +82,46 @@ impl TextSearchCache {
     }
 }
 
+/// CL-510: in-process cache of query-text embeddings, scoped to the
+/// `DatabaseRuntime` lifetime. Agents that issue the same `nearest($x, $q)`
+/// query repeatedly (e.g. `similar_issues("memory leak")` called 5×) hit
+/// the cache instead of round-tripping to LM Studio / OpenAI / Gemini.
+///
+/// Key: `(model_name, text, dim)` — model is included so switching providers
+/// (OPENAI_API_KEY vs LMSTUDIO_BASE_URL) yields fresh entries without manual
+/// invalidation. Dim is included so a schema change that bumps `Vector(N)`
+/// re-embeds rather than returning a stale vector.
+///
+/// Unbounded for v1: a typical query-text embedding is ~4 KB at 1024 dims,
+/// so 1000 unique queries = ~4 MB. Add LRU eviction if real workloads grow
+/// beyond that.
+#[derive(Debug, Default)]
+pub(crate) struct QueryEmbeddingCache {
+    entries: std::sync::Mutex<std::collections::HashMap<(String, String, usize), Vec<f32>>>,
+}
+
+impl QueryEmbeddingCache {
+    pub(crate) fn get(&self, model: &str, text: &str, dim: usize) -> Option<Vec<f32>> {
+        let guard = self.entries.lock().ok()?;
+        guard
+            .get(&(model.to_string(), text.to_string(), dim))
+            .cloned()
+    }
+
+    pub(crate) fn insert(&self, model: &str, text: String, dim: usize, vector: Vec<f32>) {
+        if let Ok(mut guard) = self.entries.lock() {
+            guard.insert((model.to_string(), text, dim), vector);
+        }
+    }
+
+    /// Test-only — counts entries. Always-available so cross-crate tests
+    /// (engine_integration) can call it without cfg(test) gymnastics.
+    #[doc(hidden)]
+    pub fn __test_len(&self) -> usize {
+        self.entries.lock().map(|g| g.len()).unwrap_or(0)
+    }
+}
+
 async fn load_native_text_scores(
     locator: &DatasetLocator,
     property: &str,
@@ -370,6 +410,7 @@ pub(crate) struct DatabaseRuntime {
     node_batch_cache: Arc<NodeBatchCache>,
     node_lookup_cache: Arc<NodeLookupCache>,
     text_search_cache: Arc<TextSearchCache>,
+    query_embedding_cache: Arc<QueryEmbeddingCache>,
 }
 
 impl DatabaseRuntime {
@@ -384,6 +425,7 @@ impl DatabaseRuntime {
             node_batch_cache: Arc::new(NodeBatchCache::default()),
             node_lookup_cache: Arc::new(NodeLookupCache::default()),
             text_search_cache: Arc::new(TextSearchCache::default()),
+            query_embedding_cache: Arc::new(QueryEmbeddingCache::default()),
         }
     }
 
@@ -479,6 +521,10 @@ impl DatabaseRuntime {
 
     pub(crate) fn edge_index_cache(&self) -> Arc<EdgeIndexCache> {
         self.edge_index_cache.clone()
+    }
+
+    pub(crate) fn query_embedding_cache(&self) -> Arc<QueryEmbeddingCache> {
+        self.query_embedding_cache.clone()
     }
 
     pub(crate) async fn native_text_scores(

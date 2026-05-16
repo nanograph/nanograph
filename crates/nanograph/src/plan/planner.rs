@@ -1229,8 +1229,16 @@ async fn resolve_nearest_query_embeddings(
     }
 
     let client = EmbeddingClient::from_env()?;
+    let model = client.model().to_string();
+    let cache = runtime.query_embedding_cache();
     let mut resolved_vectors = AHashMap::<(String, usize), Vec<f32>>::new();
     for (text, dim) in requests {
+        // CL-510: hit the per-runtime cache first. Agents that issue the
+        // same `nearest($x, $q)` query repeatedly skip the network call.
+        if let Some(vector) = cache.get(&model, &text, dim) {
+            resolved_vectors.insert((text, dim), vector);
+            continue;
+        }
         let vector = client
             .embed_texts_with_role(&[text.clone()], dim, EmbedRole::Query)
             .await?
@@ -1239,6 +1247,7 @@ async fn resolve_nearest_query_embeddings(
             .ok_or_else(|| {
                 NanoError::Execution("embedding provider returned no vector".to_string())
             })?;
+        cache.insert(&model, text.clone(), dim, vector.clone());
         resolved_vectors.insert((text, dim), vector);
     }
 
