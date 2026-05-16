@@ -87,9 +87,9 @@ Key modules: `embedding.rs` (OpenAI/Gemini/LM Studio clients, retry, mock mode),
 | `catalog/` | `schema_ir.rs` — compiled schema representation used at runtime |
 | `ir/` | `lower.rs` — lowers typed AST into flat IR operators (NodeScan, Expand, Filter, AntiJoin, mutations) |
 | `plan/bindings.rs` | Flat binding column utilities (`variable::property` naming, struct reconstruction) |
-| `plan/planner.rs` | Converts IR to DataFusion physical plans; TailStrategy analysis for DataFusion delegation |
+| `plan/planner.rs` | Converts IR to DataFusion physical plans; TailStrategy analysis for DataFusion delegation; custom ScoreExec + AntiJoinExec |
 | `plan/node_scan.rs` | Custom NodeScanExec with Lance filter pushdown and text search tracking |
-| `plan/physical.rs` | Custom ExpandExec, CrossJoinExec, AntiJoinExec, ScoreExec, mutation execution |
+| `plan/physical.rs` | Custom ExpandExec and mutation execution |
 | `store/database.rs` | Lance-backed persistence, delete API, load modes, compact/cleanup/doctor |
 | `store/graph.rs` | In-memory GraphStorage with CSR/CSC indices |
 | `store/csr.rs` | CSR/CSC adjacency structure — core graph index for traversal |
@@ -132,7 +132,7 @@ All library errors go through `NanoError` (in `error.rs`). Variants: `Parse`, `C
 
 - **Flat binding columns**: During execution, variables are materialized as flat columns named `variable::property` (e.g. `p::name`, `p::age`). The `plan/bindings.rs` module provides utilities to create, split, and access these columns. Struct columns are reconstructed on demand for the return path. This aligns with DataFusion's columnar model.
 - **Edge traversal is a Datalog predicate**: `$p knows $f` — no arrows, no Cypher syntax. Direction inferred from schema endpoint types.
-- **Custom ExecutionPlans**: NodeScanExec, ExpandExec (CSR/CSC traversal), CrossJoinExec, AntiJoinExec, ScoreExec (text search scoring). The planner analyzes tail operations via `TailStrategy` — sorting, filtering, and aggregation are delegated to DataFusion when possible, falling back to legacy post-processing for search-dependent tails.
+- **Custom ExecutionPlans**: NodeScanExec, ExpandExec (CSR/CSC traversal), AntiJoinExec, ScoreExec (text search scoring). Cross joins use DataFusion's built-in `joins::CrossJoinExec`. The planner analyzes tail operations via `TailStrategy` — sorting, filtering, and aggregation are delegated to DataFusion when possible, falling back to legacy post-processing for search-dependent tails.
 - **Reverse traversal**: When source is unbound and destination is bound, the planner swaps direction and uses CSC instead of CSR.
 - **Negation**: `not {}` compiles to AntiJoinExec. The inner pipeline must be seeded with the outer plan's input.
 - **Bounded expansion**: `knows{1,3}` compiles to a finite union of 1-hop, 2-hop, 3-hop — no recursion.
