@@ -177,146 +177,178 @@ fn typecheck_read_query(catalog: &Catalog, query: &QueryDecl) -> Result<TypeCont
     Ok(ctx)
 }
 
-fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) -> Result<String> {
-    let param_types = parse_declared_param_types(params)?;
+/// Shared validation for `insert` and `put` (both have the same shape: a list of
+/// assignments). `kind` is interpolated into error messages ("insert" or "put").
+fn validate_insert_like(
+    catalog: &Catalog,
+    insert: &InsertMutation,
+    param_types: &HashMap<String, PropType>,
+    kind: &str,
+) -> Result<String> {
+    if insert.assignments.is_empty() {
+        return Err(NanoError::Type(format!(
+            "T10: {kind} mutation requires at least one assignment"
+        )));
+    }
 
-    match mutation {
-        Mutation::Insert(insert) => {
-            if insert.assignments.is_empty() {
-                return Err(NanoError::Type(
-                    "T10: insert mutation requires at least one assignment".to_string(),
-                ));
+    ensure_no_duplicate_assignment_names(&insert.assignments)?;
+
+    if let Some(node_type) = catalog.node_types.get(&insert.type_name) {
+        for assignment in &insert.assignments {
+            let prop_type =
+                node_type
+                    .properties
+                    .get(&assignment.property)
+                    .ok_or_else(|| {
+                        NanoError::Type(format!(
+                            "T11: type `{}` has no property `{}`",
+                            insert.type_name, assignment.property
+                        ))
+                    })?;
+            check_match_value_type(
+                &assignment.value,
+                param_types,
+                prop_type,
+                &assignment.property,
+            )?;
+        }
+
+        let assigned_props: HashSet<&str> = insert
+            .assignments
+            .iter()
+            .map(|assignment| assignment.property.as_str())
+            .collect();
+        for (prop_name, prop_type) in &node_type.properties {
+            if prop_type.nullable {
+                continue;
+            }
+            if assigned_props.contains(prop_name.as_str()) {
+                continue;
             }
 
-            ensure_no_duplicate_assignment_names(&insert.assignments)?;
+            if let Some(source_prop) = node_type.embed_sources.get(prop_name) {
+                if assigned_props.contains(source_prop.as_str()) {
+                    continue;
+                }
+                return Err(NanoError::Type(format!(
+                    "T12: {kind} for `{}` must provide non-nullable property `{}` or @embed source `{}`",
+                    insert.type_name, prop_name, source_prop
+                )));
+            }
 
-            if let Some(node_type) = catalog.node_types.get(&insert.type_name) {
-                for assignment in &insert.assignments {
-                    let prop_type =
-                        node_type
-                            .properties
-                            .get(&assignment.property)
-                            .ok_or_else(|| {
-                                NanoError::Type(format!(
-                                    "T11: type `{}` has no property `{}`",
-                                    insert.type_name, assignment.property
-                                ))
-                            })?;
+            return Err(NanoError::Type(format!(
+                "T12: {kind} for `{}` must provide non-nullable property `{}`",
+                insert.type_name, prop_name
+            )));
+        }
+        return Ok(insert.type_name.clone());
+    }
+
+    if let Some(edge_type) = catalog.edge_types.get(&insert.type_name) {
+        let mut has_from = false;
+        let mut has_to = false;
+
+        for assignment in &insert.assignments {
+            match assignment.property.as_str() {
+                "from" => {
+                    has_from = true;
                     check_match_value_type(
                         &assignment.value,
-                        &param_types,
+                        param_types,
+                        &PropType::scalar(ScalarType::String, false),
+                        "from",
+                    )?;
+                }
+                "to" => {
+                    has_to = true;
+                    check_match_value_type(
+                        &assignment.value,
+                        param_types,
+                        &PropType::scalar(ScalarType::String, false),
+                        "to",
+                    )?;
+                }
+                _ => {
+                    let prop_type = edge_type
+                        .properties
+                        .get(&assignment.property)
+                        .ok_or_else(|| {
+                            NanoError::Type(format!(
+                                "T11: type `{}` has no property `{}`",
+                                insert.type_name, assignment.property
+                            ))
+                        })?;
+                    check_match_value_type(
+                        &assignment.value,
+                        param_types,
                         prop_type,
                         &assignment.property,
                     )?;
                 }
-
-                let assigned_props: HashSet<&str> = insert
-                    .assignments
-                    .iter()
-                    .map(|assignment| assignment.property.as_str())
-                    .collect();
-                for (prop_name, prop_type) in &node_type.properties {
-                    if prop_type.nullable {
-                        continue;
-                    }
-                    if assigned_props.contains(prop_name.as_str()) {
-                        continue;
-                    }
-
-                    if let Some(source_prop) = node_type.embed_sources.get(prop_name) {
-                        if assigned_props.contains(source_prop.as_str()) {
-                            continue;
-                        }
-                        return Err(NanoError::Type(format!(
-                            "T12: insert for `{}` must provide non-nullable property `{}` or @embed source `{}`",
-                            insert.type_name, prop_name, source_prop
-                        )));
-                    }
-
-                    return Err(NanoError::Type(format!(
-                        "T12: insert for `{}` must provide non-nullable property `{}`",
-                        insert.type_name, prop_name
-                    )));
-                }
-                return Ok(insert.type_name.clone());
             }
-
-            if let Some(edge_type) = catalog.edge_types.get(&insert.type_name) {
-                let mut has_from = false;
-                let mut has_to = false;
-
-                for assignment in &insert.assignments {
-                    match assignment.property.as_str() {
-                        "from" => {
-                            has_from = true;
-                            check_match_value_type(
-                                &assignment.value,
-                                &param_types,
-                                &PropType::scalar(ScalarType::String, false),
-                                "from",
-                            )?;
-                        }
-                        "to" => {
-                            has_to = true;
-                            check_match_value_type(
-                                &assignment.value,
-                                &param_types,
-                                &PropType::scalar(ScalarType::String, false),
-                                "to",
-                            )?;
-                        }
-                        _ => {
-                            let prop_type = edge_type
-                                .properties
-                                .get(&assignment.property)
-                                .ok_or_else(|| {
-                                    NanoError::Type(format!(
-                                        "T11: type `{}` has no property `{}`",
-                                        insert.type_name, assignment.property
-                                    ))
-                                })?;
-                            check_match_value_type(
-                                &assignment.value,
-                                &param_types,
-                                prop_type,
-                                &assignment.property,
-                            )?;
-                        }
-                    }
-                }
-
-                if !has_from {
-                    return Err(NanoError::Type(format!(
-                        "T12: insert for `{}` must provide required endpoint `from`",
-                        insert.type_name
-                    )));
-                }
-                if !has_to {
-                    return Err(NanoError::Type(format!(
-                        "T12: insert for `{}` must provide required endpoint `to`",
-                        insert.type_name
-                    )));
-                }
-
-                for (prop_name, prop_type) in &edge_type.properties {
-                    if prop_type.nullable {
-                        continue;
-                    }
-                    if !insert.assignments.iter().any(|a| &a.property == prop_name) {
-                        return Err(NanoError::Type(format!(
-                            "T12: insert for `{}` must provide non-nullable property `{}`",
-                            insert.type_name, prop_name
-                        )));
-                    }
-                }
-                return Ok(insert.type_name.clone());
-            }
-
-            Err(NanoError::Type(format!(
-                "T10: unknown node/edge type `{}`",
-                insert.type_name
-            )))
         }
+
+        if !has_from {
+            return Err(NanoError::Type(format!(
+                "T12: {kind} for `{}` must provide required endpoint `from`",
+                insert.type_name
+            )));
+        }
+        if !has_to {
+            return Err(NanoError::Type(format!(
+                "T12: {kind} for `{}` must provide required endpoint `to`",
+                insert.type_name
+            )));
+        }
+
+        for (prop_name, prop_type) in &edge_type.properties {
+            if prop_type.nullable {
+                continue;
+            }
+            if !insert.assignments.iter().any(|a| &a.property == prop_name) {
+                return Err(NanoError::Type(format!(
+                    "T12: {kind} for `{}` must provide non-nullable property `{}`",
+                    insert.type_name, prop_name
+                )));
+            }
+        }
+        return Ok(insert.type_name.clone());
+    }
+
+    Err(NanoError::Type(format!(
+        "T10: unknown node/edge type `{}`",
+        insert.type_name
+    )))
+}
+
+fn typecheck_mutation(catalog: &Catalog, mutation: &Mutation, params: &[Param]) -> Result<String> {
+    let param_types = parse_declared_param_types(params)?;
+
+    match mutation {
+        Mutation::Put(put) => {
+            // Same shape as insert: validate the assignments against the type's
+            // schema. Then additionally require that the type has @key and that
+            // the @key property is present in the assignments (it's the gate
+            // that selects the row to update on conflict). For edges, (from, to)
+            // is the natural key — already enforced by the insert-like check.
+            validate_insert_like(catalog, put, &param_types, "put")?;
+            if let Some(node_type) = catalog.node_types.get(&put.type_name) {
+                let key = node_type.key_property.as_deref().ok_or_else(|| {
+                    NanoError::Type(format!(
+                        "T22: put requires node type `{}` to have @key",
+                        put.type_name
+                    ))
+                })?;
+                if !put.assignments.iter().any(|a| a.property == key) {
+                    return Err(NanoError::Type(format!(
+                        "T22: put for `{}` must include the @key property `{}`",
+                        put.type_name, key
+                    )));
+                }
+            }
+            return Ok(put.type_name.clone());
+        }
+        Mutation::Insert(insert) => validate_insert_like(catalog, insert, &param_types, "insert"),
         Mutation::Update(update) => {
             let node_type = if let Some(node_type) = catalog.node_types.get(&update.type_name) {
                 node_type

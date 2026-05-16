@@ -596,6 +596,10 @@ pub(crate) async fn execute_mutation(
             type_name,
             assignments,
         } => execute_insert_mutation(db, type_name, assignments, params, writer).await,
+        MutationOpIR::Put {
+            type_name,
+            assignments,
+        } => execute_put_mutation(db, type_name, assignments, params, writer).await,
         MutationOpIR::Update {
             type_name,
             assignments,
@@ -606,6 +610,96 @@ pub(crate) async fn execute_mutation(
             predicate,
         } => execute_delete_mutation(db, type_name, predicate, params, writer).await,
     }
+}
+
+async fn execute_put_mutation(
+    db: &Database,
+    type_name: &str,
+    assignments: &[IRAssignment],
+    params: &ParamMap,
+    writer: &mut DatabaseWriteGuard<'_>,
+) -> Result<MutationExecResult> {
+    let is_node_type = db.catalog.node_types.contains_key(type_name);
+    let is_edge_type = db.catalog.edge_types.contains_key(type_name);
+    if is_edge_type {
+        return execute_put_edge_mutation(db, type_name, assignments, params, writer).await;
+    }
+    if !is_node_type {
+        return Err(NanoError::Execution(format!(
+            "unknown mutation target type `{}`",
+            type_name
+        )));
+    }
+
+    // Build a single-row JSONL line and apply through the merge path. Merge
+    // does key-based upsert: existing row → update non-key fields, missing row
+    // → insert. Idempotent for the same @key value.
+    let mut data = serde_json::Map::new();
+    for assignment in assignments {
+        let lit = resolve_mutation_literal(&assignment.value, params)?;
+        data.insert(assignment.property.clone(), literal_to_json(&lit)?);
+    }
+    let line = serde_json::json!({
+        "type": type_name,
+        "data": data,
+    })
+    .to_string();
+    db.apply_merge_mutation_locked(&line, "mutation:put_node", writer)
+        .await?;
+    Ok(MutationExecResult {
+        affected_nodes: 1,
+        affected_edges: 0,
+    })
+}
+
+async fn execute_put_edge_mutation(
+    db: &Database,
+    type_name: &str,
+    assignments: &[IRAssignment],
+    params: &ParamMap,
+    writer: &mut DatabaseWriteGuard<'_>,
+) -> Result<MutationExecResult> {
+    let mut from_name: Option<String> = None;
+    let mut to_name: Option<String> = None;
+    let mut data = serde_json::Map::new();
+
+    for assignment in assignments {
+        let lit = resolve_mutation_literal(&assignment.value, params)?;
+        match assignment.property.as_str() {
+            "from" => from_name = Some(literal_to_endpoint_name(&lit, "from")?),
+            "to" => to_name = Some(literal_to_endpoint_name(&lit, "to")?),
+            _ => {
+                data.insert(assignment.property.clone(), literal_to_json(&lit)?);
+            }
+        }
+    }
+
+    let from = from_name.ok_or_else(|| {
+        NanoError::Execution(format!(
+            "edge put for `{}` requires endpoint property `from`",
+            type_name
+        ))
+    })?;
+    let to = to_name.ok_or_else(|| {
+        NanoError::Execution(format!(
+            "edge put for `{}` requires endpoint property `to`",
+            type_name
+        ))
+    })?;
+
+    let line = serde_json::json!({
+        "edge": type_name,
+        "from": from,
+        "to": to,
+        "data": data,
+    })
+    .to_string();
+    db.apply_merge_mutation_locked(&line, "mutation:put_edge", writer)
+        .await?;
+    Ok(MutationExecResult {
+        affected_nodes: 0,
+        affected_edges: 1,
+    })
 }
 
 async fn execute_insert_mutation(

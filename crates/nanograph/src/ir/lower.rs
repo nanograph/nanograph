@@ -80,6 +80,17 @@ pub fn lower_mutation_query(query: &QueryDecl) -> Result<MutationIR> {
                 })
                 .collect(),
         },
+        Mutation::Put(put) => MutationOpIR::Put {
+            type_name: put.type_name.clone(),
+            assignments: put
+                .assignments
+                .iter()
+                .map(|a| IRAssignment {
+                    property: a.property.clone(),
+                    value: lower_match_value(&a.value, &param_names),
+                })
+                .collect(),
+        },
         Mutation::Update(update) => MutationOpIR::Update {
             type_name: update.type_name.clone(),
             assignments: update

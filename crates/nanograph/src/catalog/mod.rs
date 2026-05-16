@@ -26,6 +26,8 @@ pub struct NodeType {
     /// Maps @media_uri property -> mime property.
     pub media_uri_props: HashMap<String, String>,
     pub indexed_properties: HashSet<String>,
+    /// Name of the property marked with `@key`, if any.
+    pub key_property: Option<String>,
     pub arrow_schema: SchemaRef,
 }
 
@@ -78,8 +80,12 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
             let mut embed_sources = HashMap::new();
             let mut media_uri_props = HashMap::new();
             let mut indexed_properties = HashSet::new();
+            let mut key_property: Option<String> = None;
             for prop in &node.properties {
                 properties.insert(prop.name.clone(), prop.prop_type.clone());
+                if prop.annotations.iter().any(|ann| ann.name == "key") {
+                    key_property = Some(prop.name.clone());
+                }
                 if let Some(source_prop) = prop
                     .annotations
                     .iter()
@@ -127,6 +133,7 @@ pub fn build_catalog(schema: &SchemaFile) -> Result<Catalog> {
                     embed_sources,
                     media_uri_props,
                     indexed_properties,
+                    key_property,
                     arrow_schema,
                 },
             );

@@ -184,6 +184,7 @@ pub struct Ordering {
 #[derive(Debug, Clone)]
 pub enum Mutation {
     Insert(InsertMutation),
+    Put(InsertMutation),
     Update(UpdateMutation),
     Delete(DeleteMutation),
 }

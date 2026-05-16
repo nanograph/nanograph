@@ -1660,6 +1660,148 @@ query q() {
 }
 
 #[tokio::test]
+async fn test_put_node_inserts_when_absent_and_updates_when_present() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    // Start empty — no Alice yet.
+    let mut params = ParamMap::new();
+    params.insert(
+        "name".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(30),
+    );
+    let result = run_db_mutation_test_with_params(
+        r#"
+query upsert_person($name: String, $age: I32) {
+    put Person { name: $name, age: $age }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result.affected_nodes, 1);
+
+    let rows = export_rows_for_db(&db).await;
+    let alice = rows
+        .iter()
+        .find(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Alice")
+        })
+        .unwrap();
+    assert_eq!(alice["data"]["age"].as_i64(), Some(30));
+
+    // Same put with a different age — should update, not duplicate.
+    params.insert(
+        "age".to_string(),
+        nanograph::query::ast::Literal::Integer(42),
+    );
+    let result2 = run_db_mutation_test_with_params(
+        r#"
+query upsert_person($name: String, $age: I32) {
+    put Person { name: $name, age: $age }
+}
+"#,
+        &db,
+        &params,
+    )
+    .await;
+    assert_eq!(result2.affected_nodes, 1);
+
+    let rows_after = export_rows_for_db(&db).await;
+    let alices: Vec<_> = rows_after
+        .iter()
+        .filter(|row| {
+            row.get("type").and_then(serde_json::Value::as_str) == Some("Person")
+                && row["data"]["name"].as_str() == Some("Alice")
+        })
+        .collect();
+    assert_eq!(alices.len(), 1, "put must not duplicate by @key");
+    assert_eq!(alices[0]["data"]["age"].as_i64(), Some(42));
+}
+
+#[tokio::test]
+async fn test_put_edge_is_idempotent() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let db_path = dir.path().join("db");
+    let db = Database::init(&db_path, keyed_mutation_schema())
+        .await
+        .unwrap();
+    db.load(
+        r#"{"type":"Person","data":{"name":"Alice","age":30}}
+{"type":"Person","data":{"name":"Bob","age":25}}
+"#,
+    )
+    .await
+    .unwrap();
+
+    let mut params = ParamMap::new();
+    params.insert(
+        "from".to_string(),
+        nanograph::query::ast::Literal::String("Alice".to_string()),
+    );
+    params.insert(
+        "to".to_string(),
+        nanograph::query::ast::Literal::String("Bob".to_string()),
+    );
+
+    let put = r#"
+query ensure_knows($from: String, $to: String) {
+    put Knows { from: $from, to: $to }
+}
+"#;
+
+    let r1 = run_db_mutation_test_with_params(put, &db, &params).await;
+    assert_eq!(r1.affected_edges, 1);
+    let r2 = run_db_mutation_test_with_params(put, &db, &params).await;
+    assert_eq!(r2.affected_edges, 1, "put reports the row touched each call");
+
+    // No duplicate edges after two calls.
+    let rows = export_rows_for_db(&db).await;
+    let knows: Vec<_> = rows
+        .iter()
+        .filter(|row| row.get("edge").and_then(serde_json::Value::as_str) == Some("Knows"))
+        .collect();
+    assert_eq!(knows.len(), 1, "put must not duplicate by (from, to)");
+}
+
+#[tokio::test]
+async fn test_put_node_without_key_property_errors_at_lint() {
+    use nanograph::build_catalog;
+    use nanograph::query::parser::parse_query;
+    use nanograph::query::typecheck::typecheck_query_decl;
+    let schema = r#"
+node Tag {
+    name: String
+}
+"#;
+    let parsed_schema =
+        nanograph::schema::parser::parse_schema(schema).expect("parse schema");
+    let catalog = build_catalog(&parsed_schema).expect("build catalog");
+    let qf = parse_query(
+        r#"
+query tag_it($name: String) {
+    put Tag { name: $name }
+}
+"#,
+    )
+    .unwrap();
+    let err = typecheck_query_decl(&catalog, &qf.queries[0]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("T22") && msg.contains("@key"),
+        "expected T22 @key error, got: {msg}"
+    );
+}
+
+#[tokio::test]
 async fn test_update_with_conjunctive_where_block() {
     // Verify the new `where { atom+ }` block AND's atoms conjunctively:
     // only rows matching every atom should be touched.

@@ -308,6 +308,7 @@ fn parse_prop_match(pair: pest::iterators::Pair<Rule>) -> Result<PropMatch> {
 fn parse_mutation_stmt(pair: pest::iterators::Pair<Rule>) -> Result<Mutation> {
     match pair.as_rule() {
         Rule::insert_stmt => parse_insert_mutation(pair).map(Mutation::Insert),
+        Rule::put_stmt => parse_insert_mutation(pair).map(Mutation::Put),
         Rule::update_stmt => parse_update_mutation(pair).map(Mutation::Update),
         Rule::delete_stmt => parse_delete_mutation(pair).map(Mutation::Delete),
         other => Err(NanoError::Parse(format!(

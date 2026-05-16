@@ -290,6 +290,12 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                     fields.push(Field::new(&prop.name, prop_type.to_arrow(), prop.nullable));
                 }
 
+                let key_property = n
+                    .properties
+                    .iter()
+                    .find(|p| p.key)
+                    .map(|p| p.name.clone());
+
                 node_types.insert(
                     n.name.clone(),
                     NodeType {
@@ -298,6 +304,7 @@ pub fn build_catalog_from_ir(ir: &SchemaIR) -> Result<Catalog> {
                         embed_sources,
                         media_uri_props,
                         indexed_properties,
+                        key_property,
                         arrow_schema: Arc::new(Schema::new(fields)),
                     },
                 );

@@ -640,6 +640,14 @@ pub async fn run_mutation_query_sparse(
         .as_ref()
         .ok_or_else(|| NanoError::Execution("expected mutation query".to_string()))?;
     match mutation {
+        Mutation::Put(put) => {
+            // Put is routed through the GraphAware path by the CLI classifier;
+            // this arm is unreachable in practice but kept for exhaustiveness.
+            Err(NanoError::Execution(format!(
+                "internal: put for `{}` should be routed to the GraphAware path",
+                put.type_name
+            )))
+        }
         Mutation::Insert(insert) => {
             let metadata = DatabaseMetadata::open(db_path)?;
             if metadata

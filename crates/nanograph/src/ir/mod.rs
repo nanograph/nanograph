@@ -28,6 +28,10 @@ pub enum MutationOpIR {
         type_name: String,
         assignments: Vec<IRAssignment>,
     },
+    Put {
+        type_name: String,
+        assignments: Vec<IRAssignment>,
+    },
     Update {
         type_name: String,
         assignments: Vec<IRAssignment>,
