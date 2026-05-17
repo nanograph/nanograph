@@ -1,6 +1,6 @@
 {
   "name": "nanograph-db",
-  "version": "1.3.1",
+  "version": "1.3.0",
   "description": "NanoGraph — embedded typed property graph DB for TypeScript/Node.js",
   "main": "index.js",
   "types": "types.d.ts",
@@ -15,6 +15,7 @@
     ]
   },
   "scripts": {
+    "install": "node scripts/install.cjs",
     "build": "napi build --platform --js index.js --release",
     "build:debug": "napi build --platform --js index.js",
     "pretest": "npm run build",
@@ -23,13 +24,6 @@
   "dependencies": {
     "@napi-rs/cli": "^3.0.0",
     "apache-arrow": "^21.0.0"
-  },
-  "optionalDependencies": {
-    "nanograph-db-darwin-arm64": "1.3.1",
-    "nanograph-db-darwin-x64": "1.3.1",
-    "nanograph-db-linux-x64-gnu": "1.3.1",
-    "nanograph-db-linux-arm64-gnu": "1.3.1",
-    "nanograph-db-win32-x64-msvc": "1.3.1"
   },
   "engines": {
     "node": ">=18"
@@ -42,6 +36,8 @@
   "files": [
     "index.js",
     "types.d.ts",
+    "*.node",
+    "scripts/",
     "src/",
     "build.rs",
     "Cargo.toml"
